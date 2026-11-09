@@ -889,6 +889,20 @@ async function createFaceService({
       await storage.saveDatabase(db);
 
       return this.listGroups();
+    },
+
+    /**
+     * Clears all groups, faces, and indexed asset records (e.g. to remove sample data).
+     */
+    async clearAllData() {
+      const db = {
+        groups: {},
+        faces: {},
+        assets: {},
+        counters: { nextPersonNumber: 1 }
+      };
+      await storage.saveDatabase(db);
+      return this.listGroups();
     }
   };
 }

@@ -500,6 +500,7 @@ export const api = {
   mergeGroups: (sourceGroupIds, targetGroupId, ctx) =>
     invokeAction('groups', { operation: 'mergeGroups', sourceGroupIds, targetGroupId }, ctx),
   seedDemoData: (ctx) => invokeAction('groups', { operation: 'seedDemoData' }, ctx),
+  clearAllData: (ctx) => invokeAction('groups', { operation: 'clearAllData' }, ctx),
   ingestAsset: (params, ctx) =>
     invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx),
   scanFolder: (folderPath, ctx) =>

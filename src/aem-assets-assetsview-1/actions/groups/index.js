@@ -88,6 +88,11 @@ async function main(params = {}) {
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 
+      case 'clearAllData': {
+        const result = await faceService.clearAllData();
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
       default:
         return {
           statusCode: 400,

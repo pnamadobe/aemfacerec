@@ -333,7 +333,17 @@ export default function AdminConsole() {
     await loadAll();
     setBanner({
       type: 'positive',
-      text: 'Reset sample Face Groups and multi-face AEM assets.'
+      text: 'Loaded sample Face Groups and multi-face AEM assets.'
+    });
+  };
+
+  const handleClearAllData = async () => {
+    await api.clearAllData(hostContext);
+    setSelectedGroupId(null);
+    await loadAll();
+    setBanner({
+      type: 'positive',
+      text: 'Cleared all face groups and asset records.'
     });
   };
 
@@ -365,7 +375,8 @@ export default function AdminConsole() {
             </Text>
           </View>
           <Flex gap="size-100">
-            <ActionButton onPress={handleResetDemoData}>Reset Sample Data</ActionButton>
+            <ActionButton onPress={handleClearAllData}>Clear All Data</ActionButton>
+            <ActionButton onPress={handleResetDemoData}>Load Sample Data</ActionButton>
             {guestConnection ? (
               <Button
                 variant="secondary"
