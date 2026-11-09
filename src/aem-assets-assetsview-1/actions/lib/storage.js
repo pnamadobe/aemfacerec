@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const DEFAULT_SETTINGS = {
@@ -65,11 +66,18 @@ async function createStorage(options = {}) {
   let backend = options.backend || null;
 
   if (!backend) {
-    if (process.env.AIO_runtime_namespace && !options.useLocal) {
+    const isRuntime = Boolean(
+      (process.env.__OW_NAMESPACE || process.env.AIO_runtime_namespace) && !options.useLocal
+    );
+
+    if (isRuntime) {
+      // 1. Try @adobe/aio-lib-files (permanent cloud blob storage)
       try {
         const filesLib = require('@adobe/aio-lib-files');
         const files = await filesLib.init();
+        // Verify write access with a lightweight probe or use directly
         backend = {
+          type: 'aio-lib-files',
           async readText(filePath) {
             try {
               const buf = await files.read(filePath);
@@ -100,13 +108,48 @@ async function createStorage(options = {}) {
           }
         };
       } catch (err) {
-        // Fallback to local disk storage if aio-lib-files cannot initialize
+        // 2. Fallback to @adobe/aio-lib-state (persistent across Runtime containers, 1-year TTL)
+        try {
+          const stateLib = require('@adobe/aio-lib-state');
+          const state = await stateLib.init();
+          const ONE_YEAR_TTL = 31536000;
+          const toKey = (filePath) =>
+            `facerec_${String(filePath).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+          backend = {
+            type: 'aio-lib-state',
+            async readText(filePath) {
+              const res = await state.get(toKey(filePath));
+              return res?.value || null;
+            },
+            async writeText(filePath, content) {
+              await state.put(toKey(filePath), content, { ttl: ONE_YEAR_TTL });
+            },
+            async readBuffer(filePath) {
+              const res = await state.get(toKey(filePath));
+              return res?.value ? Buffer.from(res.value, 'base64') : null;
+            },
+            async writeBuffer(filePath, buffer) {
+              await state.put(toKey(filePath), buffer.toString('base64'), {
+                ttl: ONE_YEAR_TTL
+              });
+            },
+            async deleteFile(filePath) {
+              await state.delete(toKey(filePath));
+            }
+          };
+        } catch (stateErr) {
+          // Fallback to /tmp on container
+        }
       }
     }
   }
 
   if (!backend) {
-    const baseDir = options.localDir || path.join(process.cwd(), '.local-storage');
+    const defaultDir = process.env.__OW_NAMESPACE
+      ? path.join(os.tmpdir(), 'aem-facerec-storage')
+      : path.join(process.cwd(), '.local-storage');
+    const baseDir = options.localDir || defaultDir;
     backend = {
       async readText(filePath) {
         const full = path.join(baseDir, filePath);

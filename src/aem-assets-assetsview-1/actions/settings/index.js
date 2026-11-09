@@ -61,9 +61,13 @@ async function main(params = {}) {
     }
 
     if (operation === 'testConnection') {
-      // Allow testing unsaved form inputs or already stored credentials
-      const stored = await storage.getSettings({ includeDecryptedSecret: true });
+      // Save any provided credentials first so "Test Connection" also persists the keys
       const inputSettings = params.settings || {};
+      if (inputSettings.awsAccessKeyId || inputSettings.awsSecretAccessKey) {
+        await storage.saveSettings(inputSettings);
+      }
+
+      const stored = await storage.getSettings({ includeDecryptedSecret: true });
 
       const testConfig = {
         awsRegion: inputSettings.awsRegion || stored.awsRegion,

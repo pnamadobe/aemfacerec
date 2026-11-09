@@ -24,6 +24,7 @@ runtimeManifest:
             memorySize: 512
           annotations:
             require-adobe-auth: false
+            provide-api-key: true
             final: true
         groups:
           function: actions/groups/index.js
@@ -38,6 +39,7 @@ runtimeManifest:
             memorySize: 256
           annotations:
             require-adobe-auth: false
+            provide-api-key: true
             final: true
         settings:
           function: actions/settings/index.js
@@ -53,4 +55,5 @@ runtimeManifest:
             memorySize: 256
           annotations:
             require-adobe-auth: false
+            provide-api-key: true
             final: true
