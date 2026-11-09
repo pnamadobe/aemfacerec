@@ -1,0 +1,32 @@
+{
+  "name": "aem-face-recognition",
+  "id": "aem-face-recognition",
+  "description": "AEM Assets View UI Extension for Facial Recognition, Avatar Cropping, and Face Group Management with AWS Rekognition",
+  "version": "1.0.0",
+  "detailsSidePanels": [
+    {
+      "id": "face-recognition-panel",
+      "title": "Recognized Faces",
+      "tooltip": "Recognized Faces & People",
+      "icon": "UserGroup",
+      "componentName": "AssetDetailsSidePanel"
+    }
+  ],
+  "headerMenuButtons": [
+    {
+      "label": "Face Groups",
+      "icon": "UserGroup",
+      "needsModal": true,
+      "modalTitle": "Facial Recognition & Group Management",
+      "modalType": "fullscreen",
+      "modalSize": "XL",
+      "id": "face-management",
+      "componentName": "AdminConsole"
+    }
+  ],
+  "runtimeActions": [
+    { "name": "ingest" },
+    { "name": "groups" },
+    { "name": "settings" }
+  ]
+}

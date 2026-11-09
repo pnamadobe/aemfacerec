@@ -4,34 +4,43 @@
   "description": "AEM Assets View App Builder Extension for Facial Recognition and Grouping with AWS Rekognition",
   "private": true,
   "scripts": {
-    "test": "node --test src/aem-assets-details-1/test/*.test.js",
+    "test": "node --test src/aem-assets-assetsview-1/test/*.test.js",
     "build": "aio app build",
     "deploy": "aio app deploy",
     "undeploy": "aio app undeploy",
     "run": "aio app run"
   },
   "dependencies": {
-    "@adobe/aio-lib-files": "^6.1.0",
-    "@adobe/aio-lib-state": "^8.0.0",
-    "@adobe/aio-sdk": "^6.0.0",
-    "@adobe/react-spectrum": "^3.34.0",
-    "@adobe/uix-sdk": "^0.10.2",
+    "@adobe/aem-assets-assetsview-ext-tpl": "^0.1.0",
+    "@adobe/aio-sdk": "^6",
+    "@adobe/exc-app": "^0.2.21",
+    "@adobe/react-spectrum": "^3.4.0",
+    "@adobe/uix-guest": "^0.10.5",
     "@aws-sdk/client-rekognition": "^3.600.0",
-    "@spectrum-icons/workflow": "^4.2.0",
-    "core-js": "^3.36.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-router-dom": "^6.22.0",
-    "regenerator-runtime": "^0.14.1",
+    "@spectrum-icons/workflow": "^3.2.0",
+    "chalk": "^4.1.2",
+    "core-js": "^3.6.4",
+    "js-yaml": "^4.1.0",
+    "node-fetch": "^2.6.0",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-error-boundary": "^1.2.5",
+    "react-router-dom": "^6.3.0",
+    "regenerator-runtime": "^0.13.5",
     "sharp": "^0.33.3"
   },
   "devDependencies": {
-    "@babel/core": "^7.24.0",
-    "@babel/preset-env": "^7.24.0",
-    "@babel/preset-react": "^7.24.0",
-    "parcel": "^2.12.0"
+    "@babel/core": "^7.8.7",
+    "@babel/plugin-transform-react-jsx": "^7.8.3",
+    "@babel/polyfill": "^7.8.7",
+    "@babel/preset-env": "^7.8.7",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.5.4"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "aio-app-builder-templates": [
+    "@adobe/aem-assets-assetsview-ext-tpl"
+  ]
 }

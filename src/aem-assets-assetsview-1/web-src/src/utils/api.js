@@ -16,12 +16,11 @@ try {
 }
 
 function getActionUrl(actionName) {
-  return (
-    actionUrls[actionName] ||
-    actionUrls[`aem-face-rec/${actionName}`] ||
-    window.__AIO_ACTION_URLS__?.[actionName] ||
-    null
+  const hit = Object.entries(actionUrls || {}).find(
+    ([k]) => k.endsWith(`/${actionName}`) || k === actionName
   );
+  if (hit) return hit[1];
+  return window.__AIO_ACTION_URLS__?.[actionName] || null;
 }
 
 async function invokeAction(actionName, payload = {}, authContext = {}) {

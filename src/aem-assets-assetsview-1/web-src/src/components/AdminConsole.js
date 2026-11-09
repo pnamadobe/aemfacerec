@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { attach } from '@adobe/uix-guest';
 import { useNavigate } from 'react-router-dom';
 import {
   View,
@@ -21,9 +22,82 @@ import {
   ProgressCircle
 } from '@adobe/react-spectrum';
 import { api } from '../utils/api';
+import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 export default function AdminConsole() {
   const navigate = useNavigate();
+
+  const [guestConnection, setGuestConnection] = useState(null);
+  const [hostContext, setHostContext] = useState({
+    inAemHost: false,
+    imsToken: null,
+    imsOrg: null,
+    aemHost: null
+  });
+
+  useEffect(() => {
+    let mounted = true;
+    let storedCtx = {};
+    try {
+      storedCtx = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+    } catch (e) {
+      storedCtx = {};
+    }
+    if (storedCtx.aemAuthorUrl) {
+      setHostContext((prev) => ({ ...prev, aemHost: storedCtx.aemAuthorUrl }));
+    }
+
+    (async () => {
+      try {
+        const gc = await attach({ id: extensionId });
+        if (!gc || !mounted) return;
+        setGuestConnection(gc);
+
+        let imsToken = null;
+        let imsOrg = null;
+        let aemHost = storedCtx.aemAuthorUrl || null;
+
+        try {
+          const imsInfo = await gc.host?.auth?.getIMSInfo?.();
+          if (imsInfo) {
+            imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
+            imsOrg = imsInfo.imsOrg || null;
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        if (!aemHost && gc.host?.discovery?.getAemHost) {
+          try {
+            const discovered = await gc.host.discovery.getAemHost();
+            if (discovered) {
+              aemHost = String(discovered).startsWith('http')
+                ? discovered
+                : `https://${discovered}`;
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        if (mounted) {
+          setHostContext((prev) => ({
+            ...prev,
+            inAemHost: true,
+            imsToken: imsToken || prev.imsToken,
+            imsOrg: imsOrg || prev.imsOrg,
+            aemHost: aemHost || prev.aemHost
+          }));
+        }
+      } catch (e) {
+        // Standalone mode outside AEM host
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const [groups, setGroups] = useState([]);
   const [stats, setStats] = useState({ totalGroups: 0, totalFaces: 0, totalAssets: 0 });
@@ -69,8 +143,8 @@ export default function AdminConsole() {
     setLoading(true);
     try {
       const [groupsRes, settingsRes] = await Promise.all([
-        api.listGroups(),
-        api.getSettings()
+        api.listGroups(hostContext),
+        api.getSettings(hostContext)
       ]);
       const loadedGroups = groupsRes.groups || [];
       setGroups(loadedGroups);
@@ -102,7 +176,7 @@ export default function AdminConsole() {
     } finally {
       setLoading(false);
     }
-  }, [selectedGroupId]);
+  }, [selectedGroupId, hostContext]);
 
   useEffect(() => {
     loadAll();
@@ -121,7 +195,7 @@ export default function AdminConsole() {
   const handleRenameActiveGroup = async () => {
     if (!activeGroup) return;
     try {
-      const res = await api.renameGroup(activeGroup.groupId, groupNameInput);
+      const res = await api.renameGroup(activeGroup.groupId, groupNameInput, hostContext);
       await loadAll();
       setBanner({
         type: 'positive',
@@ -135,7 +209,7 @@ export default function AdminConsole() {
   const handleSplitSelectedFaces = async () => {
     if (selectedFaceIds.length === 0) return;
     try {
-      const res = await api.splitFaces(selectedFaceIds, splitNewGroupName);
+      const res = await api.splitFaces(selectedFaceIds, splitNewGroupName, hostContext);
       setSelectedFaceIds([]);
       setSplitNewGroupName('');
       await loadAll();
@@ -153,7 +227,7 @@ export default function AdminConsole() {
   const handleMoveSelectedFaces = async () => {
     if (selectedFaceIds.length === 0 || !moveTargetGroupId) return;
     try {
-      const res = await api.moveFaces(selectedFaceIds, moveTargetGroupId);
+      const res = await api.moveFaces(selectedFaceIds, moveTargetGroupId, hostContext);
       setSelectedFaceIds([]);
       setMoveTargetGroupId('');
       await loadAll();
@@ -169,7 +243,7 @@ export default function AdminConsole() {
   const handleMergeGroups = async (sourceIds, targetId) => {
     if (!targetId || !sourceIds.length) return;
     try {
-      const res = await api.mergeGroups(sourceIds, targetId);
+      const res = await api.mergeGroups(sourceIds, targetId, hostContext);
       setSelectedGroupIdsForMerge([]);
       setMergeTargetGroupId('');
       setSelectedGroupId(targetId);
@@ -192,7 +266,7 @@ export default function AdminConsole() {
           .map((s) => s.trim())
           .filter(Boolean)
       };
-      const res = await api.saveSettings(payload);
+      const res = await api.saveSettings(payload, hostContext);
       await loadAll();
       setBanner({
         type: 'positive',
@@ -209,7 +283,7 @@ export default function AdminConsole() {
 
   const handleTestAwsConnection = async () => {
     try {
-      const res = await api.testConnection(settings);
+      const res = await api.testConnection(settings, hostContext);
       setBanner({
         type: 'positive',
         text: `AWS Rekognition connected! Collection "${res.collectionId}" is ready (${res.faceCount} indexed faces, ${res.userCount} user groups).`
@@ -223,7 +297,7 @@ export default function AdminConsole() {
     setScanning(true);
     setScanResult(null);
     try {
-      const res = await api.scanFolder(scanFolderPath);
+      const res = await api.scanFolder(scanFolderPath, hostContext);
       setScanResult(res);
       await loadAll();
       setBanner({
@@ -240,7 +314,7 @@ export default function AdminConsole() {
   const handleRunSingleAssetScan = async () => {
     setScanning(true);
     try {
-      const res = await api.ingestAsset({ assetPath: scanAssetPath, force: true });
+      const res = await api.ingestAsset({ assetPath: scanAssetPath, force: true }, hostContext);
       await loadAll();
       setBanner({
         type: 'positive',
@@ -254,7 +328,7 @@ export default function AdminConsole() {
   };
 
   const handleResetDemoData = async () => {
-    await api.seedDemoData();
+    await api.seedDemoData(hostContext);
     setSelectedGroupId(null);
     await loadAll();
     setBanner({
@@ -292,9 +366,21 @@ export default function AdminConsole() {
           </View>
           <Flex gap="size-100">
             <ActionButton onPress={handleResetDemoData}>Reset Sample Data</ActionButton>
-            <Button variant="secondary" onPress={() => navigate('/side-panel')}>
-              Open Asset Details Side Panel
-            </Button>
+            {guestConnection ? (
+              <Button
+                variant="secondary"
+                onPress={() => guestConnection.host?.modal?.closeDialog?.()}
+              >
+                Close
+              </Button>
+            ) : (
+              <Button
+                variant="secondary"
+                onPress={() => navigate('/face-recognition-panel')}
+              >
+                Open Asset Details Side Panel
+              </Button>
+            )}
           </Flex>
         </Flex>
 

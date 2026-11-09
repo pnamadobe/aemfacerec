@@ -4,7 +4,9 @@ dist/
 .env
 .aio
 .wskprops
+.aws.tmp.creds.json
 console.json
+src/*/web-src/src/config.json
 *.log
 .DS_Store
 .local-storage/

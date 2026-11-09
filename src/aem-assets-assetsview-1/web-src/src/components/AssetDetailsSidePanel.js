@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { attach } from '@adobe/uix-sdk';
+import { attach } from '@adobe/uix-guest';
 import { useNavigate } from 'react-router-dom';
 import {
   View,
@@ -18,8 +18,7 @@ import {
   Well
 } from '@adobe/react-spectrum';
 import { api } from '../utils/api';
-
-const EXTENSION_ID = 'aem-assets-face-recognition';
+import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 const DEMO_ASSETS = [
   {
@@ -47,6 +46,7 @@ const DEMO_ASSETS = [
 export default function AssetDetailsSidePanel() {
   const navigate = useNavigate();
 
+  const [guestConnection, setGuestConnection] = useState(null);
   const [hostContext, setHostContext] = useState({
     inAemHost: false,
     imsToken: null,
@@ -69,22 +69,86 @@ export default function AssetDetailsSidePanel() {
   // Attach to AEM Assets View guest connection if running inside AEM iframe
   useEffect(() => {
     let mounted = true;
+
+    const hash = window.location.hash || '';
+    const qIdx = hash.indexOf('?');
+    const sp = new URLSearchParams(qIdx >= 0 ? hash.slice(qIdx + 1) : window.location.search);
+    let storedCtx = {};
+    try {
+      storedCtx = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+    } catch (e) {
+      storedCtx = {};
+    }
+
+    const initialAssetPath = sp.get('assetPath') || storedCtx.assetPath || '';
+    const initialAssetId = sp.get('assetId') || storedCtx.assetId || '';
+    const initialAuthorUrl = sp.get('aemAuthorUrl') || storedCtx.aemAuthorUrl || '';
+
+    if (initialAssetPath || initialAssetId) {
+      setHostContext((prev) => ({
+        ...prev,
+        assetId: initialAssetId || prev.assetId,
+        assetPath: initialAssetPath || prev.assetPath,
+        aemHost: initialAuthorUrl || prev.aemHost
+      }));
+    }
+
     const connectToHost = async () => {
       try {
-        const guestConnection = await attach({ id: EXTENSION_ID });
-        const sharedContext = guestConnection?.sharedContext;
-        if (sharedContext && mounted) {
+        const gc = await attach({ id: extensionId });
+        if (!gc || !mounted) return;
+        setGuestConnection(gc);
+
+        let imsToken = null;
+        let imsOrg = null;
+        let aemHost = initialAuthorUrl;
+
+        try {
+          const imsInfo = await gc.host?.auth?.getIMSInfo?.();
+          if (imsInfo) {
+            imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
+            imsOrg = imsInfo.imsOrg || null;
+          }
+        } catch (e) {
+          // fallback to sharedContext
+        }
+
+        const sharedContext = gc.sharedContext;
+        if (sharedContext) {
           const auth = sharedContext.get('auth') || {};
           const asset = sharedContext.get('asset') || {};
-          const aemHost = sharedContext.get('aemHost') || auth.aemHost || null;
+          imsToken = imsToken || auth.imsToken || null;
+          imsOrg = imsOrg || auth.imsOrg || null;
+          aemHost = aemHost || sharedContext.get('aemHost') || auth.aemHost || null;
+          if (asset.assetId || asset.id || asset.path) {
+            setHostContext((prev) => ({
+              ...prev,
+              assetId: asset.assetId || asset.id || prev.assetId,
+              assetPath: asset.path || asset.assetPath || prev.assetPath
+            }));
+          }
+        }
+
+        if (!aemHost && gc.host?.discovery?.getAemHost) {
+          try {
+            const discovered = await gc.host.discovery.getAemHost();
+            if (discovered) {
+              aemHost = String(discovered).startsWith('http')
+                ? discovered
+                : `https://${discovered}`;
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        if (mounted) {
           setHostContext((prev) => ({
             ...prev,
             inAemHost: true,
-            imsToken: auth.imsToken || null,
-            imsOrg: auth.imsOrg || null,
-            aemHost,
-            assetId: asset.assetId || asset.id || prev.assetId,
-            assetPath: asset.path || asset.assetPath || prev.assetPath
+            imsToken: imsToken || prev.imsToken,
+            imsOrg: imsOrg || prev.imsOrg,
+            aemHost: aemHost || prev.aemHost
           }));
         }
       } catch (e) {
@@ -211,7 +275,21 @@ export default function AssetDetailsSidePanel() {
             <Badge variant="info">{faces.length}</Badge>
           </Flex>
           <Flex gap="size-100">
-            <ActionButton isQuiet onPress={() => navigate('/admin')}>
+            <ActionButton
+              isQuiet
+              onPress={() => {
+                if (guestConnection?.host?.modal?.openDialog) {
+                  guestConnection.host.modal.openDialog({
+                    title: 'Facial Recognition & Group Management',
+                    contentUrl: `/index.html?cb=${Date.now()}#modal-face-management`,
+                    type: 'fullscreen',
+                    size: 'XL'
+                  });
+                } else {
+                  navigate('/modal-face-management');
+                }
+              }}
+            >
               Manage All Groups
             </ActionButton>
             <Button
@@ -393,7 +471,32 @@ export default function AssetDetailsSidePanel() {
           </Flex>
         ) : faces.length === 0 ? (
           <Well>
-            <Text>No faces detected on this asset yet. Click "Re-scan" to run AWS Rekognition.</Text>
+            <Flex direction="column" gap="size-150">
+              <Text>
+                No faces indexed for this asset yet (
+                <code>{hostContext.assetPath || hostContext.assetId}</code>).
+              </Text>
+              <Flex gap="size-100" wrap>
+                <Button
+                  variant="cta"
+                  onPress={handleRescanAsset}
+                  isDisabled={scanning}
+                >
+                  {scanning ? 'Scanning...' : 'Scan Asset with AWS Rekognition'}
+                </Button>
+                <ActionButton
+                  onPress={() =>
+                    setHostContext((prev) => ({
+                      ...prev,
+                      assetId: DEMO_ASSETS[0].assetId,
+                      assetPath: DEMO_ASSETS[0].assetPath
+                    }))
+                  }
+                >
+                  Load Sample 3-Face Asset
+                </ActionButton>
+              </Flex>
+            </Flex>
           </Well>
         ) : (
           <Flex direction="column" gap="size-150">

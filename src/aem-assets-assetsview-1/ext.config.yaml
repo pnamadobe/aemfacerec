@@ -4,41 +4,53 @@ operations:
       impl: index.html
 actions: actions
 web: web-src
+hooks:
+  post-app-deploy: ./hooks/post-deploy.js
 runtimeManifest:
   packages:
-    aem-face-rec:
+    aem-assets-assetsview-1:
       license: Apache-2.0
       actions:
         ingest:
           function: actions/ingest/index.js
           web: 'yes'
-          runtime: nodejs:20
+          runtime: nodejs:22
           inputs:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
+            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+          limits:
+            timeout: 120000
+            memorySize: 512
           annotations:
-            require-adobe-auth: true
+            require-adobe-auth: false
             final: true
         groups:
           function: actions/groups/index.js
           web: 'yes'
-          runtime: nodejs:20
+          runtime: nodejs:22
           inputs:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
+            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+          limits:
+            timeout: 60000
+            memorySize: 256
           annotations:
-            require-adobe-auth: true
+            require-adobe-auth: false
             final: true
         settings:
           function: actions/settings/index.js
           web: 'yes'
-          runtime: nodejs:20
+          runtime: nodejs:22
           inputs:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
+            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
             ENCRYPTION_SECRET: $ENCRYPTION_SECRET
+          limits:
+            timeout: 60000
+            memorySize: 256
           annotations:
-            require-adobe-auth: true
+            require-adobe-auth: false
             final: true
-hooks:
-  post-app-run: echo "AEM Facial Recognition Extension running. Open Assets View or /#/admin for the Face Management Console."
