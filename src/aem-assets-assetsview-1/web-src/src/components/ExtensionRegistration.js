@@ -11,6 +11,7 @@ import {
   Well
 } from '@adobe/react-spectrum';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
+import { api } from '../utils/api';
 
 function findAemAuthorUrl(...sources) {
   const seen = new Set();
@@ -31,6 +32,8 @@ function findAemAuthorUrl(...sources) {
   return sources.map(visit).find(Boolean) || '';
 }
 
+const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic)$/i;
+
 function extractAssetContext(resource, context) {
   const rawPath =
     (resource &&
@@ -41,9 +44,19 @@ function extractAssetContext(resource, context) {
         resource.repositoryMetadata?.path)) ||
     '';
 
-  let assetPath = String(rawPath).trim();
-  const damIdx = assetPath.indexOf('/content/dam');
-  if (damIdx > 0) assetPath = assetPath.slice(damIdx);
+  let cleanPath = String(rawPath).trim();
+  const damIdx = cleanPath.indexOf('/content/dam');
+  if (damIdx > 0) cleanPath = cleanPath.slice(damIdx);
+  cleanPath = cleanPath.replace(/\/+$/, '');
+
+  const isAssetFile = IMAGE_EXT_RE.test(cleanPath);
+  const folderPath = isAssetFile
+    ? cleanPath.slice(0, cleanPath.lastIndexOf('/')) || '/content/dam'
+    : cleanPath.startsWith('/content/dam')
+    ? cleanPath
+    : '/content/dam';
+
+  const assetPath = isAssetFile ? cleanPath : '';
 
   const assetId =
     (resource &&
@@ -55,7 +68,7 @@ function extractAssetContext(resource, context) {
 
   const aemAuthorUrl = findAemAuthorUrl(resource, context);
 
-  return { assetPath, assetId, aemAuthorUrl };
+  return { folderPath, assetPath, assetId, aemAuthorUrl };
 }
 
 export default function ExtensionRegistration() {
@@ -87,13 +100,24 @@ export default function ExtensionRegistration() {
                     icon: 'UserGroup',
                     label: 'Recognize Faces',
                     onClick: async () => {
-                      const first = resources[0];
-                      const extracted = extractAssetContext(first, context);
-                      if (!extracted.aemAuthorUrl && guestConnection.host?.discovery?.getAemHost) {
+                      let imsToken = null;
+                      let imsOrg = null;
+                      try {
+                        const imsInfo = await guestConnection.host?.auth?.getIMSInfo?.();
+                        if (imsInfo) {
+                          imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
+                          imsOrg = imsInfo.imsOrg || null;
+                        }
+                      } catch (e) {
+                        // ignore
+                      }
+
+                      let aemAuthorUrl = findAemAuthorUrl(resources, context);
+                      if (!aemAuthorUrl && guestConnection.host?.discovery?.getAemHost) {
                         try {
                           const discovered = await guestConnection.host.discovery.getAemHost();
                           if (discovered) {
-                            extracted.aemAuthorUrl = String(discovered).startsWith('http')
+                            aemAuthorUrl = String(discovered).startsWith('http')
                               ? discovered
                               : `https://${discovered}`;
                           }
@@ -101,19 +125,54 @@ export default function ExtensionRegistration() {
                           // ignore
                         }
                       }
+
+                      const authContext = { imsToken, imsOrg, aemHost: aemAuthorUrl };
+
                       try {
-                        localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(extracted));
+                        guestConnection.host?.toast?.display?.({
+                          variant: 'neutral',
+                          message: `Running AWS Rekognition on ${resources.length} selected item(s)...`
+                        });
                       } catch (e) {
-                        // ignore
+                        // ignore toast error
                       }
-                      const qs = new URLSearchParams(extracted).toString();
-                      guestConnection.host.modal.openDialog({
-                        title: 'Facial Recognition & Group Management',
-                        contentUrl: `/index.html?cb=${Date.now()}#modal-face-management?${qs}`,
-                        type: 'fullscreen',
-                        size: 'XL',
-                        payload: extracted
-                      });
+
+                      let totalFacesFound = 0;
+                      let processedCount = 0;
+
+                      try {
+                        for (const item of resources) {
+                          const extracted = extractAssetContext(item, context);
+                          if (extracted.assetPath) {
+                            const res = await api.ingestAsset(
+                              {
+                                assetPath: extracted.assetPath,
+                                assetId: extracted.assetId,
+                                force: true
+                              },
+                              authContext
+                            );
+                            totalFacesFound += res.faceCount || 0;
+                            processedCount += 1;
+                          } else if (extracted.folderPath) {
+                            const res = await api.scanFolder(extracted.folderPath, authContext);
+                            processedCount += res.totalAssets || 0;
+                            for (const r of res.results || []) {
+                              totalFacesFound += r.faceCount || 0;
+                            }
+                          }
+                        }
+
+                        guestConnection.host?.toast?.display?.({
+                          variant: 'positive',
+                          message: `Recognized ${totalFacesFound} face(s) across ${processedCount} asset(s) and updated xdm:faceNames.`
+                        });
+                      } catch (err) {
+                        guestConnection.host?.toast?.display?.({
+                          variant: 'negative',
+                          message: `Face recognition error: ${err.message}`
+                        });
+                      }
                     }
                   }
                 ];

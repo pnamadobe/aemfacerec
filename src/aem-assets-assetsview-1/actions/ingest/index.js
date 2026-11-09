@@ -60,6 +60,13 @@ async function main(params = {}) {
 
     const operation = params.operation || 'ingestAsset';
 
+    if (operation === 'browseFolder') {
+      const result = await faceService.browseFolder({
+        folderPath: params.folderPath || '/content/dam'
+      });
+      return { statusCode: 200, headers: corsHeaders, body: result };
+    }
+
     if (operation === 'scanFolder') {
       if (!params.folderPath) {
         return {

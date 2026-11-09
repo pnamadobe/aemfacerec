@@ -301,6 +301,36 @@ async function createFaceService({
     },
 
     /**
+     * Browses child subfolders and image assets inside a DAM folder for the visual folder/asset picker.
+     */
+    async browseFolder({ folderPath = '/content/dam' }) {
+      const [browsed, db] = await Promise.all([
+        aemClient.browseDamFolder(folderPath),
+        storage.getDatabase()
+      ]);
+
+      const indexedByPath = {};
+      for (const rec of Object.values(db.assets || {})) {
+        if (rec.assetPath) indexedByPath[rec.assetPath] = rec;
+      }
+
+      const enrichedAssets = (browsed.assets || []).map((a) => {
+        const indexed = db.assets[a.assetId] || indexedByPath[a.assetPath] || null;
+        return {
+          ...a,
+          scanned: Boolean(indexed),
+          faceCount: indexed?.faceIds?.length || 0,
+          faceNames: indexed?.faceNames || []
+        };
+      });
+
+      return {
+        ...browsed,
+        assets: enrichedAssets
+      };
+    },
+
+    /**
      * Scans all image assets in a DAM folder.
      */
     async scanFolder({ folderPath, force = true }) {

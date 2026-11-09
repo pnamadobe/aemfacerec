@@ -503,6 +503,8 @@ export const api = {
   clearAllData: (ctx) => invokeAction('groups', { operation: 'clearAllData' }, ctx),
   ingestAsset: (params, ctx) =>
     invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx),
+  browseFolder: (folderPath, ctx) =>
+    invokeAction('ingest', { operation: 'browseFolder', folderPath }, ctx),
   scanFolder: (folderPath, ctx) =>
     invokeAction('ingest', { operation: 'scanFolder', folderPath, force: true }, ctx),
   getSettings: (ctx) => invokeAction('settings', { operation: 'getSettings' }, ctx),

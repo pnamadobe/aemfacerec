@@ -129,13 +129,35 @@ export default function AdminConsole() {
   const [splitNewGroupName, setSplitNewGroupName] = useState('');
   const [moveTargetGroupId, setMoveTargetGroupId] = useState('');
 
-  // Scan Folder / Asset tab state
-  const [scanFolderPath, setScanFolderPath] = useState('/content/dam/events/2026-summit');
-  const [scanAssetPath, setScanAssetPath] = useState(
-    '/content/dam/events/2026-summit/keynote-panel.jpg'
-  );
+  // Visual DAM Browser state (defaults to the current folder in AEM Assets View)
+  const [currentFolderPath, setCurrentFolderPath] = useState(() => {
+    const hash = window.location.hash || '';
+    const qIdx = hash.indexOf('?');
+    const sp = new URLSearchParams(qIdx >= 0 ? hash.slice(qIdx + 1) : window.location.search);
+    if (sp.get('folderPath')) return sp.get('folderPath');
+    try {
+      const stored = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+      if (stored.folderPath) return stored.folderPath;
+      if (stored.assetPath && stored.assetPath.startsWith('/content/dam')) {
+        return /\.[a-z0-9]+$/i.test(stored.assetPath)
+          ? stored.assetPath.slice(0, stored.assetPath.lastIndexOf('/')) || '/content/dam'
+          : stored.assetPath;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return '/content/dam';
+  });
+  const [folderContents, setFolderContents] = useState({
+    folderPath: '/content/dam',
+    folderTitle: 'Assets',
+    folders: [],
+    assets: []
+  });
+  const [browsingFolder, setBrowsingFolder] = useState(false);
   const [scanResult, setScanResult] = useState(null);
   const [scanning, setScanning] = useState(false);
+  const [scanningAssetPath, setScanningAssetPath] = useState(null);
 
   const [banner, setBanner] = useState(null);
 
@@ -178,9 +200,30 @@ export default function AdminConsole() {
     }
   }, [selectedGroupId, hostContext]);
 
+  const loadFolderBrowser = useCallback(
+    async (targetFolder = currentFolderPath) => {
+      setBrowsingFolder(true);
+      try {
+        const res = await api.browseFolder(targetFolder, hostContext);
+        if (res && res.folderPath) {
+          setFolderContents(res);
+        }
+      } catch (e) {
+        // ignore if AEM host is not reachable yet
+      } finally {
+        setBrowsingFolder(false);
+      }
+    },
+    [currentFolderPath, hostContext]
+  );
+
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    loadFolderBrowser(currentFolderPath);
+  }, [currentFolderPath, loadFolderBrowser]);
 
   const activeGroup = groups.find((g) => g.groupId === selectedGroupId) || null;
 
@@ -297,9 +340,9 @@ export default function AdminConsole() {
     setScanning(true);
     setScanResult(null);
     try {
-      const res = await api.scanFolder(scanFolderPath, hostContext);
+      const res = await api.scanFolder(currentFolderPath, hostContext);
       setScanResult(res);
-      await loadAll();
+      await Promise.all([loadAll(), loadFolderBrowser(currentFolderPath)]);
       setBanner({
         type: 'positive',
         text: `Folder scan complete for ${res.folderPath} (${res.totalAssets} assets processed).`
@@ -311,30 +354,28 @@ export default function AdminConsole() {
     }
   };
 
-  const handleRunSingleAssetScan = async () => {
-    setScanning(true);
+  const handleScanSingleAssetCard = async (asset) => {
+    setScanningAssetPath(asset.assetPath);
     try {
-      const res = await api.ingestAsset({ assetPath: scanAssetPath, force: true }, hostContext);
-      await loadAll();
+      const res = await api.ingestAsset(
+        {
+          assetPath: asset.assetPath,
+          assetId: asset.assetId,
+          assetTitle: asset.assetTitle,
+          force: true
+        },
+        hostContext
+      );
+      await Promise.all([loadAll(), loadFolderBrowser(currentFolderPath)]);
       setBanner({
         type: 'positive',
-        text: `Scanned ${scanAssetPath}: detected ${res.faceCount || 0} face(s).`
+        text: `Scanned "${asset.assetTitle}": detected ${res.faceCount || 0} face(s).`
       });
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     } finally {
-      setScanning(false);
+      setScanningAssetPath(null);
     }
-  };
-
-  const handleResetDemoData = async () => {
-    await api.seedDemoData(hostContext);
-    setSelectedGroupId(null);
-    await loadAll();
-    setBanner({
-      type: 'positive',
-      text: 'Loaded sample Face Groups and multi-face AEM assets.'
-    });
   };
 
   const handleClearAllData = async () => {
@@ -375,8 +416,14 @@ export default function AdminConsole() {
             </Text>
           </View>
           <Flex gap="size-100">
+            <Button
+              variant="primary"
+              onPress={handleRunFolderScan}
+              isDisabled={scanning}
+            >
+              {scanning ? 'Scanning Current Folder...' : 'Scan Current Folder'}
+            </Button>
             <ActionButton onPress={handleClearAllData}>Clear All Data</ActionButton>
-            <ActionButton onPress={handleResetDemoData}>Load Sample Data</ActionButton>
             {guestConnection ? (
               <Button
                 variant="secondary"
@@ -447,9 +494,8 @@ export default function AdminConsole() {
         {/* Main Workspace Tabs */}
         <Tabs aria-label="Face Recognition Admin Tabs">
           <TabList>
-            <Item key="groups">1. Face Groups & Split / Merge Manager</Item>
-            <Item key="scan">2. Scan Folder / On-Demand Ingest</Item>
-            <Item key="settings">3. BYOK AWS Rekognition & Metadata Settings</Item>
+            <Item key="groups">Face Groups & Split / Merge Manager</Item>
+            <Item key="settings">BYOK AWS Rekognition & Metadata Settings</Item>
           </TabList>
 
           <TabPanels marginTop="size-250">
@@ -539,17 +585,12 @@ export default function AdminConsole() {
                             No Face Groups Indexed Yet
                           </Heading>
                           <Text UNSAFE_style={{ color: '#475569' }}>
-                            Your Face Groups database is currently empty. Upload images to a
-                            DAM folder with the <strong>Face Recognition</strong> Processing
-                            Profile enabled, scan an existing DAM folder in Tab 2, or click
-                            <strong> Load Sample Data</strong> in the top-right to preview with
-                            sample faces.
+                            Select one or more assets in AEM Assets View and click{' '}
+                            <strong>Recognize Faces</strong> in the bottom action bar, upload
+                            images to a folder with the <strong>Face Recognition</strong>{' '}
+                            Processing Profile enabled, or click{' '}
+                            <strong>Scan Current Folder</strong> above.
                           </Text>
-                          <Flex gap="size-100">
-                            <Button variant="primary" onPress={handleResetDemoData}>
-                              Load Sample Face Groups
-                            </Button>
-                          </Flex>
                         </Flex>
                       </Well>
                     ) : (
@@ -849,75 +890,7 @@ export default function AdminConsole() {
             </Item>
 
             {/* ============================================================ */}
-            {/* TAB 2: SCAN FOLDER / ON-DEMAND INGEST                        */}
-            {/* ============================================================ */}
-            <Item key="scan">
-              <Flex gap="size-300" wrap>
-                <Well flex="1" minWidth="360px">
-                  <Flex direction="column" gap="size-200">
-                    <Heading level={3} margin={0}>
-                      Scan Entire DAM Folder
-                    </Heading>
-                    <Text>
-                      Indexes all image assets in the specified AEM DAM folder through AWS
-                      Rekognition, crops 160×160 face avatars, clusters matching faces, and
-                      writes <code>{settings.metadataProperty}</code> metadata to each asset.
-                    </Text>
-                    <TextField
-                      label="AEM DAM Folder Path"
-                      value={scanFolderPath}
-                      onChange={setScanFolderPath}
-                      width="100%"
-                    />
-                    <View>
-                      <Button
-                        variant="cta"
-                        onPress={handleRunFolderScan}
-                        isDisabled={scanning}
-                      >
-                        {scanning ? 'Scanning Folder...' : 'Scan DAM Folder'}
-                      </Button>
-                    </View>
-                    {scanResult && (
-                      <View marginTop="size-100">
-                        <Text UNSAFE_style={{ fontWeight: 700 }}>
-                          Processed {scanResult.totalAssets} asset(s) in {scanResult.folderPath}
-                        </Text>
-                      </View>
-                    )}
-                  </Flex>
-                </Well>
-
-                <Well flex="1" minWidth="360px">
-                  <Flex direction="column" gap="size-200">
-                    <Heading level={3} margin={0}>
-                      Scan Single AEM Asset
-                    </Heading>
-                    <Text>
-                      Run or re-run facial recognition on a single AEM asset path immediately.
-                    </Text>
-                    <TextField
-                      label="AEM Asset DAM Path"
-                      value={scanAssetPath}
-                      onChange={setScanAssetPath}
-                      width="100%"
-                    />
-                    <View>
-                      <Button
-                        variant="primary"
-                        onPress={handleRunSingleAssetScan}
-                        isDisabled={scanning}
-                      >
-                        {scanning ? 'Scanning Asset...' : 'Scan Single Asset'}
-                      </Button>
-                    </View>
-                  </Flex>
-                </Well>
-              </Flex>
-            </Item>
-
-            {/* ============================================================ */}
-            {/* TAB 3: BYOK AWS REKOGNITION & METADATA SETTINGS              */}
+            {/* TAB 2: BYOK AWS REKOGNITION & METADATA SETTINGS              */}
             {/* ============================================================ */}
             <Item key="settings">
               <Flex direction="column" gap="size-300">
@@ -1050,15 +1023,6 @@ export default function AdminConsole() {
                           setSettings((s) => ({ ...s, processingProfileName: v }))
                         }
                         placeholder="Face Recognition"
-                        width="100%"
-                      />
-
-                      <TextField
-                        label="Enabled DAM Folder Prefixes (one path per line)"
-                        value={settings.enabledFoldersText}
-                        onChange={(v) =>
-                          setSettings((s) => ({ ...s, enabledFoldersText: v }))
-                        }
                         width="100%"
                       />
                     </Flex>

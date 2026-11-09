@@ -219,41 +219,77 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     },
 
     /**
-     * Lists image assets inside a DAM folder via the AEM Assets HTTP API.
+     * Lists both child folders and image assets inside a DAM folder via the AEM Assets HTTP API
+     * to power the visual folder & asset browser UI (no manual path typing).
      */
-    async listFolderAssets(folderPath) {
-      const cleanFolder = normalizeDamPath(folderPath);
-      if (!baseUrl || !fetchImpl) return [];
+    async browseDamFolder(folderPath = '/content/dam') {
+      const cleanFolder = normalizeDamPath(folderPath) || '/content/dam';
+      if (!baseUrl || !fetchImpl) {
+        return {
+          folderPath: cleanFolder,
+          folderTitle: cleanFolder.split('/').pop() || 'DAM',
+          folders: [],
+          assets: []
+        };
+      }
 
       const relFolder = toApiAssetsRelativePath(cleanFolder);
-      const url = `${baseUrl}/api/assets/${relFolder}.json?limit=200`;
+      const apiPath = relFolder ? `/api/assets/${relFolder}.json?limit=200` : '/api/assets.json?limit=200';
+      const url = `${baseUrl}${apiPath}`;
       const res = await fetchImpl(url, { headers: authHeaders() });
       if (!res.ok) {
-        throw new Error(`Failed to list folder ${cleanFolder} from AEM (HTTP ${res.status})`);
+        throw new Error(`Unable to browse folder ${cleanFolder} (HTTP ${res.status})`);
       }
 
       const data = await res.json();
       const entities = data.entities || [];
+      const folders = [];
       const assets = [];
 
       for (const entity of entities) {
-        const isAsset = (entity.class || []).includes('assets/asset');
-        const mimeType =
-          entity.properties?.metadata?.['dc:format'] ||
-          entity.properties?.['dc:format'] ||
-          '';
-        if (isAsset && (!mimeType || String(mimeType).startsWith('image/'))) {
-          const name = entity.properties?.name || '';
-          const fullPath = `${cleanFolder.replace(/\/$/, '')}/${name}`;
-          assets.push({
-            assetId: entity.properties?.['jcr:uuid'] || fullPath,
-            assetPath: fullPath,
-            assetTitle: entity.properties?.title || name
+        const classes = entity.class || [];
+        const name = entity.properties?.name || '';
+        if (!name) continue;
+        const title = entity.properties?.['dc:title'] || entity.properties?.title || name;
+        const fullPath = `${cleanFolder.replace(/\/$/, '')}/${name}`;
+
+        if (classes.includes('assets/folder')) {
+          folders.push({
+            name,
+            title: Array.isArray(title) ? title[0] : title,
+            folderPath: fullPath
           });
+        } else if (classes.includes('assets/asset')) {
+          const mimeType =
+            entity.properties?.metadata?.['dc:format'] ||
+            entity.properties?.['dc:format'] ||
+            '';
+          if (!mimeType || String(mimeType).startsWith('image/')) {
+            assets.push({
+              assetId: entity.properties?.['jcr:uuid'] || fullPath,
+              assetPath: fullPath,
+              assetTitle: Array.isArray(title) ? title[0] : title,
+              mimeType: mimeType || 'image/jpeg',
+              thumbnailUrl: `${baseUrl}${fullPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`
+            });
+          }
         }
       }
 
-      return assets;
+      return {
+        folderPath: cleanFolder,
+        folderTitle: data.properties?.['dc:title'] || data.properties?.title || cleanFolder.split('/').pop() || 'Assets',
+        folders,
+        assets
+      };
+    },
+
+    /**
+     * Lists image assets inside a DAM folder via the AEM Assets HTTP API.
+     */
+    async listFolderAssets(folderPath) {
+      const browsed = await this.browseDamFolder(folderPath);
+      return browsed.assets || [];
     },
 
     /**

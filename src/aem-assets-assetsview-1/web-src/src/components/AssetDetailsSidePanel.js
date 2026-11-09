@@ -20,29 +20,6 @@ import {
 import { api } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
-const DEMO_ASSETS = [
-  {
-    assetId: 'urn:aaid:aem:demo-keynote-panel',
-    assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
-    label: 'keynote-panel.jpg (3 faces)'
-  },
-  {
-    assetId: 'urn:aaid:aem:demo-backstage-chat',
-    assetPath: '/content/dam/events/2026-summit/backstage-chat.jpg',
-    label: 'backstage-chat.jpg (2 faces)'
-  },
-  {
-    assetId: 'urn:aaid:aem:demo-executive-portrait',
-    assetPath: '/content/dam/events/2026-summit/executive-portrait.jpg',
-    label: 'executive-portrait.jpg (1 face)'
-  },
-  {
-    assetId: 'urn:aaid:aem:demo-workshop-session',
-    assetPath: '/content/dam/events/2026-summit/workshop-session.jpg',
-    label: 'workshop-session.jpg (1 unnamed face)'
-  }
-];
-
 export default function AssetDetailsSidePanel() {
   const navigate = useNavigate();
 
@@ -52,8 +29,8 @@ export default function AssetDetailsSidePanel() {
     imsToken: null,
     imsOrg: null,
     aemHost: null,
-    assetId: DEMO_ASSETS[0].assetId,
-    assetPath: DEMO_ASSETS[0].assetPath
+    assetId: '',
+    assetPath: ''
   });
 
   const [assetData, setAssetData] = useState(null);
@@ -302,35 +279,6 @@ export default function AssetDetailsSidePanel() {
           </Flex>
         </Flex>
 
-        {/* Demo Asset Switcher when previewing outside AEM iframe */}
-        {!hostContext.inAemHost && (
-          <View
-            backgroundColor="gray-100"
-            padding="size-125"
-            borderRadius="small"
-          >
-            <Picker
-              label="Previewing AEM Asset (Side Panel Simulator)"
-              width="100%"
-              selectedKey={hostContext.assetId}
-              onSelectionChange={(key) => {
-                const found = DEMO_ASSETS.find((a) => a.assetId === key);
-                if (found) {
-                  setHostContext((prev) => ({
-                    ...prev,
-                    assetId: found.assetId,
-                    assetPath: found.assetPath
-                  }));
-                }
-              }}
-            >
-              {DEMO_ASSETS.map((item) => (
-                <Item key={item.assetId}>{item.label}</Item>
-              ))}
-            </Picker>
-          </View>
-        )}
-
         {statusBanner && (
           <View
             padding="size-125"
@@ -473,8 +421,7 @@ export default function AssetDetailsSidePanel() {
           <Well>
             <Flex direction="column" gap="size-150">
               <Text>
-                No faces indexed for this asset yet (
-                <code>{hostContext.assetPath || hostContext.assetId}</code>).
+                No faces indexed for this asset yet.
               </Text>
               <Flex gap="size-100" wrap>
                 <Button
@@ -484,17 +431,6 @@ export default function AssetDetailsSidePanel() {
                 >
                   {scanning ? 'Scanning...' : 'Scan Asset with AWS Rekognition'}
                 </Button>
-                <ActionButton
-                  onPress={() =>
-                    setHostContext((prev) => ({
-                      ...prev,
-                      assetId: DEMO_ASSETS[0].assetId,
-                      assetPath: DEMO_ASSETS[0].assetPath
-                    }))
-                  }
-                >
-                  Load Sample 3-Face Asset
-                </ActionButton>
               </Flex>
             </Flex>
           </Well>
