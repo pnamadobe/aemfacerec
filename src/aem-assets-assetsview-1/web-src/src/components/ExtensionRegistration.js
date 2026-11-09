@@ -69,7 +69,8 @@ export default function ExtensionRegistration() {
           id: extensionId,
           methods: {
             actionBar: {
-              async getActions({ context, resourceSelection }) {
+              async getActions(params = {}) {
+                const { context, resourceSelection } = params || {};
                 const resources = Array.isArray(resourceSelection?.resources)
                   ? resourceSelection.resources
                   : Array.isArray(resourceSelection)
@@ -162,7 +163,8 @@ export default function ExtensionRegistration() {
               }
             },
             headerMenu: {
-              async getButtons({ context, resource }) {
+              async getButtons(params = {}) {
+                const { context, resource } = params || {};
                 return [
                   {
                     id: 'face-management',

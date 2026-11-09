@@ -532,6 +532,26 @@ export default function AdminConsole() {
                       <Flex justifyContent="center" paddingY="size-400">
                         <ProgressCircle aria-label="Loading groups..." isIndeterminate />
                       </Flex>
+                    ) : filteredGroups.length === 0 ? (
+                      <Well>
+                        <Flex direction="column" gap="size-150" alignItems="start">
+                          <Heading level={3} margin={0}>
+                            No Face Groups Indexed Yet
+                          </Heading>
+                          <Text UNSAFE_style={{ color: '#475569' }}>
+                            Your Face Groups database is currently empty. Upload images to a
+                            DAM folder with the <strong>Face Recognition</strong> Processing
+                            Profile enabled, scan an existing DAM folder in Tab 2, or click
+                            <strong> Load Sample Data</strong> in the top-right to preview with
+                            sample faces.
+                          </Text>
+                          <Flex gap="size-100">
+                            <Button variant="primary" onPress={handleResetDemoData}>
+                              Load Sample Face Groups
+                            </Button>
+                          </Flex>
+                        </Flex>
+                      </Well>
                     ) : (
                       <div
                         style={{
