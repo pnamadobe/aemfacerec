@@ -1,0 +1,900 @@
+const crypto = require('crypto');
+const { createStorage } = require('./storage');
+const { createRekognitionService } = require('./rekognition');
+const { createAemClient, normalizeDamPath } = require('./aem');
+const { cropFaceAvatar } = require('./cropper');
+
+function generateGroupId() {
+  return `grp_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * Computes the resolved display name for a group based on settings.
+ */
+function getGroupEffectiveMetadataName(group, settings) {
+  if (!group) return null;
+  if (group.name && String(group.name).trim() !== '') {
+    return String(group.name).trim();
+  }
+  if (settings.includeUnnamedInMetadata) {
+    return group.autoLabel || group.groupId;
+  }
+  return null;
+}
+
+/**
+ * Pure helper that computes the exact metadata payload (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`)
+ * for a given asset from the current faces and groups state.
+ */
+function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
+  const faceIds = (assetRecord?.faceIds || []).filter((id) => Boolean(faces[id]));
+  const resolvedGroups = faceIds
+    .map((id) => groups[faces[id]?.groupId])
+    .filter(Boolean);
+
+  const faceNames = Array.from(
+    new Set(
+      resolvedGroups
+        .map((g) => getGroupEffectiveMetadataName(g, settings))
+        .filter(Boolean)
+    )
+  );
+
+  const faceGroupIds = Array.from(
+    new Set(resolvedGroups.map((g) => g.groupId).filter(Boolean))
+  );
+
+  const metadataProperty = settings.metadataProperty || 'xdm:faceNames';
+
+  return {
+    metadataProperty,
+    faceNames,
+    faceGroupIds,
+    faceCount: faceIds.length
+  };
+}
+
+/**
+ * Creates the Face Recognition & Grouping domain service.
+ */
+async function createFaceService({
+  aemHost,
+  token,
+  storage: customStorage,
+  rekognitionClient: customRekognitionClient,
+  aemClient: customAemClient
+} = {}) {
+  const storage = customStorage || (await createStorage());
+  const aemClient = customAemClient || createAemClient({ aemHost, token });
+
+  async function getRekognition() {
+    const settings = await storage.getSettings({ includeDecryptedSecret: true });
+    return {
+      settings,
+      rekognition: createRekognitionService(settings, customRekognitionClient)
+    };
+  }
+
+  /**
+   * Enriches a raw face record with its group details for UI responses.
+   */
+  function enrichFace(face, groups) {
+    if (!face) return null;
+    const group = groups[face.groupId] || null;
+    return {
+      ...face,
+      groupName: group?.name || null,
+      groupAutoLabel: group?.autoLabel || 'Unassigned',
+      groupDisplayName: group?.name || group?.autoLabel || 'Unassigned',
+      groupFaceCount: group?.faceIds?.length || 1
+    };
+  }
+
+  /**
+   * Enriches a group record with its member faces and cover avatar data URL.
+   */
+  function enrichGroup(group, faces) {
+    if (!group) return null;
+    const memberFaces = (group.faceIds || [])
+      .map((id) => faces[id])
+      .filter(Boolean);
+    const uniqueAssets = new Set(memberFaces.map((f) => f.assetId).filter(Boolean));
+    const coverFace =
+      faces[group.coverFaceId] || memberFaces[0] || null;
+
+    return {
+      ...group,
+      displayName: group.name || group.autoLabel || group.groupId,
+      isNamed: Boolean(group.name && group.name.trim()),
+      faceCount: memberFaces.length,
+      assetCount: uniqueAssets.size,
+      coverAvatarDataUrl: coverFace?.avatarDataUrl || null,
+      faces: memberFaces
+    };
+  }
+
+  /**
+   * Recomputes and writes AEM metadata for a set of assetIds.
+   */
+  async function syncAssetsToAem(assetIds, db, settings) {
+    const uniqueAssetIds = Array.from(new Set(assetIds.filter(Boolean)));
+    const results = [];
+
+    for (const assetId of uniqueAssetIds) {
+      const assetRecord = db.assets[assetId];
+      if (!assetRecord) continue;
+
+      const computed = computeAssetFaceMetadata(
+        assetRecord,
+        db.faces,
+        db.groups,
+        settings
+      );
+
+      assetRecord.faceNames = computed.faceNames;
+      assetRecord.faceGroupIds = computed.faceGroupIds;
+      assetRecord.faceCount = computed.faceCount;
+      assetRecord.updatedAt = new Date().toISOString();
+
+      if (assetRecord.assetPath) {
+        const syncRes = await aemClient.updateAssetFaceMetadata(
+          assetRecord.assetPath,
+          computed
+        );
+        results.push(syncRes);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Removes faces previously indexed for an asset (used before re-scanning or on asset deletion).
+   */
+  async function removeExistingAssetFaces(assetId, db, rekognition) {
+    const existingAsset = db.assets[assetId];
+    if (!existingAsset || !Array.isArray(existingAsset.faceIds) || existingAsset.faceIds.length === 0) {
+      return;
+    }
+
+    const oldFaceIds = [...existingAsset.faceIds];
+    const byGroup = {};
+
+    for (const fId of oldFaceIds) {
+      const face = db.faces[fId];
+      if (face && face.groupId) {
+        byGroup[face.groupId] = byGroup[face.groupId] || [];
+        byGroup[face.groupId].push(fId);
+      }
+      delete db.faces[fId];
+      await storage.deleteAvatar(fId);
+    }
+
+    for (const [groupId, fIds] of Object.entries(byGroup)) {
+      await rekognition.disassociateFaces(groupId, fIds);
+      const grp = db.groups[groupId];
+      if (grp) {
+        grp.faceIds = (grp.faceIds || []).filter((id) => !fIds.includes(id));
+        if (grp.faceIds.length === 0) {
+          delete db.groups[groupId];
+          await rekognition.deleteGroup(groupId);
+        } else if (fIds.includes(grp.coverFaceId)) {
+          grp.coverFaceId = grp.faceIds[0];
+        }
+      }
+    }
+
+    await rekognition.deleteFaces(oldFaceIds);
+    existingAsset.faceIds = [];
+  }
+
+  return {
+    /**
+     * Ingests a single AEM asset: checks folder processing profile eligibility,
+     * downloads web rendition, indexes faces in AWS Rekognition, crops 160x160 avatars,
+     * auto-matches or creates face groups, and writes `xdm:faceNames` back to AEM.
+     */
+    async ingestAsset({ assetPath, assetId, assetTitle, imageBuffer, force = false }) {
+      const { settings, rekognition } = await getRekognition();
+      const cleanPath = normalizeDamPath(assetPath);
+
+      if (!force && cleanPath) {
+        const eligibility = await aemClient.checkFolderEligibility(cleanPath, settings);
+        if (!eligibility.eligible) {
+          return {
+            skipped: true,
+            assetPath: cleanPath,
+            reason: eligibility.reason
+          };
+        }
+      }
+
+      const info =
+        assetId && cleanPath
+          ? { assetId, assetPath: cleanPath, assetTitle: assetTitle || cleanPath.split('/').pop() }
+          : await aemClient.getAssetInfo(cleanPath);
+
+      const resolvedAssetId = info.assetId;
+      const resolvedPath = info.assetPath;
+      const resolvedTitle = info.assetTitle;
+
+      const buffer =
+        imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
+
+      const db = await storage.getDatabase();
+
+      // Clean up previous faces for this asset if re-scanning
+      await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
+
+      // Detect and index all faces in the image via AWS Rekognition
+      const detectedFaces = await rekognition.indexAssetFaces(buffer, resolvedAssetId);
+      const now = new Date().toISOString();
+      const newFaceIds = [];
+
+      for (const detected of detectedFaces) {
+        const { faceId, confidence, boundingBox } = detected;
+
+        // 1. Crop 160x160 padded avatar from the in-memory rendition buffer
+        const avatar = await cropFaceAvatar(buffer, boundingBox);
+        const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
+
+        // 2. Search Rekognition Collection for a matching Face Group
+        const match = await rekognition.findMatchingGroup(faceId, db.faces, db.groups);
+        let assignedGroupId = null;
+        let matchConfidence = null;
+
+        if (match && db.groups[match.groupId]) {
+          assignedGroupId = match.groupId;
+          matchConfidence = match.matchConfidence;
+          await rekognition.associateFaces(assignedGroupId, [faceId]);
+          if (!db.groups[assignedGroupId].faceIds.includes(faceId)) {
+            db.groups[assignedGroupId].faceIds.push(faceId);
+          }
+          db.groups[assignedGroupId].updatedAt = now;
+        } else {
+          assignedGroupId = generateGroupId();
+          const personNumber = db.counters.nextPersonNumber || 1;
+          db.counters.nextPersonNumber = personNumber + 1;
+
+          await rekognition.createGroup(assignedGroupId, [faceId]);
+          db.groups[assignedGroupId] = {
+            groupId: assignedGroupId,
+            name: null,
+            autoLabel: `Person #${personNumber}`,
+            coverFaceId: faceId,
+            faceIds: [faceId],
+            createdAt: now,
+            updatedAt: now
+          };
+        }
+
+        db.faces[faceId] = {
+          faceId,
+          groupId: assignedGroupId,
+          assetId: resolvedAssetId,
+          assetPath: resolvedPath,
+          assetTitle: resolvedTitle,
+          boundingBox,
+          confidence,
+          matchConfidence,
+          avatarFile,
+          avatarDataUrl: avatar.dataUrl,
+          createdAt: now
+        };
+
+        newFaceIds.push(faceId);
+      }
+
+      db.assets[resolvedAssetId] = {
+        assetId: resolvedAssetId,
+        assetPath: resolvedPath,
+        assetTitle: resolvedTitle,
+        faceIds: newFaceIds,
+        scannedAt: now,
+        updatedAt: now
+      };
+
+      await syncAssetsToAem([resolvedAssetId], db, settings);
+      await storage.saveDatabase(db);
+
+      return this.getAssetFaces({ assetId: resolvedAssetId, assetPath: resolvedPath });
+    },
+
+    /**
+     * Scans all image assets in a DAM folder.
+     */
+    async scanFolder({ folderPath, force = true }) {
+      const assets = await aemClient.listFolderAssets(folderPath);
+      const results = [];
+      for (const item of assets) {
+        try {
+          const res = await this.ingestAsset({
+            assetPath: item.assetPath,
+            assetId: item.assetId,
+            assetTitle: item.assetTitle,
+            force
+          });
+          results.push({ assetPath: item.assetPath, status: 'processed', faceCount: res.faces?.length || 0 });
+        } catch (err) {
+          results.push({ assetPath: item.assetPath, status: 'error', error: err.message });
+        }
+      }
+      return {
+        folderPath: normalizeDamPath(folderPath),
+        totalAssets: assets.length,
+        results
+      };
+    },
+
+    /**
+     * Retrieves all detected faces and metadata for a specific AEM asset (by assetId or assetPath).
+     */
+    async getAssetFaces({ assetId, assetPath }) {
+      const [db, settings] = await Promise.all([
+        storage.getDatabase(),
+        storage.getSettings()
+      ]);
+
+      let assetRecord = assetId ? db.assets[assetId] : null;
+      if (!assetRecord && assetPath) {
+        const cleanPath = normalizeDamPath(assetPath);
+        assetRecord = Object.values(db.assets).find((a) => a.assetPath === cleanPath) || null;
+      }
+
+      if (!assetRecord) {
+        return {
+          assetId: assetId || null,
+          assetPath: assetPath ? normalizeDamPath(assetPath) : null,
+          scanned: false,
+          faceCount: 0,
+          faceNames: [],
+          faceGroupIds: [],
+          metadataProperty: settings.metadataProperty,
+          faces: []
+        };
+      }
+
+      const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
+      const enrichedFaces = (assetRecord.faceIds || [])
+        .map((id) => enrichFace(db.faces[id], db.groups))
+        .filter(Boolean);
+
+      return {
+        ...assetRecord,
+        scanned: true,
+        faceCount: computed.faceCount,
+        faceNames: computed.faceNames,
+        faceGroupIds: computed.faceGroupIds,
+        metadataProperty: computed.metadataProperty,
+        includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
+        faces: enrichedFaces
+      };
+    },
+
+    /**
+     * Lists all Face Groups (Named and Unnamed) for the Admin Console and group pickers.
+     */
+    async listGroups() {
+      const [db, settings] = await Promise.all([
+        storage.getDatabase(),
+        storage.getSettings()
+      ]);
+
+      const groupsList = Object.values(db.groups)
+        .map((g) => enrichGroup(g, db.faces))
+        .filter(Boolean)
+        .sort((a, b) => {
+          if (a.isNamed !== b.isNamed) return a.isNamed ? -1 : 1;
+          return b.faceCount - a.faceCount;
+        });
+
+      return {
+        groups: groupsList,
+        totalGroups: groupsList.length,
+        totalFaces: Object.keys(db.faces).length,
+        totalAssets: Object.keys(db.assets).length,
+        settings: {
+          metadataProperty: settings.metadataProperty,
+          includeUnnamedInMetadata: settings.includeUnnamedInMetadata
+        }
+      };
+    },
+
+    /**
+     * Names or renames a Face Group and immediately updates `xdm:faceNames` on all assets
+     * containing any face in this group.
+     */
+    async renameGroup({ groupId, name }) {
+      const [db, settings] = await Promise.all([
+        storage.getDatabase(),
+        storage.getSettings()
+      ]);
+
+      const group = db.groups[groupId];
+      if (!group) {
+        throw new Error(`Face Group '${groupId}' not found.`);
+      }
+
+      const cleanName = typeof name === 'string' && name.trim() !== '' ? name.trim() : null;
+      group.name = cleanName;
+      group.updatedAt = new Date().toISOString();
+
+      const affectedAssetIds = (group.faceIds || [])
+        .map((fId) => db.faces[fId]?.assetId)
+        .filter(Boolean);
+
+      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+
+      return {
+        group: enrichGroup(group, db.faces),
+        syncedAssetCount: syncedAssets.length,
+        syncedAssets
+      };
+    },
+
+    /**
+     * Splits one or more faces out of their current group into a brand new standalone group.
+     * Updates AWS Rekognition User associations and recomputes `xdm:faceNames` on affected assets.
+     */
+    async splitFacesToNewGroup({ faceIds = [], newGroupName = null }) {
+      if (!Array.isArray(faceIds) || faceIds.length === 0) {
+        throw new Error('At least one faceId must be provided to split into a new group.');
+      }
+
+      const { settings, rekognition } = await getRekognition();
+      const db = await storage.getDatabase();
+      const now = new Date().toISOString();
+
+      const validFaceIds = faceIds.filter((fId) => Boolean(db.faces[fId]));
+      if (validFaceIds.length === 0) {
+        throw new Error('None of the specified faceIds exist.');
+      }
+
+      // Group faces by their current groupId so we can disassociate them cleanly
+      const byOldGroup = {};
+      const affectedAssetIds = [];
+
+      for (const fId of validFaceIds) {
+        const face = db.faces[fId];
+        affectedAssetIds.push(face.assetId);
+        if (face.groupId) {
+          byOldGroup[face.groupId] = byOldGroup[face.groupId] || [];
+          byOldGroup[face.groupId].push(fId);
+        }
+      }
+
+      for (const [oldGroupId, fIds] of Object.entries(byOldGroup)) {
+        await rekognition.disassociateFaces(oldGroupId, fIds);
+        const oldGroup = db.groups[oldGroupId];
+        if (oldGroup) {
+          oldGroup.faceIds = (oldGroup.faceIds || []).filter((id) => !fIds.includes(id));
+          oldGroup.updatedAt = now;
+          if (oldGroup.faceIds.length === 0) {
+            delete db.groups[oldGroupId];
+            await rekognition.deleteGroup(oldGroupId);
+          } else if (fIds.includes(oldGroup.coverFaceId)) {
+            oldGroup.coverFaceId = oldGroup.faceIds[0];
+          }
+        }
+      }
+
+      const newGroupId = generateGroupId();
+      const personNumber = db.counters.nextPersonNumber || 1;
+      db.counters.nextPersonNumber = personNumber + 1;
+
+      await rekognition.createGroup(newGroupId, validFaceIds);
+
+      const cleanNewName =
+        typeof newGroupName === 'string' && newGroupName.trim() !== ''
+          ? newGroupName.trim()
+          : null;
+
+      db.groups[newGroupId] = {
+        groupId: newGroupId,
+        name: cleanNewName,
+        autoLabel: `Person #${personNumber}`,
+        coverFaceId: validFaceIds[0],
+        faceIds: validFaceIds,
+        createdAt: now,
+        updatedAt: now
+      };
+
+      for (const fId of validFaceIds) {
+        db.faces[fId].groupId = newGroupId;
+      }
+
+      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+
+      return {
+        newGroup: enrichGroup(db.groups[newGroupId], db.faces),
+        syncedAssetCount: syncedAssets.length,
+        syncedAssets
+      };
+    },
+
+    /**
+     * Moves one or more faces from their current group(s) into an existing target group.
+     * Supports combining an individual face into another group.
+     */
+    async moveFacesToGroup({ faceIds = [], targetGroupId }) {
+      if (!Array.isArray(faceIds) || faceIds.length === 0) {
+        throw new Error('At least one faceId is required.');
+      }
+
+      const { settings, rekognition } = await getRekognition();
+      const db = await storage.getDatabase();
+      const now = new Date().toISOString();
+
+      const targetGroup = db.groups[targetGroupId];
+      if (!targetGroup) {
+        throw new Error(`Target Face Group '${targetGroupId}' not found.`);
+      }
+
+      const facesToMove = faceIds.filter(
+        (fId) => db.faces[fId] && db.faces[fId].groupId !== targetGroupId
+      );
+
+      if (facesToMove.length === 0) {
+        return {
+          targetGroup: enrichGroup(targetGroup, db.faces),
+          syncedAssetCount: 0,
+          syncedAssets: []
+        };
+      }
+
+      const bySourceGroup = {};
+      const affectedAssetIds = [];
+
+      for (const fId of facesToMove) {
+        const face = db.faces[fId];
+        affectedAssetIds.push(face.assetId);
+        if (face.groupId) {
+          bySourceGroup[face.groupId] = bySourceGroup[face.groupId] || [];
+          bySourceGroup[face.groupId].push(fId);
+        }
+      }
+
+      for (const [sourceGroupId, fIds] of Object.entries(bySourceGroup)) {
+        await rekognition.disassociateFaces(sourceGroupId, fIds);
+        const sourceGroup = db.groups[sourceGroupId];
+        if (sourceGroup) {
+          sourceGroup.faceIds = (sourceGroup.faceIds || []).filter((id) => !fIds.includes(id));
+          sourceGroup.updatedAt = now;
+          if (sourceGroup.faceIds.length === 0) {
+            delete db.groups[sourceGroupId];
+            await rekognition.deleteGroup(sourceGroupId);
+          } else if (fIds.includes(sourceGroup.coverFaceId)) {
+            sourceGroup.coverFaceId = sourceGroup.faceIds[0];
+          }
+        }
+      }
+
+      await rekognition.associateFaces(targetGroupId, facesToMove);
+
+      for (const fId of facesToMove) {
+        if (!targetGroup.faceIds.includes(fId)) {
+          targetGroup.faceIds.push(fId);
+        }
+        db.faces[fId].groupId = targetGroupId;
+      }
+      targetGroup.updatedAt = now;
+
+      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+
+      return {
+        targetGroup: enrichGroup(targetGroup, db.faces),
+        syncedAssetCount: syncedAssets.length,
+        syncedAssets
+      };
+    },
+
+    /**
+     * Combines / merges one or more source Face Groups into a target Face Group.
+     * Disassociates faces from the source groups in AWS Rekognition, associates them
+     * with targetGroupId, deletes the source groups, and updates `xdm:faceNames` on all affected assets.
+     */
+    async mergeGroups({ sourceGroupIds = [], targetGroupId }) {
+      const sources = (Array.isArray(sourceGroupIds) ? sourceGroupIds : [sourceGroupIds]).filter(
+        (id) => id && id !== targetGroupId
+      );
+
+      if (!targetGroupId || sources.length === 0) {
+        throw new Error('A targetGroupId and at least one distinct sourceGroupId are required.');
+      }
+
+      const { settings, rekognition } = await getRekognition();
+      const db = await storage.getDatabase();
+      const now = new Date().toISOString();
+
+      const targetGroup = db.groups[targetGroupId];
+      if (!targetGroup) {
+        throw new Error(`Target Face Group '${targetGroupId}' not found.`);
+      }
+
+      const allMovedFaceIds = [];
+      const affectedAssetIds = [];
+
+      for (const srcId of sources) {
+        const srcGroup = db.groups[srcId];
+        if (!srcGroup) continue;
+
+        const srcFaces = [...(srcGroup.faceIds || [])];
+        if (srcFaces.length > 0) {
+          await rekognition.disassociateFaces(srcId, srcFaces);
+          allMovedFaceIds.push(...srcFaces);
+          for (const fId of srcFaces) {
+            if (db.faces[fId]) {
+              db.faces[fId].groupId = targetGroupId;
+              affectedAssetIds.push(db.faces[fId].assetId);
+            }
+          }
+        }
+
+        // If targetGroup is unnamed and source group had a name, inherit the source group's name
+        if (!targetGroup.name && srcGroup.name) {
+          targetGroup.name = srcGroup.name;
+        }
+
+        delete db.groups[srcId];
+        await rekognition.deleteGroup(srcId);
+      }
+
+      if (allMovedFaceIds.length > 0) {
+        await rekognition.associateFaces(targetGroupId, allMovedFaceIds);
+        for (const fId of allMovedFaceIds) {
+          if (!targetGroup.faceIds.includes(fId)) {
+            targetGroup.faceIds.push(fId);
+          }
+        }
+      }
+
+      targetGroup.updatedAt = now;
+
+      // Also include targetGroup's existing assets in case targetGroup inherited a name
+      for (const fId of targetGroup.faceIds) {
+        if (db.faces[fId]?.assetId) {
+          affectedAssetIds.push(db.faces[fId].assetId);
+        }
+      }
+
+      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+
+      return {
+        targetGroup: enrichGroup(targetGroup, db.faces),
+        mergedGroupIds: sources,
+        movedFaceCount: allMovedFaceIds.length,
+        syncedAssetCount: syncedAssets.length,
+        syncedAssets
+      };
+    },
+
+    /**
+     * Re-computes and syncs `xdm:faceNames` on all indexed AEM assets
+     * (e.g. after toggling `includeUnnamedInMetadata` in Settings).
+     */
+    async resyncAllAssetsMetadata() {
+      const [db, settings] = await Promise.all([
+        storage.getDatabase(),
+        storage.getSettings()
+      ]);
+
+      const allAssetIds = Object.keys(db.assets);
+      const syncedAssets = await syncAssetsToAem(allAssetIds, db, settings);
+      await storage.saveDatabase(db);
+
+      return {
+        syncedAssetCount: syncedAssets.length,
+        syncedAssets
+      };
+    },
+
+    /**
+     * Seeds realistic sample assets, face groups, and SVG portrait avatars for instant demo/testing
+     * before live AWS credentials or AEM assets are connected.
+     */
+    async seedDemoData() {
+      const [db, settings] = await Promise.all([
+        storage.getDatabase(),
+        storage.getSettings()
+      ]);
+
+      const now = new Date().toISOString();
+
+      function makePortraitSvg(bg, hair, skin, label) {
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+          <rect width="160" height="160" rx="20" fill="${bg}"/>
+          <circle cx="80" cy="58" r="34" fill="${hair}"/>
+          <circle cx="80" cy="66" r="26" fill="${skin}"/>
+          <circle cx="71" cy="63" r="3" fill="#1f2937"/>
+          <circle cx="89" cy="63" r="3" fill="#1f2937"/>
+          <path d="M72 75 Q80 82 88 75" stroke="#1f2937" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+          <path d="M36 146 C36 108 124 108 124 146" fill="${hair}"/>
+          <rect x="14" y="128" width="132" height="22" rx="8" fill="rgba(0,0,0,0.45)"/>
+          <text x="80" y="143" font-family="sans-serif" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">${label}</text>
+        </svg>`;
+        return `data:image/svg+xml;base64,${Buffer.from(svg, 'utf8').toString('base64')}`;
+      }
+
+      const demoGroups = {
+        grp_sarah01: {
+          groupId: 'grp_sarah01',
+          name: 'Sarah Jenkins',
+          autoLabel: 'Person #1',
+          coverFaceId: 'face-sarah-1',
+          faceIds: ['face-sarah-1', 'face-sarah-2'],
+          createdAt: now,
+          updatedAt: now
+        },
+        grp_marcus02: {
+          groupId: 'grp_marcus02',
+          name: 'Marcus Vance',
+          autoLabel: 'Person #2',
+          coverFaceId: 'face-marcus-1',
+          faceIds: ['face-marcus-1', 'face-marcus-2'],
+          createdAt: now,
+          updatedAt: now
+        },
+        grp_unnamed03: {
+          groupId: 'grp_unnamed03',
+          name: null,
+          autoLabel: 'Person #3',
+          coverFaceId: 'face-p3-1',
+          faceIds: ['face-p3-1', 'face-p3-2'],
+          createdAt: now,
+          updatedAt: now
+        },
+        grp_unnamed04: {
+          groupId: 'grp_unnamed04',
+          name: null,
+          autoLabel: 'Person #4',
+          coverFaceId: 'face-p4-1',
+          faceIds: ['face-p4-1'],
+          createdAt: now,
+          updatedAt: now
+        }
+      };
+
+      const demoFaces = {
+        'face-sarah-1': {
+          faceId: 'face-sarah-1',
+          groupId: 'grp_sarah01',
+          assetId: 'urn:aaid:aem:demo-keynote-panel',
+          assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
+          assetTitle: 'keynote-panel.jpg',
+          boundingBox: { left: 0.14, top: 0.22, width: 0.14, height: 0.22 },
+          confidence: 99.92,
+          matchConfidence: 98.4,
+          avatarDataUrl: makePortraitSvg('#1e3a8a', '#451a03', '#f3d2b3', 'Sarah (1)'),
+          createdAt: now
+        },
+        'face-marcus-1': {
+          faceId: 'face-marcus-1',
+          groupId: 'grp_marcus02',
+          assetId: 'urn:aaid:aem:demo-keynote-panel',
+          assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
+          assetTitle: 'keynote-panel.jpg',
+          boundingBox: { left: 0.44, top: 0.20, width: 0.15, height: 0.23 },
+          confidence: 99.87,
+          matchConfidence: 96.1,
+          avatarDataUrl: makePortraitSvg('#065f46', '#111827', '#c68642', 'Marcus (1)'),
+          createdAt: now
+        },
+        'face-p3-1': {
+          faceId: 'face-p3-1',
+          groupId: 'grp_unnamed03',
+          assetId: 'urn:aaid:aem:demo-keynote-panel',
+          assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
+          assetTitle: 'keynote-panel.jpg',
+          boundingBox: { left: 0.72, top: 0.24, width: 0.13, height: 0.21 },
+          confidence: 99.54,
+          matchConfidence: null,
+          avatarDataUrl: makePortraitSvg('#5b21b6', '#9a3412', '#f7dec4', 'Person #3 (1)'),
+          createdAt: now
+        },
+        'face-sarah-2': {
+          faceId: 'face-sarah-2',
+          groupId: 'grp_sarah01',
+          assetId: 'urn:aaid:aem:demo-backstage-chat',
+          assetPath: '/content/dam/events/2026-summit/backstage-chat.jpg',
+          assetTitle: 'backstage-chat.jpg',
+          boundingBox: { left: 0.25, top: 0.18, width: 0.18, height: 0.26 },
+          confidence: 99.95,
+          matchConfidence: 97.8,
+          avatarDataUrl: makePortraitSvg('#1d4ed8', '#451a03', '#f3d2b3', 'Sarah (2)'),
+          createdAt: now
+        },
+        'face-p3-2': {
+          faceId: 'face-p3-2',
+          groupId: 'grp_unnamed03',
+          assetId: 'urn:aaid:aem:demo-backstage-chat',
+          assetPath: '/content/dam/events/2026-summit/backstage-chat.jpg',
+          assetTitle: 'backstage-chat.jpg',
+          boundingBox: { left: 0.61, top: 0.21, width: 0.17, height: 0.25 },
+          confidence: 98.91,
+          matchConfidence: 88.2,
+          avatarDataUrl: makePortraitSvg('#6d28d9', '#78350f', '#e0ac69', 'Misgrouped?'),
+          createdAt: now
+        },
+        'face-marcus-2': {
+          faceId: 'face-marcus-2',
+          groupId: 'grp_marcus02',
+          assetId: 'urn:aaid:aem:demo-executive-portrait',
+          assetPath: '/content/dam/events/2026-summit/executive-portrait.jpg',
+          assetTitle: 'executive-portrait.jpg',
+          boundingBox: { left: 0.36, top: 0.16, width: 0.26, height: 0.36 },
+          confidence: 99.98,
+          matchConfidence: 99.1,
+          avatarDataUrl: makePortraitSvg('#047857', '#111827', '#c68642', 'Marcus (2)'),
+          createdAt: now
+        },
+        'face-p4-1': {
+          faceId: 'face-p4-1',
+          groupId: 'grp_unnamed04',
+          assetId: 'urn:aaid:aem:demo-workshop-session',
+          assetPath: '/content/dam/events/2026-summit/workshop-session.jpg',
+          assetTitle: 'workshop-session.jpg',
+          boundingBox: { left: 0.41, top: 0.23, width: 0.19, height: 0.28 },
+          confidence: 99.41,
+          matchConfidence: null,
+          avatarDataUrl: makePortraitSvg('#9d174d', '#78350f', '#e0ac69', 'Person #4'),
+          createdAt: now
+        }
+      };
+
+      const demoAssets = {
+        'urn:aaid:aem:demo-keynote-panel': {
+          assetId: 'urn:aaid:aem:demo-keynote-panel',
+          assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
+          assetTitle: 'keynote-panel.jpg',
+          faceIds: ['face-sarah-1', 'face-marcus-1', 'face-p3-1'],
+          scannedAt: now,
+          updatedAt: now
+        },
+        'urn:aaid:aem:demo-backstage-chat': {
+          assetId: 'urn:aaid:aem:demo-backstage-chat',
+          assetPath: '/content/dam/events/2026-summit/backstage-chat.jpg',
+          assetTitle: 'backstage-chat.jpg',
+          faceIds: ['face-sarah-2', 'face-p3-2'],
+          scannedAt: now,
+          updatedAt: now
+        },
+        'urn:aaid:aem:demo-executive-portrait': {
+          assetId: 'urn:aaid:aem:demo-executive-portrait',
+          assetPath: '/content/dam/events/2026-summit/executive-portrait.jpg',
+          assetTitle: 'executive-portrait.jpg',
+          faceIds: ['face-marcus-2'],
+          scannedAt: now,
+          updatedAt: now
+        },
+        'urn:aaid:aem:demo-workshop-session': {
+          assetId: 'urn:aaid:aem:demo-workshop-session',
+          assetPath: '/content/dam/events/2026-summit/workshop-session.jpg',
+          assetTitle: 'workshop-session.jpg',
+          faceIds: ['face-p4-1'],
+          scannedAt: now,
+          updatedAt: now
+        }
+      };
+
+      db.groups = demoGroups;
+      db.faces = demoFaces;
+      db.assets = demoAssets;
+      db.counters = { nextPersonNumber: 5 };
+
+      await syncAssetsToAem(Object.keys(demoAssets), db, settings);
+      await storage.saveDatabase(db);
+
+      return this.listGroups();
+    }
+  };
+}
+
+module.exports = {
+  createFaceService,
+  computeAssetFaceMetadata,
+  getGroupEffectiveMetadataName
+};

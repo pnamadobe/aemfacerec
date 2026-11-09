@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.parcel-cache/
+.env
+.aio
+.wskprops
+console.json
+*.log
+.DS_Store
+.local-storage/
