@@ -1,4 +1,5 @@
 const { createFaceService } = require('../lib/face-service');
+const { createStorage } = require('../lib/storage');
 const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
 const { errorResponse } = require('../lib/security');
 
@@ -35,7 +36,21 @@ function extractAssetFromIoEvent(params) {
     event.format ||
     null;
 
-  return { assetPath, assetId, mimeType: format ? String(format) : null };
+  const eventId =
+    params.event_id ||
+    event.id ||
+    event['@id'] ||
+    event.event_id ||
+    obj['repo:etag'] ||
+    repoMeta['repo:etag'] ||
+    null;
+
+  return {
+    assetPath,
+    assetId,
+    mimeType: format ? String(format) : null,
+    eventId: eventId ? String(eventId) : null
+  };
 }
 
 /**
@@ -65,11 +80,12 @@ async function main(params = {}) {
 
   try {
     const ctx = buildActionContext(params);
+    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
     const faceService = await createFaceService({
       aemHost: ctx.aemHost,
       token: ctx.token,
       serviceCredentials: ctx.serviceCredentials,
-      encryptionSecret: ctx.encryptionSecret
+      storage
     });
 
     const operation = params.operation || 'ingestAsset';
@@ -102,7 +118,7 @@ async function main(params = {}) {
       return { statusCode: 200, headers: corsHeaders, body: result };
     }
 
-    const { assetPath, assetId, mimeType } = extractAssetFromIoEvent(params);
+    const { assetPath, assetId, mimeType, eventId } = extractAssetFromIoEvent(params);
     if (!assetPath) {
       return {
         statusCode: 400,
@@ -113,6 +129,24 @@ async function main(params = {}) {
 
     // If invoked directly from the UI ("Scan / Re-scan Asset"), force=true bypasses folder check
     const isManualTrigger = parseFlag(params.force, false);
+
+    // R10: I/O Event idempotency — skip duplicate/retry deliveries of the same event
+    if (!isManualTrigger && eventId) {
+      const idempotencyKey = `${eventId}:${assetId || assetPath}`;
+      const claimed = await storage.claimEventIdempotencyKey(idempotencyKey);
+      if (!claimed) {
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: {
+            skipped: true,
+            assetPath,
+            reasonCode: 'duplicate-event',
+            reason: `Duplicate event '${eventId}' already processed.`
+          }
+        };
+      }
+    }
     const result = await faceService.ingestAsset({
       assetPath,
       assetId,

@@ -6,6 +6,7 @@ const { PublicError, assertDamPath } = require('./security');
 const { mapWithConcurrency } = require('./retry');
 
 const AEM_WRITE_CONCURRENCY = 4;
+const DEFAULT_SYNC_TIME_BUDGET_MS = 18000;
 
 // Page sizes keep every response far below the 1 MB Adobe I/O Runtime limit.
 // A 72px JPEG avatar is ~2-4 KB as a data URL.
@@ -239,53 +240,104 @@ async function createFaceService({
   /**
    * Recomputes and writes AEM metadata for a set of assetIds.
    *
-   * Writes run with bounded concurrency, and a failure on one asset never aborts the batch:
-   * callers always persist their database changes and report failures to the user.
-   * Returns { synced, failed }.
+   * - Writes run with bounded concurrency (`AEM_WRITE_CONCURRENCY`).
+   * - Enforces an optional `timeBudgetMs` so large fan-outs (e.g. a person in 1,000 photos
+   *   or a full-library resync) stop cleanly before the 30s gateway timeout and return
+   *   `hasMore: true, nextOffset, remainingAssetCount` (`R14`).
+   * - A failure on one asset never aborts the batch; callers always persist their database
+   *   changes first and report failures/remaining counts to the user.
    */
-  async function syncAssetsToAem(assetIds, db, settings) {
-    const uniqueAssetIds = Array.from(new Set(assetIds.filter(Boolean)));
-    const synced = [];
-    const failed = [];
-
+  async function syncAssetsToAem(
+    assetIds,
+    db,
+    settings,
+    { offset = 0, limit = 0, timeBudgetMs = 0 } = {}
+  ) {
+    const startTime = Date.now();
     const seenPaths = new Set();
-    await mapWithConcurrency(uniqueAssetIds, AEM_WRITE_CONCURRENCY, async (assetId) => {
+    const dedupedRecords = [];
+
+    for (const assetId of assetIds.filter(Boolean)) {
       const assetRecord = findAssetRecord(db, assetId, null);
-      if (!assetRecord) return;
+      if (!assetRecord) continue;
       const dedupeKey = safeNormalizeDamPath(assetRecord.assetPath) || assetRecord.assetId;
-      if (seenPaths.has(dedupeKey)) return;
+      if (seenPaths.has(dedupeKey)) continue;
       seenPaths.add(dedupeKey);
 
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
-
       assetRecord.faceNames = computed.faceNames;
       assetRecord.faceGroupIds = computed.faceGroupIds;
       assetRecord.faceCount = computed.faceCount;
       assetRecord.updatedAt = new Date().toISOString();
+      dedupedRecords.push({ assetRecord, computed });
+    }
 
-      if (!assetRecord.assetPath) return;
-      try {
-        const syncRes = await aemClient.updateAssetFaceMetadata(assetRecord.assetPath, computed);
-        assetRecord.metadataSyncError = null;
-        synced.push(syncRes);
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error(`[facerec] metadata sync failed for ${assetRecord.assetPath}:`, err.message);
-        const message = err.expose ? err.message : 'AEM metadata update failed.';
-        assetRecord.metadataSyncError = message;
-        failed.push({ assetPath: assetRecord.assetPath, error: message });
+    const startIdx = Math.max(0, Number(offset) || 0);
+    const maxItems = Number(limit) > 0 ? Number(limit) : dedupedRecords.length;
+    const targetSlice = dedupedRecords.slice(startIdx, startIdx + maxItems);
+
+    const synced = [];
+    const failed = [];
+    let processedCount = 0;
+    let stoppedForTimeBudget = false;
+
+    for (let i = 0; i < targetSlice.length; i += AEM_WRITE_CONCURRENCY) {
+      if (i > 0 && timeBudgetMs > 0 && Date.now() - startTime >= timeBudgetMs) {
+        stoppedForTimeBudget = true;
+        break;
       }
-    });
+      const chunk = targetSlice.slice(i, i + AEM_WRITE_CONCURRENCY);
+      // eslint-disable-next-line no-await-in-loop
+      await Promise.all(
+        chunk.map(async ({ assetRecord, computed }) => {
+          processedCount++;
+          if (!assetRecord.assetPath) return;
+          try {
+            const syncRes = await aemClient.updateAssetFaceMetadata(
+              assetRecord.assetPath,
+              computed
+            );
+            assetRecord.metadataSyncError = null;
+            synced.push(syncRes);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error(
+              `[facerec] metadata sync failed for ${assetRecord.assetPath}:`,
+              err.message
+            );
+            const message = err.expose ? err.message : 'AEM metadata update failed.';
+            assetRecord.metadataSyncError = message;
+            failed.push({ assetPath: assetRecord.assetPath, error: message });
+          }
+        })
+      );
+    }
 
-    return { synced, failed };
+    const nextOffset = startIdx + processedCount;
+    const hasMore = stoppedForTimeBudget || nextOffset < dedupedRecords.length;
+    const remainingAssetCount = Math.max(0, dedupedRecords.length - nextOffset);
+
+    return {
+      synced,
+      failed,
+      totalAssets: dedupedRecords.length,
+      processedCount,
+      hasMore,
+      nextOffset: hasMore ? nextOffset : null,
+      remainingAssetCount
+    };
   }
 
-  function syncSummary({ synced, failed }) {
+  function syncSummary(sync) {
     return {
-      syncedAssetCount: synced.length,
-      syncedAssets: synced,
-      failedAssetCount: failed.length,
-      failedAssets: failed
+      syncedAssetCount: sync.synced.length,
+      syncedAssets: sync.synced,
+      failedAssetCount: sync.failed.length,
+      failedAssets: sync.failed,
+      totalAssetsToSync: sync.totalAssets ?? sync.synced.length + sync.failed.length,
+      hasMoreToSync: Boolean(sync.hasMore),
+      nextSyncOffset: sync.nextOffset ?? null,
+      remainingAssetCount: sync.remainingAssetCount ?? 0
     };
   }
 
@@ -822,8 +874,8 @@ async function createFaceService({
           assetRecord =
             allAssets.find((a) => a.assetPath === decodedPath) || null;
           if (assetRecord) {
+            // R13: getAssetFaces is a read path; never rewrite the database during a read
             assetRecord.uuid = rawUuid;
-            await storage.saveDatabase(db);
           }
         }
       }
@@ -970,7 +1022,7 @@ async function createFaceService({
      * Names or renames a Face Group and immediately updates `xdm:faceNames` on all assets
      * containing any face in this group.
      */
-    async renameGroup({ groupId, name }) {
+    async renameGroup({ groupId, name, timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS }) {
       const [db, settings] = await Promise.all([
         storage.getDatabase(),
         storage.getSettings()
@@ -992,7 +1044,9 @@ async function createFaceService({
         .map((fId) => db.faces[fId]?.assetId)
         .filter(Boolean);
 
-      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
+      // Save the rename first so it is never lost if the AEM sync hits a time budget
+      await storage.saveDatabase(db);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings, { timeBudgetMs });
       await storage.saveDatabase(db);
 
       return {
@@ -1005,7 +1059,11 @@ async function createFaceService({
      * Splits one or more faces out of their current group into a brand new standalone group.
      * Updates AWS Rekognition User associations and recomputes `xdm:faceNames` on affected assets.
      */
-    async splitFacesToNewGroup({ faceIds = [], newGroupName = null }) {
+    async splitFacesToNewGroup({
+      faceIds = [],
+      newGroupName = null,
+      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS
+    }) {
       if (!Array.isArray(faceIds) || faceIds.length === 0) {
         throw new PublicError('At least one faceId must be provided to split into a new group.');
       }
@@ -1072,7 +1130,8 @@ async function createFaceService({
         db.faces[fId].groupId = newGroupId;
       }
 
-      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings, { timeBudgetMs });
       await storage.saveDatabase(db);
 
       return {
@@ -1085,7 +1144,11 @@ async function createFaceService({
      * Moves one or more faces from their current group(s) into an existing target group.
      * Supports combining an individual face into another group.
      */
-    async moveFacesToGroup({ faceIds = [], targetGroupId }) {
+    async moveFacesToGroup({
+      faceIds = [],
+      targetGroupId,
+      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS
+    }) {
       if (!Array.isArray(faceIds) || faceIds.length === 0) {
         throw new PublicError('At least one faceId is required.');
       }
@@ -1139,15 +1202,18 @@ async function createFaceService({
 
       await rekognition.associateFaces(targetGroupId, facesToMove);
 
+      const existingInTarget = new Set(targetGroup.faceIds || []);
       for (const fId of facesToMove) {
-        if (!targetGroup.faceIds.includes(fId)) {
+        if (!existingInTarget.has(fId)) {
           targetGroup.faceIds.push(fId);
+          existingInTarget.add(fId);
         }
         db.faces[fId].groupId = targetGroupId;
       }
       targetGroup.updatedAt = now;
 
-      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings, { timeBudgetMs });
       await storage.saveDatabase(db);
 
       return {
@@ -1161,7 +1227,11 @@ async function createFaceService({
      * Disassociates faces from the source groups in AWS Rekognition, associates them
      * with targetGroupId, deletes the source groups, and updates `xdm:faceNames` on all affected assets.
      */
-    async mergeGroups({ sourceGroupIds = [], targetGroupId }) {
+    async mergeGroups({
+      sourceGroupIds = [],
+      targetGroupId,
+      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS
+    }) {
       const sources = (Array.isArray(sourceGroupIds) ? sourceGroupIds : [sourceGroupIds]).filter(
         (id) => id && id !== targetGroupId
       );
@@ -1209,9 +1279,11 @@ async function createFaceService({
 
       if (allMovedFaceIds.length > 0) {
         await rekognition.associateFaces(targetGroupId, allMovedFaceIds);
+        const existingInTarget = new Set(targetGroup.faceIds || []);
         for (const fId of allMovedFaceIds) {
-          if (!targetGroup.faceIds.includes(fId)) {
+          if (!existingInTarget.has(fId)) {
             targetGroup.faceIds.push(fId);
+            existingInTarget.add(fId);
           }
         }
       }
@@ -1225,7 +1297,8 @@ async function createFaceService({
         }
       }
 
-      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
+      await storage.saveDatabase(db);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings, { timeBudgetMs });
       await storage.saveDatabase(db);
 
       return {
@@ -1240,14 +1313,22 @@ async function createFaceService({
      * Re-computes and syncs `xdm:faceNames` on all indexed AEM assets
      * (e.g. after toggling `includeUnnamedInMetadata` in Settings).
      */
-    async resyncAllAssetsMetadata() {
+    async resyncAllAssetsMetadata({
+      offset = 0,
+      limit = 0,
+      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS
+    } = {}) {
       const [db, settings] = await Promise.all([
         storage.getDatabase(),
         storage.getSettings()
       ]);
 
       const allAssetIds = Object.keys(db.assets);
-      const sync = await syncAssetsToAem(allAssetIds, db, settings);
+      const sync = await syncAssetsToAem(allAssetIds, db, settings, {
+        offset,
+        limit,
+        timeBudgetMs
+      });
       await storage.saveDatabase(db);
 
       return {

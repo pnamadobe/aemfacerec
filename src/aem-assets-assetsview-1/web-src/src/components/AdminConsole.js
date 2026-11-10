@@ -488,12 +488,17 @@ export default function AdminConsole() {
           .filter(Boolean)
       };
       const res = await api.saveSettings(payload, hostContext);
+      let totalResynced = res.resyncedAssets || 0;
+      if (res.hasMoreToSync) {
+        const rest = await api.resyncAllAssets(hostContext);
+        totalResynced += rest.syncedAssetCount || 0;
+      }
       await loadAll();
       setBanner({
         type: 'positive',
         text: `Settings saved. ${
-          res.resyncedAssets
-            ? `Re-synced ${settings.metadataProperty} across ${res.resyncedAssets} asset(s).`
+          totalResynced
+            ? `Re-synced ${settings.metadataProperty} across ${totalResynced} asset(s).`
             : ''
         }`
       });

@@ -110,7 +110,11 @@ async function main(params = {}) {
       }
 
       case 'resyncAllAssets': {
-        const result = await faceService.resyncAllAssetsMetadata();
+        const result = await faceService.resyncAllAssetsMetadata({
+          offset: params.offset,
+          limit: params.limit,
+          timeBudgetMs: params.timeBudgetMs
+        });
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 

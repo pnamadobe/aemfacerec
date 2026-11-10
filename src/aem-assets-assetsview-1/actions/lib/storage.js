@@ -12,6 +12,8 @@ const {
 const AWS_REGION_PATTERN = /^[a-z]{2}(-gov)?-[a-z]+-\d$/;
 const COLLECTION_ID_PATTERN = /^[a-zA-Z0-9_.\-]{1,255}$/;
 const FACE_ID_PATTERN = /^[a-zA-Z0-9_.\-:]{1,128}$/;
+const EVENT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_STORED_EVENT_KEYS = 2000;
 
 function isNotFoundError(err) {
   if (!err) return false;
@@ -194,6 +196,40 @@ async function createStorage(options = {}) {
           'No persistent storage backend (aio-lib-files / aio-lib-state) is available in this Runtime namespace.'
         );
       }
+
+      // Cross-container distributed lease + event dedupe via @adobe/aio-lib-state when available
+      try {
+        const stateLib = require('@adobe/aio-lib-state');
+        const state = await stateLib.init();
+        const LOCK_KEY = 'facerec_db_lease_lock_v1';
+        backend.acquireLease = async (ownerId, ttlSeconds = 60) => {
+          const res = await state.put(LOCK_KEY, ownerId, {
+            ttl: Math.max(60, Math.ceil(ttlSeconds)),
+            ifNotExists: true
+          });
+          return Boolean(res);
+        };
+        backend.releaseLease = async (ownerId) => {
+          try {
+            const cur = await state.get(LOCK_KEY);
+            if (!cur || !cur.value || cur.value === ownerId) {
+              await state.delete(LOCK_KEY);
+            }
+          } catch (e) {
+            // lease will expire naturally via TTL
+          }
+        };
+        backend.claimIdempotencyKey = async (eventKey, ttlSeconds = 86400) => {
+          const safeKey = `facerec_evt_${crypto.createHash('sha256').update(String(eventKey)).digest('hex').slice(0, 40)}`;
+          const res = await state.put(safeKey, new Date().toISOString(), {
+            ttl: Math.max(60, Math.ceil(ttlSeconds)),
+            ifNotExists: true
+          });
+          return Boolean(res);
+        };
+      } catch (e) {
+        // State store unavailable; file/directory lease fallback is used below
+      }
     }
   }
 
@@ -230,6 +266,41 @@ async function createStorage(options = {}) {
         if (fs.existsSync(full)) {
           fs.unlinkSync(full);
         }
+      },
+      async acquireLease(ownerId, ttlSeconds = 60) {
+        const lockDir = path.join(baseDir, 'db/.lease.lock');
+        fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+        try {
+          fs.mkdirSync(lockDir);
+          fs.writeFileSync(
+            path.join(lockDir, 'owner.json'),
+            JSON.stringify({ ownerId, expiresAt: Date.now() + ttlSeconds * 1000 })
+          );
+          return true;
+        } catch (err) {
+          if (err.code !== 'EEXIST') throw err;
+          try {
+            const info = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
+            if (info.expiresAt && Date.now() > info.expiresAt) {
+              fs.rmSync(lockDir, { recursive: true, force: true });
+              return this.acquireLease(ownerId, ttlSeconds);
+            }
+          } catch (e) {
+            // another process is mid-write
+          }
+          return false;
+        }
+      },
+      async releaseLease(ownerId) {
+        const lockDir = path.join(baseDir, 'db/.lease.lock');
+        try {
+          const info = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
+          if (!info.ownerId || info.ownerId === ownerId) {
+            fs.rmSync(lockDir, { recursive: true, force: true });
+          }
+        } catch (e) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        }
       }
     };
   }
@@ -252,6 +323,116 @@ async function createStorage(options = {}) {
     await backend.writeText(filePath, JSON.stringify(data));
   }
 
+  // Serializes mutations inside the same Node process and coordinates across processes/containers
+  // via backend.acquireLease when available.
+  let inProcessChain = Promise.resolve();
+  const sleep = options.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+  async function withDatabaseLock(fn, { timeoutMs = 15000, leaseTtlSeconds = 60 } = {}) {
+    const runExclusive = async () => {
+      const ownerId = crypto.randomBytes(12).toString('hex');
+      if (typeof backend.acquireLease === 'function') {
+        const deadline = Date.now() + timeoutMs;
+        let acquired = false;
+        let attempt = 0;
+        while (Date.now() < deadline) {
+          // eslint-disable-next-line no-await-in-loop
+          if (await backend.acquireLease(ownerId, leaseTtlSeconds)) {
+            acquired = true;
+            break;
+          }
+          attempt++;
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(Math.min(200, 15 * attempt) + Math.floor(Math.random() * 25));
+        }
+        if (!acquired) {
+          throw new Error('Timed out waiting for database write lock.');
+        }
+      }
+      try {
+        return await fn();
+      } finally {
+        if (typeof backend.releaseLease === 'function') {
+          await backend.releaseLease(ownerId);
+        }
+      }
+    };
+
+    const next = inProcessChain.then(runExclusive, runExclusive);
+    inProcessChain = next.catch(() => {});
+    return next;
+  }
+
+  /**
+   * Computes a revision map over a database snapshot so saveDatabase can detect which
+   * collections changed since getDatabase() and merge concurrent edits to untouched records.
+   */
+  function snapshotDatabase(db) {
+    return {
+      groups: structuredClone(db.groups || {}),
+      faces: structuredClone(db.faces || {}),
+      assets: structuredClone(db.assets || {}),
+      counters: structuredClone(db.counters || { nextPersonNumber: 1 })
+    };
+  }
+
+  function mergeMapChanges(baseMap = {}, workingMap = {}, latestMap = {}) {
+    const merged = { ...latestMap };
+    const allKeys = new Set([
+      ...Object.keys(baseMap),
+      ...Object.keys(workingMap),
+      ...Object.keys(latestMap)
+    ]);
+    let changed = false;
+
+    for (const key of allKeys) {
+      const inBase = Object.prototype.hasOwnProperty.call(baseMap, key);
+      const inWorking = Object.prototype.hasOwnProperty.call(workingMap, key);
+      const inLatest = Object.prototype.hasOwnProperty.call(latestMap, key);
+      const baseJson = inBase ? JSON.stringify(baseMap[key]) : null;
+      const workingJson = inWorking ? JSON.stringify(workingMap[key]) : null;
+      const latestJson = inLatest ? JSON.stringify(latestMap[key]) : null;
+
+      // Only apply this caller's change if the caller actually touched `key`
+      if (workingJson !== baseJson) {
+        if (!inWorking) {
+          if (inLatest) {
+            delete merged[key];
+            changed = true;
+          }
+        } else if (
+          inLatest &&
+          latestJson !== baseJson &&
+          Array.isArray(workingMap[key]?.faceIds) &&
+          Array.isArray(latestMap[key]?.faceIds)
+        ) {
+          // Concurrent update to the same group/asset record: preserve faceIds added by the
+          // other writer and only remove faceIds that this caller explicitly removed.
+          const baseFaceIds = Array.isArray(baseMap[key]?.faceIds) ? baseMap[key].faceIds : [];
+          const removedByWorking = new Set(
+            baseFaceIds.filter((id) => !workingMap[key].faceIds.includes(id))
+          );
+          const removedByLatest = new Set(
+            baseFaceIds.filter((id) => !latestMap[key].faceIds.includes(id))
+          );
+          const unionFaceIds = Array.from(
+            new Set([...latestMap[key].faceIds, ...workingMap[key].faceIds])
+          ).filter((id) => !removedByWorking.has(id) && !removedByLatest.has(id));
+          merged[key] = {
+            ...latestMap[key],
+            ...workingMap[key],
+            faceIds: unionFaceIds
+          };
+          changed = true;
+        } else if (workingJson !== latestJson) {
+          merged[key] = workingMap[key];
+          changed = true;
+        }
+      }
+    }
+    return { merged, changed };
+  }
+
   return {
     async getDatabase() {
       const [groups, faces, assets, counters] = await Promise.all([
@@ -260,7 +441,14 @@ async function createStorage(options = {}) {
         readJson('db/assets.json', {}),
         readJson('db/counters.json', { nextPersonNumber: 1 })
       ]);
-      return { groups, faces, assets, counters };
+      const db = { groups, faces, assets, counters };
+      Object.defineProperty(db, '_baseSnapshot', {
+        value: snapshotDatabase(db),
+        enumerable: false,
+        configurable: true,
+        writable: true
+      });
+      return db;
     },
 
     async exportRawSnapshot() {
@@ -295,13 +483,121 @@ async function createStorage(options = {}) {
       await Promise.all(ops);
     },
 
-    async saveDatabase({ groups, faces, assets, counters }) {
-      const ops = [];
-      if (groups) ops.push(writeJson('db/groups.json', groups));
-      if (faces) ops.push(writeJson('db/faces.json', faces));
-      if (assets) ops.push(writeJson('db/assets.json', assets));
-      if (counters) ops.push(writeJson('db/counters.json', counters));
-      await Promise.all(ops);
+    /**
+     * Persists database changes under a distributed/in-process lock, merging record-level
+     * additions, updates, and deletions against the latest stored state so concurrent
+     * operations never clobber each other's changes (R1/R3).
+     */
+    async saveDatabase(db) {
+      return withDatabaseLock(async () => {
+        const base = db._baseSnapshot || null;
+
+        if (!base) {
+          // Full replacement (e.g. clearAllData / seedDemoData / unit-test seed)
+          if (db.faces) await writeJson('db/faces.json', db.faces);
+          if (db.groups) await writeJson('db/groups.json', db.groups);
+          if (db.assets) await writeJson('db/assets.json', db.assets);
+          if (db.counters) await writeJson('db/counters.json', db.counters);
+          Object.defineProperty(db, '_baseSnapshot', {
+            value: snapshotDatabase(db),
+            enumerable: false,
+            configurable: true,
+            writable: true
+          });
+          return;
+        }
+
+        const [latestGroups, latestFaces, latestAssets, latestCounters] = await Promise.all([
+          readJson('db/groups.json', {}),
+          readJson('db/faces.json', {}),
+          readJson('db/assets.json', {}),
+          readJson('db/counters.json', { nextPersonNumber: 1 })
+        ]);
+
+        const facesDiff = mergeMapChanges(base.faces, db.faces || {}, latestFaces);
+        const groupsDiff = mergeMapChanges(base.groups, db.groups || {}, latestGroups);
+        const assetsDiff = mergeMapChanges(base.assets, db.assets || {}, latestAssets);
+
+        const nextPersonNumber = Math.max(
+          Number(latestCounters?.nextPersonNumber) || 1,
+          Number(db.counters?.nextPersonNumber) || 1
+        );
+        const mergedCounters = { ...latestCounters, ...db.counters, nextPersonNumber };
+        const countersChanged = JSON.stringify(mergedCounters) !== JSON.stringify(latestCounters);
+
+        // Write in dependency order (faces -> groups -> assets -> counters) and only for
+        // collections that actually changed.
+        if (facesDiff.changed) await writeJson('db/faces.json', facesDiff.merged);
+        if (groupsDiff.changed) await writeJson('db/groups.json', groupsDiff.merged);
+        if (assetsDiff.changed) await writeJson('db/assets.json', assetsDiff.merged);
+        if (countersChanged) await writeJson('db/counters.json', mergedCounters);
+
+        db.groups = groupsDiff.merged;
+        db.faces = facesDiff.merged;
+        db.assets = assetsDiff.merged;
+        db.counters = mergedCounters;
+        Object.defineProperty(db, '_baseSnapshot', {
+          value: snapshotDatabase(db),
+          enumerable: false,
+          configurable: true,
+          writable: true
+        });
+      });
+    },
+
+    /**
+     * Runs an atomic read-modify-write transaction under the database lock.
+     */
+    async transactDatabase(mutatorFn) {
+      return withDatabaseLock(async () => {
+        const db = await this.getDatabase();
+        const result = await mutatorFn(db);
+        // Save directly without re-acquiring the lock
+        const base = db._baseSnapshot;
+        const facesChanged = JSON.stringify(db.faces) !== JSON.stringify(base.faces);
+        const groupsChanged = JSON.stringify(db.groups) !== JSON.stringify(base.groups);
+        const assetsChanged = JSON.stringify(db.assets) !== JSON.stringify(base.assets);
+        const countersChanged = JSON.stringify(db.counters) !== JSON.stringify(base.counters);
+        if (facesChanged) await writeJson('db/faces.json', db.faces);
+        if (groupsChanged) await writeJson('db/groups.json', db.groups);
+        if (assetsChanged) await writeJson('db/assets.json', db.assets);
+        if (countersChanged) await writeJson('db/counters.json', db.counters);
+        return result;
+      });
+    },
+
+    /**
+     * Claims an I/O Event idempotency key (`R10`). Returns `true` the first time the key is
+     * seen within the TTL window, and `false` on duplicate/retry deliveries.
+     */
+    async claimEventIdempotencyKey(eventKey, ttlMs = EVENT_DEDUPE_TTL_MS) {
+      if (!eventKey) return true;
+      const cleanKey = String(eventKey).trim().slice(0, 300);
+      if (!cleanKey) return true;
+
+      if (typeof backend.claimIdempotencyKey === 'function') {
+        return backend.claimIdempotencyKey(cleanKey, Math.ceil(ttlMs / 1000));
+      }
+
+      return withDatabaseLock(async () => {
+        const now = Date.now();
+        const events = await readJson('db/events.json', {});
+        for (const [k, expiresAt] of Object.entries(events)) {
+          if (!expiresAt || expiresAt <= now) delete events[k];
+        }
+        if (events[cleanKey] && events[cleanKey] > now) {
+          return false;
+        }
+        events[cleanKey] = now + ttlMs;
+        const keys = Object.keys(events);
+        if (keys.length > MAX_STORED_EVENT_KEYS) {
+          for (const oldKey of keys.slice(0, keys.length - MAX_STORED_EVENT_KEYS)) {
+            delete events[oldKey];
+          }
+        }
+        await writeJson('db/events.json', events);
+        return true;
+      });
     },
 
     async getSettings({ includeDecryptedSecret = false } = {}) {

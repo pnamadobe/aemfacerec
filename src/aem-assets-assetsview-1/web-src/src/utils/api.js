@@ -509,6 +509,18 @@ async function invokeLocalPreviewFallback(actionName, payload) {
         syncedAssetCount: faceIds.length
       };
     }
+    if (op === 'resyncAllAssets') {
+      const total = Object.keys(db.assets).length;
+      return {
+        syncedAssetCount: total,
+        failedAssetCount: 0,
+        failedAssets: [],
+        totalAssetsToSync: total,
+        hasMoreToSync: false,
+        nextSyncOffset: null,
+        remainingAssetCount: 0
+      };
+    }
     if (op === 'mergeGroups') {
       const { sourceGroupIds = [], targetGroupId } = payload;
       const targetGrp = db.groups[targetGroupId];
@@ -605,6 +617,11 @@ export function describeScanSummary(summary) {
  */
 export function resultBanner(successText, res = {}) {
   const issues = [];
+  if (res.hasMoreToSync && res.remainingAssetCount > 0) {
+    issues.push(
+      `Stopped before the request timeout with ${res.remainingAssetCount} asset(s) still queued for metadata sync.`
+    );
+  }
   if (res.failedAssetCount > 0) {
     const first = (res.failedAssets || [])[0];
     issues.push(
@@ -645,6 +662,48 @@ export const api = {
     invokeAction('groups', { operation: 'moveFaces', faceIds, targetGroupId }, ctx),
   mergeGroups: (sourceGroupIds, targetGroupId, ctx) =>
     invokeAction('groups', { operation: 'mergeGroups', sourceGroupIds, targetGroupId }, ctx),
+  /**
+   * Re-syncs AEM metadata across all indexed assets in time-budgeted chunks (`R14`).
+   */
+  resyncAllAssets: async (ctx, onProgress) => {
+    let offset = 0;
+    let totalSynced = 0;
+    let totalFailed = 0;
+    const failedAssets = [];
+    for (let page = 0; page < 200; page++) {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await invokeAction(
+        'groups',
+        { operation: 'resyncAllAssets', offset },
+        ctx
+      );
+      totalSynced += res.syncedAssetCount || 0;
+      totalFailed += res.failedAssetCount || 0;
+      if (Array.isArray(res.failedAssets)) failedAssets.push(...res.failedAssets);
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress({
+            syncedAssetCount: totalSynced,
+            remainingAssetCount: res.remainingAssetCount || 0,
+            totalAssetsToSync: res.totalAssetsToSync || totalSynced
+          });
+        } catch (e) {
+          // ignore
+        }
+      }
+      if (!res.hasMoreToSync || res.nextSyncOffset === null || res.nextSyncOffset === undefined) {
+        break;
+      }
+      offset = res.nextSyncOffset;
+    }
+    return {
+      syncedAssetCount: totalSynced,
+      failedAssetCount: totalFailed,
+      failedAssets,
+      hasMoreToSync: false,
+      remainingAssetCount: 0
+    };
+  },
   seedDemoData: (ctx) => invokeAction('groups', { operation: 'seedDemoData' }, ctx),
   clearAllData: (ctx) => invokeAction('groups', { operation: 'clearAllData' }, ctx),
   ingestAsset: (params, ctx) =>

@@ -34,6 +34,7 @@ async function main(params = {}) {
 
       // If includeUnnamedInMetadata or metadataProperty changed, re-sync all AEM assets automatically
       let resyncResult = null;
+      // R14: pass a 15s time budget so settings saves never exceed the 30s gateway timeout
       if (
         previousSettings.includeUnnamedInMetadata !== updatedSettings.includeUnnamedInMetadata ||
         previousSettings.metadataProperty !== updatedSettings.metadataProperty
@@ -44,7 +45,9 @@ async function main(params = {}) {
           serviceCredentials: ctx.serviceCredentials,
           storage
         });
-        resyncResult = await faceService.resyncAllAssetsMetadata();
+        resyncResult = await faceService.resyncAllAssetsMetadata({
+          timeBudgetMs: Math.min(Math.max(Number(params.timeBudgetMs) || 15000, 1000), 22000)
+        });
       }
 
       return {
@@ -52,7 +55,10 @@ async function main(params = {}) {
         headers: corsHeaders,
         body: {
           settings: updatedSettings,
-          resyncedAssets: resyncResult?.syncedAssetCount ?? 0
+          resyncedAssets: resyncResult?.syncedAssetCount ?? 0,
+          hasMoreToSync: Boolean(resyncResult?.hasMoreToSync),
+          nextSyncOffset: resyncResult?.nextSyncOffset ?? null,
+          remainingAssetCount: resyncResult?.remainingAssetCount ?? 0
         }
       };
     }
