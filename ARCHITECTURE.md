@@ -11,9 +11,10 @@ This Adobe Developer App Builder application extends **AEM as a Cloud Service (A
 2. **AWS Rekognition Vector Indexing & Auto-Grouping**:
    - Indexes all faces in an asset in a single call (`IndexFaces`).
    - Uses Rekognition `Users` (`SearchUsers`, `CreateUser`, `AssociateFaces`, `DisassociateFaces`, `DeleteUser`) + `SearchFaces` fallback to automatically cluster faces of the same person across assets.
-3. **Single-Pass `160x160` Face Avatar Cropping**:
-   - Reuses the downloaded AEM web rendition buffer in memory with `sharp` to crop padded `160x160` square portrait avatars for every detected face and stores them in `@adobe/aio-lib-files`.
-4. **Assets View Details Side Panel (`aem/assets/details/1`)**:
+3. **Single-Pass `72×72` Pure-JS Face Avatar Cropping**:
+   - Reuses the downloaded AEM web rendition buffer in memory with pure JavaScript (`jpeg-js` + `pngjs`, zero native C++ binary dependencies) to crop padded `72×72` square portrait avatars for every detected face and stores them in `@adobe/aio-lib-files`.
+   - Also sniffs JPEG/PNG header dimensions before calling AWS so small images (`< minImageSize`, default `200px`, e.g. logos/icons) are skipped at zero AWS cost.
+4. **Assets View Details Side Panel (`aem/assets/assetsview/1`)**:
    - Displays cropped face avatars for all people detected in the currently open asset.
    - Interactive bounding-box overlay preview showing which avatar corresponds to which person in multi-person photos.
    - Allows naming a person, splitting a mis-grouped face into its own group, or reassigning a face to another group directly from the asset.
@@ -77,6 +78,7 @@ aemfacerec/
             ├── cost.test.js                 # Skip already-scanned, MIME allowlist & min image dimensions
             ├── folder-and-asset-id.test.js  # DAM folder pagination (>200 items) & canonical asset IDs
             ├── concurrency-and-jobs.test.js # Distributed lock, record-level merge, event dedupe & R14
+            ├── privacy-and-oauth.test.js    # Per-person erasure (deleteGroup), clearAllData & OAuth S2S
             ├── ui-api.test.js               # Client banner & folder-scan batching tests
             └── ui-admin-console.test.js     # End-to-end jsdom UI tests against real Runtime actions
 ```

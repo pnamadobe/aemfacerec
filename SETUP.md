@@ -2,6 +2,10 @@
 
 This guide walks through every step required to set up, configure, and deploy the **AEM Assets View Facial Recognition & Grouping Extension** (`aem/assets/assetsview/1`) with **AWS Rekognition (BYOK)**, **AEM Processing Profiles**, and **Adobe I/O Events**.
 
+> 🏢 **Deployment Model — Self-Hosted per Customer Organization**
+> This open-source repository is intended to be cloned and deployed by each customer into **their own** Adobe Developer Console App Builder project (and published privately to their own organization's Extension Manager), rather than installed from a shared multi-tenant listing on public Adobe Exchange.
+> Deploying into your own App Builder project ensures that your `@adobe/aio-lib-files` storage container, your `ENCRYPTION_SECRET` (`.env`), your AWS Rekognition credentials, and all face data remain 100% inside your own Adobe and AWS accounts.
+
 ---
 
 ## Table of Contents

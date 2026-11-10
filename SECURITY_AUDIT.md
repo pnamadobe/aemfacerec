@@ -22,7 +22,7 @@ Across six rounds of work, we have now fixed:
 - **Library growth & AWS cost (`P2`, `P6`, `R9`, `R11`, `C1`–`C4`)**: paged group list + server-side search/filter, picker options endpoint with capped cover avatars, paged per-group faces (keeps every response well under the 1 MB Runtime limit), DAM folder pagination past 200 items, canonical asset IDs with legacy duplicate consolidation, and AWS cost controls (skip already-scanned images, file-type allowlist, minimum image dimension).
 - **Concurrency & resumable jobs (`R1`, `R3`, `R10`, `R13`, `R14`, `R15`)**: distributed lease lock via `@adobe/aio-lib-state` + in-process mutex, record-level delta merging on `saveDatabase()` (including set-union of `faceIds`), read-only `getAssetFaces`, 24-hour I/O Event idempotency, save-before-sync mutations, and time-budgeted/resumable AEM metadata fan-outs.
 
-The remaining open items are Group 4 housekeeping & compliance (`S15` dependency cleanup, `S9` OAuth Server-to-Server credentials, `S10` biometric privacy/erasure, `S11` multi-org partitioning, and the deferred `S8` cross-account IAM role).
+The remaining open items (`S8` cross-account IAM role and `S11` multi-org shared namespace) apply only to a centrally hosted multi-tenant SaaS / public Adobe Exchange distribution model. Because this repository is distributed as an **open-source, self-hosted App Builder template** that each customer deploys into their own Adobe Developer Console project, each customer owns their own App Builder Runtime namespace, `@adobe/aio-lib-files` storage container, and `ENCRYPTION_SECRET`. Both items are documented below as architectural notes for anyone who ever adapts the repo for shared multi-tenant hosting.
 
 ---
 
