@@ -16,6 +16,7 @@ const MAX_GROUP_FACES_PAGE_SIZE = 100;
 const MAX_GROUP_OPTIONS = 2000;
 const {
   AVATAR_SIZE,
+  getImageDimensions,
   cropFaceAvatar,
   decodeImageBuffer,
   cropAndResizeRgbaToJpeg
@@ -286,6 +287,25 @@ async function createFaceService({
   }
 
   /**
+   * Finds an existing asset record by id (with or without the urn prefix) or by DAM path.
+   */
+  function findAssetRecord(db, assetId, assetPath) {
+    if (assetId) {
+      const raw = String(assetId).replace(/^urn:aaid:aem:/i, '');
+      const byId = db.assets[assetId] || db.assets[raw] || db.assets[`urn:aaid:aem:${raw}`];
+      if (byId) return byId;
+    }
+    if (assetPath) {
+      return Object.values(db.assets).find((a) => a.assetPath === assetPath) || null;
+    }
+    return null;
+  }
+
+  function skippedResult(assetPath, reasonCode, reason) {
+    return { skipped: true, assetPath, reasonCode, reason };
+  }
+
+  /**
    * Core single-asset ingestion routine that operates on an already-loaded `db`, `settings`,
    * and `rekognition` instance so batch/folder operations only read and write storage once.
    *
@@ -302,6 +322,8 @@ async function createFaceService({
     assetTitle,
     imageBuffer,
     force = false,
+    rescan = true,
+    mimeType = null,
     db,
     settings,
     rekognition,
@@ -326,12 +348,22 @@ async function createFaceService({
       }
     }
 
+    // Cost controls, all checked before anything is sent to AWS:
+    // 1. Already scanned (unless an explicit re-scan was requested)
+    if (!rescan) {
+      const existing = findAssetRecord(db, assetId, cleanPath);
+      if (existing && !existing.incomplete) {
+        return skippedResult(cleanPath, 'already-scanned', 'Already scanned');
+      }
+    }
+
     const info =
       assetId && cleanPath
         ? {
             assetId,
             assetPath: cleanPath,
-            assetTitle: assetTitle || cleanPath.split('/').pop()
+            assetTitle: assetTitle || cleanPath.split('/').pop(),
+            mimeType
           }
         : await aemClient.getAssetInfo(cleanPath);
 
@@ -339,7 +371,25 @@ async function createFaceService({
     const resolvedPath = info.assetPath;
     const resolvedTitle = info.assetTitle;
 
+    // 2. File type allowlist (unknown types are allowed through; the rendition is still checked)
+    const allowedTypes = (settings.allowedImageTypes || []).map((t) => String(t).toLowerCase());
+    const assetType = String(mimeType || info.mimeType || '').toLowerCase().split(';')[0].trim();
+    if (assetType && allowedTypes.length > 0 && !allowedTypes.includes(assetType)) {
+      return skippedResult(resolvedPath, 'unsupported-type', `File type ${assetType} is not enabled for face recognition`);
+    }
+
     const buffer = imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
+
+    // 3. Tiny images (logos, icons) can't contain usable faces
+    const minSize = Number(settings.minImageSize) || 0;
+    const dims = minSize > 0 ? getImageDimensions(buffer) : null;
+    if (dims && Math.min(dims.width, dims.height) < minSize) {
+      return skippedResult(
+        resolvedPath,
+        'too-small',
+        `Image is ${dims.width}x${dims.height}px (minimum ${minSize}px)`
+      );
+    }
 
     // Phase 1: detect, match and crop. Nothing in `db` changes in this phase.
     const detectedFaces = await rekognition.indexAssetFaces(buffer, resolvedAssetId, {
@@ -472,7 +522,15 @@ async function createFaceService({
      * downloads web rendition, indexes faces in AWS Rekognition, crops avatars,
      * auto-matches or creates face groups, and writes `xdm:faceNames` back to AEM.
      */
-    async ingestAsset({ assetPath, assetId, assetTitle, imageBuffer, force = false }) {
+    async ingestAsset({
+      assetPath,
+      assetId,
+      assetTitle,
+      imageBuffer,
+      force = false,
+      rescan = true,
+      mimeType = null
+    }) {
       const [{ settings, rekognition }, db] = await Promise.all([
         getRekognition(),
         storage.getDatabase()
@@ -486,6 +544,8 @@ async function createFaceService({
           assetTitle,
           imageBuffer,
           force,
+          rescan,
+          mimeType,
           db,
           settings,
           rekognition,
@@ -508,8 +568,9 @@ async function createFaceService({
      * Browses child subfolders and image assets inside a DAM folder for the visual folder/asset picker.
      */
     async browseFolder({ folderPath = '/content/dam' }) {
+      const settings = await storage.getSettings();
       const [browsed, db] = await Promise.all([
-        aemClient.browseDamFolder(folderPath),
+        aemClient.browseDamFolder(folderPath, { allowedImageTypes: settings.allowedImageTypes }),
         storage.getDatabase()
       ]);
 
@@ -546,6 +607,7 @@ async function createFaceService({
       offset = 0,
       limit = 0,
       force = true,
+      rescan = false,
       timeBudgetMs = 20000
     }) {
       const startTime = Date.now();
@@ -556,23 +618,12 @@ async function createFaceService({
         }
         explicitAssets.forEach((a) => assertDamPath(a && a.assetPath, 'asset path'));
       }
-      const [allAssets, { settings, rekognition }, db] = await Promise.all([
-        Array.isArray(explicitAssets)
-          ? Promise.resolve(explicitAssets)
-          : aemClient.listFolderAssets(folderPath),
-        getRekognition(),
-        storage.getDatabase()
-      ]);
-
-      let collectionEnsured = false;
-      if (allAssets.length > 0) {
-        try {
-          await rekognition.ensureCollection();
-          collectionEnsured = true;
-        } catch (e) {
-          collectionEnsured = false;
-        }
-      }
+      const [{ settings, rekognition }, db] = await Promise.all([getRekognition(), storage.getDatabase()]);
+      const allAssets = Array.isArray(explicitAssets)
+        ? explicitAssets
+        : await aemClient.listFolderAssets(folderPath, { allowedImageTypes: settings.allowedImageTypes });
+      // The collection check is cached per request and only happens if an image needs AWS
+      const collectionEnsured = false;
 
       const startIdx = Math.max(0, Number(offset) || 0);
       const maxItems = Number(limit) > 0 ? Number(limit) : allAssets.length;
@@ -593,7 +644,9 @@ async function createFaceService({
             assetPath: item.assetPath,
             assetId: item.assetId,
             assetTitle: item.assetTitle,
+            mimeType: item.mimeType || null,
             force,
+            rescan,
             db,
             settings,
             rekognition,
@@ -606,6 +659,7 @@ async function createFaceService({
             assetPath: item.assetPath,
             status: res.skipped ? 'skipped' : 'processed',
             faceCount: res.faces?.length || 0,
+            ...(res.skipped ? { reasonCode: res.reasonCode, reason: res.reason } : {}),
             ...(res.metadataSyncError ? { warning: res.metadataSyncError } : {})
           });
         } catch (err) {

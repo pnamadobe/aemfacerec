@@ -168,6 +168,13 @@ async function seedDatabase() {
       updatedAt: now
     };
   }
+  db.assets['already-id'] = {
+    assetId: 'already-id',
+    assetPath: '/content/dam/already.jpg',
+    assetTitle: 'already.jpg',
+    faceIds: [],
+    scannedAt: now
+  };
   await storage.saveDatabase(db);
   await storage.saveSettings({ awsAccessKeyId: 'AKIATEST', awsSecretAccessKey: 'test-secret' });
   return storage;
@@ -182,11 +189,37 @@ window.__AIO_ACTION_URLS__ = {
   ingest: 'https://runtime.test/api/v1/web/pkg/ingest'
 };
 const aemRequests = [];
+const jpegJs = require('jpeg-js');
+const SAMPLE_JPEG = Buffer.from(
+  jpegJs.encode({ data: Buffer.alloc(400 * 300 * 4, 120), width: 400, height: 300 }, 80).data
+);
+const damEntity = (name, format) => ({ class: ['assets/asset'], properties: { name, metadata: { 'dc:format': format } } });
+// /content/dam listing: one already-scanned image, one new image, one PDF
+const DAM_ROOT_LISTING = [
+  damEntity('already.jpg', 'image/jpeg'),
+  damEntity('new.jpg', 'image/jpeg'),
+  damEntity('doc.pdf', 'application/pdf')
+];
+function jsonResponse(obj) {
+  const text = JSON.stringify(obj);
+  return { ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => text, json: async () => obj };
+}
 global.fetch = async (url, opts = {}) => {
   // Backend -> AEM calls (metadata write-back): accept them
   if (String(url).startsWith('https://author-p1-e1.adobeaemcloud.com/')) {
     aemRequests.push({ url: String(url), method: opts.method || 'GET' });
-    return { ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => '{}', json: async () => ({}) };
+    if (String(url).includes('/api/assets.json')) {
+      return jsonResponse({ entities: DAM_ROOT_LISTING });
+    }
+    if (String(url).includes('/renditions/')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'image/jpeg' : null) },
+        arrayBuffer: async () => SAMPLE_JPEG
+      };
+    }
+    return jsonResponse({});
   }
   const actionName = String(url).split('/').pop();
   const body = JSON.parse(opts.body || '{}');
@@ -397,4 +430,75 @@ test('UI side panel: unscanned asset shows the scan prompt instead of an error',
   renderSidePanel('/content/dam/ui/never-scanned.jpg');
   await screen.findByText('No faces indexed for this asset yet.');
   screen.getByText('Scan Asset with AWS Rekognition');
+});
+
+test('UI cost: folder scan analyzes only new images and explains what was skipped', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+  const indexCallsBefore = awsCommands.filter((c) => c === 'IndexFacesCommand').length;
+
+  fireEvent.click(screen.getByText('Scan Current Folder'));
+  await screen.findByText(
+    'Folder scan complete for /content/dam. Analyzed 1 image(s) (0 face(s)). Skipped 1: 1 already scanned. 1 non-image or excluded file type(s) ignored.'
+  );
+  const scanCalls = requests.filter((r) => r.action === 'ingest' && r.body.operation === 'scanFolder');
+  assert.equal(scanCalls.length, 1);
+  assert.deepEqual(scanCalls[0].body.assets.map((a) => a.assetPath), ['/content/dam/new.jpg']);
+  assert.equal(scanCalls[0].body.rescan, false);
+  assert.equal(awsCommands.filter((c) => c === 'IndexFacesCommand').length - indexCallsBefore, 1);
+
+  // Scanning again: nothing new, so no AWS calls at all
+  requests.length = 0;
+  const awsBefore = awsCommands.length;
+  await waitFor(() => assert.equal(screen.getByText('Scan Current Folder').closest('button').disabled, false));
+  fireEvent.click(screen.getByText('Scan Current Folder'));
+  await screen.findByText(
+    'Folder scan complete for /content/dam. Analyzed 0 image(s) (0 face(s)). Skipped 2: 2 already scanned. 1 non-image or excluded file type(s) ignored.'
+  );
+  assert.equal(requests.filter((r) => r.body.operation === 'scanFolder').length, 0);
+  assert.equal(awsCommands.length, awsBefore);
+
+  // With "Include already-scanned images" both images are analyzed again
+  const includeScanned = screen.getByLabelText('Include already-scanned images');
+  await waitFor(() => assert.equal(includeScanned.disabled, false));
+  fireEvent.click(includeScanned);
+  assert.equal(includeScanned.checked, true);
+  await waitFor(() => assert.equal(screen.getByText('Scan Current Folder').closest('button').disabled, false));
+  fireEvent.click(screen.getByText('Scan Current Folder'));
+  await screen.findByText(
+    'Folder scan complete for /content/dam. Analyzed 2 image(s) (0 face(s)). 1 non-image or excluded file type(s) ignored.'
+  );
+  const rescanCall = requests.filter((r) => r.body.operation === 'scanFolder').at(-1);
+  assert.equal(rescanCall.body.rescan, true);
+  assert.equal(rescanCall.body.assets.length, 2);
+});
+
+test('UI cost: cost-control settings load, save, and are validated', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+  fireEvent.click(
+    screen.getAllByText('BYOK AWS Rekognition & Metadata Settings').find((el) => el.closest('[role="tab"]'))
+  );
+
+  const typesField = await screen.findByLabelText('Image types to analyze (comma-separated)');
+  await waitFor(() => assert.match(typesField.value, /^image\/jpeg, image\/png/));
+  const sizeField = screen.getByLabelText('Skip images smaller than (pixels, shorter side)');
+  assert.equal(sizeField.value, '200');
+
+  fireEvent.change(typesField, { target: { value: 'image/jpeg, image/png' } });
+  fireEvent.change(sizeField, { target: { value: '120' } });
+  fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
+  await screen.findByText(/^Settings saved\./);
+
+  const save = requests.filter((r) => r.action === 'settings' && r.body.operation === 'saveSettings').at(-1);
+  assert.deepEqual(save.body.settings.allowedImageTypes, ['image/jpeg', 'image/png']);
+  assert.equal(save.body.settings.minImageSize, 120);
+  const stored = await (await createStorage({})).getSettings();
+  assert.deepEqual(stored.allowedImageTypes, ['image/jpeg', 'image/png']);
+  assert.equal(stored.minImageSize, 120);
+
+  // Invalid input shows the server's validation message
+  fireEvent.change(typesField, { target: { value: 'application/pdf' } });
+  fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
+  await screen.findByText(/Invalid image type\(s\): application\/pdf/);
 });

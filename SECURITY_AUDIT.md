@@ -82,6 +82,16 @@ This round fixes the critical security issues (S1–S7, S9 partially) and the wo
 
 ---
 
+## 3b. AWS cost
+
+| ID | Finding | Status | Remediation |
+|---|---|---|---|
+| C1 | Folder scans and the bulk "Recognize Faces" action re-sent **every** image to AWS on every run, including already-scanned ones and ones with no faces. Each re-scan also re-created the image's faces and re-matched them. | ✅ | Already-scanned images are skipped. The browser filters them out before calling the backend, and the backend double-checks by asset id, its `urn:aaid` variants, or path. Skipped images cause zero AWS calls, downloads or AEM writes. An "Include already-scanned images" option forces a full re-scan. The side panel's Re-scan and AEM upload events still always analyze. Images left `incomplete` by a failed scan are retried. |
+| C2 | No file-type control: the folder scan accepted any `image/*` type (SVG, GIF, icons) or unknown type, and events and single scans had no check, so PDFs and videos had their previews analyzed. | ✅ | One configurable allowlist for all paths (default: JPEG, PNG, TIFF, PSD, WebP, HEIC/HEIF, BMP). It's checked before any download, using the type from the folder listing, the upload event, or the AEM asset info. Excluded files are counted and reported. |
+| C3 | Logos and icons were sent to AWS. | ✅ | Images whose shorter side is under `minImageSize` (default 200px, configurable, 0 = off) are skipped. Dimensions are read from the downloaded JPEG/PNG header, before the AWS call. Skipped images aren't recorded, so lowering the limit later makes them eligible. |
+| C4 | Every batch called `DescribeCollection`, even when nothing needed analysis. | ✅ | Checked at most once per request, and only when an image actually needs AWS. |
+| C5 | Images with no faces still cost one AWS call on their **first** scan. | ⬜ Won't fix | AWS's detect-only call costs the same as indexing; a local detector adds weight and misses small faces; Smart Tags hints are unreliable. After C1 the cost is paid once per image. |
+
 ## 4. Target architecture (recommended)
 
 ```
@@ -137,3 +147,5 @@ Against the original code, 11 of these tests fail. With the fixes, the full suit
 2. Keep `ENABLE_MAINTENANCE_OPS=false` in production. The UI's "Load sample data" and "Clear all data" buttons will return a "disabled" message.
 3. Make sure Assets View users who scan or name people have write permission on the relevant DAM folders.
 4. If AEM is reached through a custom domain, add it to `AEM_ALLOWED_HOSTS`.
+
+`test/cost.test.js` (17 tests), plus additions to `ui-api.test.js` (+4) and `ui-admin-console.test.js` (+2), added in the fourth round (C1–C4). Against the previous code, 12 of the 17 cost tests fail. The assertions count AWS calls, downloads and AEM writes for every skip path, including an upload event for a PDF that must not touch AEM or AWS. The end-to-end UI test checks that a second folder scan with nothing new makes no AWS calls.

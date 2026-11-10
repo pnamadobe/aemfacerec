@@ -62,3 +62,108 @@ test('UI: folder scans with failed items produce a warning banner', () => {
   assert.match(b.text, /1 asset\(s\) failed/);
   assert.match(b.text, /2\.tif/);
 });
+
+// ---------------------------------------------------------------------------
+// Folder scan (client side): skip already-scanned images before calling the backend
+// ---------------------------------------------------------------------------
+
+function withFakeBackend(browseResult, fn) {
+  const calls = [];
+  const prevWindow = global.window;
+  const prevFetch = global.fetch;
+  global.window = { __AIO_ACTION_URLS__: { ingest: 'https://runtime.test/ingest' } };
+  global.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push(body);
+    let result;
+    if (body.operation === 'browseFolder') {
+      result = browseResult;
+    } else {
+      result = {
+        results: body.assets.map((a) => ({ assetPath: a.assetPath, status: 'processed', faceCount: 2 }))
+      };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(result) };
+  };
+  return Promise.resolve(fn(calls)).finally(() => {
+    global.window = prevWindow;
+    global.fetch = prevFetch;
+  });
+}
+
+const browsed = {
+  folderPath: '/content/dam/f',
+  excludedAssetCount: 3,
+  assets: Array.from({ length: 12 }, (_, i) => ({
+    assetId: `id${i}`,
+    assetPath: `/content/dam/f/${i}.jpg`,
+    assetTitle: `${i}.jpg`,
+    mimeType: 'image/jpeg',
+    scanned: i < 9, // 9 already scanned, 3 new
+    faceCount: i < 9 ? 1 : 0
+  }))
+};
+
+test('UI scanFolder: only new images are sent to the backend by default', async () => {
+  const { api } = loadApiModule();
+  await withFakeBackend(browsed, async (calls) => {
+    const progress = [];
+    const res = await api.scanFolder('/content/dam/f', {}, (p) => progress.push(p.completed));
+    const scanCalls = calls.filter((c) => c.operation === 'scanFolder');
+    assert.equal(scanCalls.length, 1);
+    assert.deepEqual(scanCalls[0].assets.map((a) => a.assetPath), ['/content/dam/f/9.jpg', '/content/dam/f/10.jpg', '/content/dam/f/11.jpg']);
+    assert.equal(scanCalls[0].rescan, false);
+    assert.equal(scanCalls[0].assets[0].mimeType, 'image/jpeg');
+    assert.deepEqual(res.summary, {
+      scanned: 3,
+      faces: 6,
+      skipped: 9,
+      skippedByReason: { 'already-scanned': 9 },
+      failed: 0,
+      excluded: 3
+    });
+    assert.deepEqual(progress, [3]);
+  });
+});
+
+test('UI scanFolder: a folder where everything is already scanned makes no scan calls', async () => {
+  const { api } = loadApiModule();
+  const allScanned = { ...browsed, assets: browsed.assets.map((a) => ({ ...a, scanned: true })) };
+  await withFakeBackend(allScanned, async (calls) => {
+    const res = await api.scanFolder('/content/dam/f', {});
+    assert.equal(calls.filter((c) => c.operation === 'scanFolder').length, 0);
+    assert.equal(res.summary.skipped, 12);
+    assert.equal(res.summary.scanned, 0);
+  });
+});
+
+test('UI scanFolder: "include already-scanned" sends everything in batches of 5', async () => {
+  const { api } = loadApiModule();
+  await withFakeBackend(browsed, async (calls) => {
+    const res = await api.scanFolder('/content/dam/f', {}, null, { rescan: true });
+    const scanCalls = calls.filter((c) => c.operation === 'scanFolder');
+    assert.deepEqual(scanCalls.map((c) => c.assets.length), [5, 5, 2]);
+    assert.ok(scanCalls.every((c) => c.rescan === true));
+    assert.equal(res.summary.scanned, 12);
+  });
+});
+
+test('UI: scan summary text', () => {
+  const { describeScanSummary, summarizeScanResults } = loadApiModule();
+  const summary = summarizeScanResults(
+    [
+      { status: 'processed', faceCount: 2 },
+      { status: 'skipped', reasonCode: 'already-scanned' },
+      { status: 'skipped', reasonCode: 'already-scanned' },
+      { status: 'skipped', reasonCode: 'too-small' },
+      { status: 'skipped', reasonCode: 'unsupported-type' },
+      { status: 'error', error: 'x' }
+    ],
+    4
+  );
+  assert.equal(
+    describeScanSummary(summary),
+    'Analyzed 1 image(s) (2 face(s)). Skipped 4: 2 already scanned, 1 too small, 1 unsupported file type. 4 non-image or excluded file type(s) ignored.'
+  );
+  assert.equal(describeScanSummary(summarizeScanResults([])), 'Analyzed 0 image(s) (0 face(s)).');
+});

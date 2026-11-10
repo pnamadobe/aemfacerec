@@ -42,8 +42,23 @@ const DEFAULT_SETTINGS = {
   includeUnnamedInMetadata: true,
   processingProfileName: 'Face Recognition',
   requireProcessingProfile: true,
-  enabledFolders: ['/content/dam']
+  enabledFolders: ['/content/dam'],
+  // Only these asset types are ever sent for face analysis (AEM's JPEG rendition is what's sent)
+  allowedImageTypes: [
+    'image/jpeg',
+    'image/png',
+    'image/tiff',
+    'image/vnd.adobe.photoshop',
+    'image/webp',
+    'image/heic',
+    'image/heif',
+    'image/bmp'
+  ],
+  // Images whose shorter side is below this many pixels (logos, icons) are skipped
+  minImageSize: 200
 };
+
+const MIME_TYPE_PATTERN = /^image\/[a-z0-9][a-z0-9.+-]{0,99}$/;
 
 /**
  * Encrypts a plaintext string using AES-256-GCM with a key derived from secret.
@@ -327,7 +342,14 @@ async function createStorage(options = {}) {
         requireProcessingProfile: Boolean(merged.requireProcessingProfile ?? true),
         enabledFolders: Array.isArray(merged.enabledFolders)
           ? merged.enabledFolders
-          : ['/content/dam']
+          : ['/content/dam'],
+        allowedImageTypes:
+          Array.isArray(merged.allowedImageTypes) && merged.allowedImageTypes.length > 0
+            ? merged.allowedImageTypes
+            : DEFAULT_SETTINGS.allowedImageTypes,
+        minImageSize: Number.isFinite(Number(merged.minImageSize))
+          ? Number(merged.minImageSize)
+          : DEFAULT_SETTINGS.minImageSize
       };
 
       if (includeDecryptedSecret) {
@@ -397,6 +419,27 @@ async function createStorage(options = {}) {
           .map((f) => String(f).trim())
           .filter(Boolean)
           .map((f) => assertDamPath(f, 'enabled folder'));
+      }
+
+      if (Array.isArray(newSettings.allowedImageTypes)) {
+        const types = Array.from(
+          new Set(newSettings.allowedImageTypes.map((t) => String(t).trim().toLowerCase()).filter(Boolean))
+        );
+        const invalid = types.filter((t) => !MIME_TYPE_PATTERN.test(t));
+        if (invalid.length > 0) {
+          throw new PublicError(`Invalid image type(s): ${invalid.join(', ')}. Use values like image/jpeg.`);
+        }
+        if (types.length === 0) {
+          throw new PublicError('At least one image type must be allowed.');
+        }
+        updated.allowedImageTypes = types;
+      }
+      if (newSettings.minImageSize !== undefined && newSettings.minImageSize !== '') {
+        const size = Number(newSettings.minImageSize);
+        if (!Number.isInteger(size) || size < 0 || size > 4000) {
+          throw new PublicError('Minimum image size must be a whole number of pixels between 0 and 4000.');
+        }
+        updated.minImageSize = size;
       }
 
       await writeJson('db/settings.json', updated);

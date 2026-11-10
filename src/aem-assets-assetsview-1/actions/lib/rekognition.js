@@ -117,11 +117,21 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
     });
   }
 
+  let ensuredCollection = null;
+
   return {
     /**
      * Verifies AWS credentials and ensures the configured Rekognition Collection exists.
+     * The result is cached for the lifetime of this service (one request), so batches
+     * check at most once and only if an image actually needs analysis.
      */
     async ensureCollection() {
+      if (ensuredCollection) return ensuredCollection;
+      ensuredCollection = await this.describeOrCreateCollection();
+      return ensuredCollection;
+    },
+
+    async describeOrCreateCollection() {
       try {
         const desc = await send(
           new DescribeCollectionCommand({ CollectionId: collectionId })

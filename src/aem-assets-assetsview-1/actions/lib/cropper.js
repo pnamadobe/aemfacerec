@@ -228,10 +228,48 @@ async function cropFaceAvatar(imageBufferOrDecoded, boundingBox) {
   }
 }
 
+/**
+ * Reads pixel dimensions from a JPEG (SOF marker) or PNG (IHDR) header without decoding.
+ * Returns { width, height } or null if the format isn't recognized.
+ */
+function getImageDimensions(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 24) return null;
+
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buf.length) {
+      if (buf[offset] !== 0xff) {
+        offset++;
+        continue;
+      }
+      const marker = buf[offset + 1];
+      // Standalone markers without a length field
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0xff) {
+        offset += marker === 0xff ? 1 : 2;
+        continue;
+      }
+      const segmentLength = buf.readUInt16BE(offset + 2);
+      const isStartOfFrame =
+        marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isStartOfFrame) {
+        return { height: buf.readUInt16BE(offset + 5), width: buf.readUInt16BE(offset + 7) };
+      }
+      if (marker === 0xda || segmentLength < 2) return null; // start of scan: no SOF found
+      offset += 2 + segmentLength;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   AVATAR_SIZE,
   PADDING_RATIO,
   MAX_DECODE_MEGAPIXELS,
+  getImageDimensions,
   calculateSquareCropRegion,
   decodeImageBuffer,
   cropAndResizeRgbaToJpeg,

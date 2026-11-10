@@ -11,7 +11,7 @@ import {
   Well
 } from '@adobe/react-spectrum';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
-import { api } from '../utils/api';
+import { api, summarizeScanResults, describeScanSummary } from '../utils/api';
 
 function findAemAuthorUrl(...sources) {
   const seen = new Set();
@@ -187,8 +187,10 @@ export default function ExtensionRegistration() {
                         // ignore toast error
                       }
 
-                      let totalFacesFound = 0;
-                      let processedCount = 0;
+                      // Already-scanned images are skipped (no AWS cost); use the side panel's
+                      // Re-scan button to analyze a single image again.
+                      const results = [];
+                      let excludedAssetCount = 0;
 
                       try {
                         for (const item of resources) {
@@ -198,24 +200,29 @@ export default function ExtensionRegistration() {
                               {
                                 assetPath: extracted.assetPath,
                                 assetId: extracted.assetId,
-                                force: true
+                                force: true,
+                                rescan: false
                               },
                               authContext
                             );
-                            totalFacesFound += res.faceCount || 0;
-                            processedCount += 1;
+                            results.push(
+                              res.skipped
+                                ? { status: 'skipped', reasonCode: res.reasonCode }
+                                : { status: 'processed', faceCount: res.faceCount || 0 }
+                            );
                           } else if (extracted.folderPath) {
                             const res = await api.scanFolder(extracted.folderPath, authContext);
-                            processedCount += res.totalAssets || 0;
-                            for (const r of res.results || []) {
-                              totalFacesFound += r.faceCount || 0;
-                            }
+                            results.push(...(res.results || []));
+                            excludedAssetCount += res.excludedAssetCount || 0;
                           }
                         }
 
+                        const summary = summarizeScanResults(results, excludedAssetCount);
                         guestConnection.host?.toast?.display?.({
-                          variant: 'positive',
-                          message: `Recognized ${totalFacesFound} face(s) across ${processedCount} asset(s) and updated xdm:faceNames.`
+                          variant: summary.failed > 0 ? 'negative' : 'positive',
+                          message: `Face recognition: ${describeScanSummary(summary)}${
+                            summary.failed > 0 ? ` ${summary.failed} failed.` : ''
+                          }`
                         });
                       } catch (err) {
                         guestConnection.host?.toast?.display?.({

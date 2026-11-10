@@ -27,7 +27,24 @@ function extractAssetFromIoEvent(params) {
     event.assetId ||
     null;
 
-  return { assetPath, assetId };
+  const format =
+    params.mimeType ||
+    obj['xdmAsset:format'] ||
+    obj['dc:format'] ||
+    repoMeta['dc:format'] ||
+    event.format ||
+    null;
+
+  return { assetPath, assetId, mimeType: format ? String(format) : null };
+}
+
+/**
+ * Parses an optional boolean parameter that may arrive as a boolean or a string.
+ */
+function parseFlag(value, defaultValue) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  if (typeof value === 'boolean') return value;
+  return /^(1|true|yes|on)$/i.test(String(value).trim());
 }
 
 async function main(params = {}) {
@@ -78,12 +95,14 @@ async function main(params = {}) {
         offset: params.offset,
         limit: params.limit,
         timeBudgetMs: Math.min(Math.max(Number(params.timeBudgetMs) || 20000, 1000), 25000),
-        force: params.force !== undefined ? Boolean(params.force) : true
+        force: parseFlag(params.force, true),
+        // Folder scans skip already-scanned images unless explicitly asked to re-scan
+        rescan: parseFlag(params.rescan, false)
       });
       return { statusCode: 200, headers: corsHeaders, body: result };
     }
 
-    const { assetPath, assetId } = extractAssetFromIoEvent(params);
+    const { assetPath, assetId, mimeType } = extractAssetFromIoEvent(params);
     if (!assetPath) {
       return {
         statusCode: 400,
@@ -93,12 +112,15 @@ async function main(params = {}) {
     }
 
     // If invoked directly from the UI ("Scan / Re-scan Asset"), force=true bypasses folder check
-    const isManualTrigger = Boolean(params.force);
+    const isManualTrigger = parseFlag(params.force, false);
     const result = await faceService.ingestAsset({
       assetPath,
       assetId,
       assetTitle: params.assetTitle,
-      force: isManualTrigger
+      mimeType,
+      force: isManualTrigger,
+      // Uploads (events) and the side panel's Re-scan always analyze; bulk actions pass rescan=false
+      rescan: parseFlag(params.rescan, true)
     });
 
     return {

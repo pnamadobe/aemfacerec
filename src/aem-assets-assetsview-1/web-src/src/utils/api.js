@@ -554,6 +554,50 @@ async function invokeLocalPreviewFallback(actionName, payload) {
   return {};
 }
 
+const SKIP_REASON_LABELS = {
+  'already-scanned': 'already scanned',
+  'too-small': 'too small',
+  'unsupported-type': 'unsupported file type'
+};
+
+/**
+ * Counts scan outcomes: { scanned, faces, skipped, skippedByReason, failed, excluded }.
+ */
+export function summarizeScanResults(results = [], excludedAssetCount = 0) {
+  const summary = { scanned: 0, faces: 0, skipped: 0, skippedByReason: {}, failed: 0, excluded: excludedAssetCount };
+  for (const r of results) {
+    if (r.status === 'processed') {
+      summary.scanned++;
+      summary.faces += r.faceCount || 0;
+    } else if (r.status === 'skipped') {
+      summary.skipped++;
+      const key = r.reasonCode || 'other';
+      summary.skippedByReason[key] = (summary.skippedByReason[key] || 0) + 1;
+    } else if (r.status === 'error') {
+      summary.failed++;
+    }
+  }
+  return summary;
+}
+
+/**
+ * Human-readable one-line scan summary, e.g.
+ * "Analyzed 3 image(s) (5 faces). Skipped 40: 38 already scanned, 2 too small. 4 non-image or excluded file type(s) ignored."
+ */
+export function describeScanSummary(summary) {
+  const parts = [`Analyzed ${summary.scanned} image(s) (${summary.faces} face(s)).`];
+  if (summary.skipped > 0) {
+    const reasons = Object.entries(summary.skippedByReason)
+      .map(([code, n]) => `${n} ${SKIP_REASON_LABELS[code] || code}`)
+      .join(', ');
+    parts.push(`Skipped ${summary.skipped}: ${reasons}.`);
+  }
+  if (summary.excluded > 0) {
+    parts.push(`${summary.excluded} non-image or excluded file type(s) ignored.`);
+  }
+  return parts.join(' ');
+}
+
 /**
  * Builds a status banner for an operation result, downgrading it to a warning when some
  * AEM metadata writes (or individual folder-scan items) failed.
@@ -606,7 +650,12 @@ export const api = {
     invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx),
   browseFolder: (folderPath, ctx) =>
     invokeAction('ingest', { operation: 'browseFolder', folderPath }, ctx),
-  scanFolder: async (folderPath, ctx, onProgress) => {
+  /**
+   * Scans the image assets in a folder in small batches.
+   * By default images that were already scanned are skipped without calling the backend
+   * (no AWS cost); pass { rescan: true } to analyze everything again.
+   */
+  scanFolder: async (folderPath, ctx, onProgress, { rescan = false } = {}) => {
     if (!getActionUrl('ingest')) {
       return invokeLocalPreviewFallback('ingest', { operation: 'scanFolder', folderPath });
     }
@@ -615,25 +664,47 @@ export const api = {
       { operation: 'browseFolder', folderPath },
       ctx
     );
-    const allAssets = browsed.assets || [];
+    const listedAssets = browsed.assets || [];
     const resolvedFolderPath = browsed.folderPath || folderPath;
-    if (allAssets.length === 0) {
-      return {
-        folderPath: resolvedFolderPath,
-        totalAssets: 0,
-        results: []
-      };
+    const excludedAssetCount = browsed.excludedAssetCount || 0;
+
+    const allResults = [];
+    const toScan = [];
+    for (const a of listedAssets) {
+      if (!rescan && a.scanned) {
+        allResults.push({
+          assetPath: a.assetPath,
+          status: 'skipped',
+          reasonCode: 'already-scanned',
+          reason: 'Already scanned',
+          faceCount: a.faceCount || 0
+        });
+      } else {
+        toScan.push(a);
+      }
     }
 
     const BATCH_SIZE = 5;
-    const allResults = [];
     let idx = 0;
+    const report = () => {
+      if (typeof onProgress !== 'function') return;
+      try {
+        onProgress({
+          completed: Math.min(idx, toScan.length),
+          total: toScan.length,
+          results: allResults
+        });
+      } catch (e) {
+        // ignore progress callback error
+      }
+    };
 
-    while (idx < allAssets.length) {
-      const batch = allAssets.slice(idx, idx + BATCH_SIZE).map((a) => ({
+    while (idx < toScan.length) {
+      const batch = toScan.slice(idx, idx + BATCH_SIZE).map((a) => ({
         assetPath: a.assetPath,
         assetId: a.assetId,
-        assetTitle: a.assetTitle
+        assetTitle: a.assetTitle,
+        mimeType: a.mimeType || null
       }));
       const batchRes = await invokeAction(
         'ingest',
@@ -641,7 +712,8 @@ export const api = {
           operation: 'scanFolder',
           folderPath: resolvedFolderPath,
           assets: batch,
-          force: true
+          force: true,
+          rescan
         },
         ctx
       );
@@ -649,24 +721,15 @@ export const api = {
       allResults.push(...batchResults);
       const step = Math.max(1, batchResults.length || batch.length);
       idx += step;
-
-      if (typeof onProgress === 'function') {
-        try {
-          onProgress({
-            completed: Math.min(idx, allAssets.length),
-            total: allAssets.length,
-            results: allResults
-          });
-        } catch (e) {
-          // ignore progress callback error
-        }
-      }
+      report();
     }
 
     return {
       folderPath: resolvedFolderPath,
-      totalAssets: allAssets.length,
-      results: allResults
+      totalAssets: listedAssets.length,
+      excludedAssetCount,
+      results: allResults,
+      summary: summarizeScanResults(allResults, excludedAssetCount)
     };
   },
   getSettings: (ctx) => invokeAction('settings', { operation: 'getSettings' }, ctx),

@@ -24,7 +24,7 @@ import {
   DialogTrigger,
   AlertDialog
 } from '@adobe/react-spectrum';
-import { api, resultBanner } from '../utils/api';
+import { api, resultBanner, describeScanSummary } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 const GROUP_PAGE_SIZE = 60;
@@ -145,7 +145,9 @@ export default function AdminConsole() {
     includeUnnamedInMetadata: true,
     processingProfileName: 'Face Recognition',
     requireProcessingProfile: true,
-    enabledFoldersText: '/content/dam/events\n/content/dam/campaigns'
+    enabledFoldersText: '/content/dam/events\n/content/dam/campaigns',
+    allowedImageTypesText: '',
+    minImageSize: 200
   });
 
   const [loading, setLoading] = useState(true);
@@ -189,6 +191,7 @@ export default function AdminConsole() {
   });
   const [browsingFolder, setBrowsingFolder] = useState(false);
   const [scanResult, setScanResult] = useState(null);
+  const [rescanExisting, setRescanExisting] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState(null);
   const [scanningAssetPath, setScanningAssetPath] = useState(null);
@@ -310,7 +313,8 @@ export default function AdminConsole() {
           ...prev,
           ...settingsRes.settings,
           awsSecretAccessKey: '',
-          enabledFoldersText: (settingsRes.settings.enabledFolders || ['/content/dam']).join('\n')
+          enabledFoldersText: (settingsRes.settings.enabledFolders || ['/content/dam']).join('\n'),
+          allowedImageTypesText: (settingsRes.settings.allowedImageTypes || []).join(', ')
         }));
       }
     } catch (err) {
@@ -430,6 +434,11 @@ export default function AdminConsole() {
     try {
       const payload = {
         ...settings,
+        allowedImageTypes: settings.allowedImageTypesText
+          .split(/[\s,]+/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+        minImageSize: Number(settings.minImageSize),
         enabledFolders: settings.enabledFoldersText
           .split('\n')
           .map((s) => s.trim())
@@ -467,12 +476,18 @@ export default function AdminConsole() {
     setScanProgress(null);
     setScanResult(null);
     try {
-      const res = await api.scanFolder(currentFolderPath, hostContext, (prog) => {
-        setScanProgress(prog);
-      });
+      const res = await api.scanFolder(
+        currentFolderPath,
+        hostContext,
+        (prog) => setScanProgress(prog),
+        { rescan: rescanExisting }
+      );
       setScanResult(res);
       await loadAll();
-      setBanner(resultBanner(`Folder scan complete for ${res.folderPath} (${res.totalAssets} assets processed).`, res));
+      const summaryText = res.summary
+        ? describeScanSummary(res.summary)
+        : `${res.totalAssets} asset(s) processed.`;
+      setBanner(resultBanner(`Folder scan complete for ${res.folderPath}. ${summaryText}`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     } finally {
@@ -521,6 +536,9 @@ export default function AdminConsole() {
                   : 'Scanning Current Folder...'
                 : 'Scan Current Folder'}
             </Button>
+            <Checkbox isSelected={rescanExisting} onChange={setRescanExisting} isDisabled={scanning}>
+              <span style={{ fontSize: 12 }}>Include already-scanned images</span>
+            </Checkbox>
             <DialogTrigger>
               <ActionButton isDisabled={stats.totalGroups === 0 && stats.totalFaces === 0}>
                 Clear All Data
@@ -1186,6 +1204,31 @@ export default function AdminConsole() {
                         placeholder="Face Recognition"
                         width="100%"
                       />
+
+                      <Divider size="S" />
+
+                      <Heading level={4} margin={0}>
+                        AWS cost controls
+                      </Heading>
+                      <TextField
+                        label="Image types to analyze (comma-separated)"
+                        value={settings.allowedImageTypesText}
+                        onChange={(v) => setSettings((s) => ({ ...s, allowedImageTypesText: v }))}
+                        width="100%"
+                      />
+                      <TextField
+                        label="Skip images smaller than (pixels, shorter side)"
+                        value={String(settings.minImageSize ?? '')}
+                        onChange={(v) => setSettings((s) => ({ ...s, minImageSize: v }))}
+                        inputMode="numeric"
+                        width="size-3000"
+                      />
+                      <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>
+                        Other file types (PDFs, videos, SVGs, GIFs...) and small images such as
+                        logos and icons are never sent to AWS. Folder scans also skip images that
+                        were already scanned unless &quot;Include already-scanned images&quot; is
+                        checked.
+                      </Text>
                     </Flex>
                   </Well>
                 </Flex>
