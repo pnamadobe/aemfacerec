@@ -18,11 +18,13 @@ This Adobe Developer App Builder application extends **AEM as a Cloud Service (A
    - Interactive bounding-box overlay preview showing which avatar corresponds to which person in multi-person photos.
    - Allows naming a person, splitting a mis-grouped face into its own group, or reassigning a face to another group directly from the asset.
 5. **Face Management & Settings Console (Admin UI)**:
-   - Manage all recognized Face Groups (Named People & Unnamed Placeholders like `Person #12`).
+   - Sticky top action bar keeping **Scan Current Folder**, **Clear All Data**, and **Close** pinned while scrolling.
+   - Server-paged Face Groups grid (60 per page) with server-side search and Named/Unnamed filtering.
    - **Name / Rename** a face group.
    - **Remove / Split** one or more faces out of a group into a new standalone group.
-   - **Combine / Merge** a face or an entire face group into another group.
-   - **Settings Tab**: Configure customer's AWS Rekognition API credentials, Collection ID, similarity threshold, Processing Profile name, enabled folders, target metadata property (`xdm:faceNames`), and the toggle to **show or hide unnamed placeholder labels** (`Person #N`) in AEM asset metadata.
+   - **Combine / Merge** a face or an entire face group into another group using dropdown pickers with circular `22×22` face avatar thumbnails.
+   - Direct **new-tab deep links** (`↗`) next to each face's filename under *Faces in this Group* opening the asset in AEM Assets View (`experience.adobe.com`).
+   - **Settings Tab**: Configure customer's AWS Rekognition API credentials, Collection ID, similarity threshold, Processing Profile name, enabled folders, AWS cost controls (`allowedImageTypes`, `minImageSize`), target metadata property (`xdm:faceNames`), and the toggle to **show or hide unnamed placeholder labels** (`Person #N`) in AEM asset metadata.
 6. **Multi-Face AEM Metadata Sync (`xdm:faceNames`)**:
    - Automatically computes and writes deduplicated multi-value `String[]` metadata (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`) to `jcr:content/metadata` on every affected AEM asset whenever faces are ingested, named, split, or merged.
 
@@ -74,6 +76,7 @@ aemfacerec/
             ├── paging.test.js               # 1 MB response budget, server paging/search/filter
             ├── cost.test.js                 # Skip already-scanned, MIME allowlist & min image dimensions
             ├── folder-and-asset-id.test.js  # DAM folder pagination (>200 items) & canonical asset IDs
+            ├── concurrency-and-jobs.test.js # Distributed lock, record-level merge, event dedupe & R14
             ├── ui-api.test.js               # Client banner & folder-scan batching tests
             └── ui-admin-console.test.js     # End-to-end jsdom UI tests against real Runtime actions
 ```

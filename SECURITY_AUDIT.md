@@ -16,12 +16,13 @@ The extension works as a prototype. Before our remediation rounds, three problem
 2. **The AEM technical-account token could be sent to any host, and was used silently in place of the user's token** (SSRF and privilege escalation).
 3. **All state lives in a few JSON documents.** Each request reads and rewrites the whole document, with no concurrency control, and a single read error could wipe the database.
 
-Across five rounds of work, we have now fixed:
+Across six rounds of work, we have now fixed:
 - **Critical & high security issues (`S1`–`S7`, `S9` partially, `S12`–`S14`, `S16`, `S17`)**: Adobe auth required on all web actions, AEM host allowlist + no service-token fallback on user requests, mandatory `ENCRYPTION_SECRET`, strict DAM path and metadata property validation, no `process.env` mutation, and sanitized error responses.
 - **Load & failure resilience (`R2`, `R4`, `R5` ingest, `R6`, `R7`, `R8`, `R12`, `P5`)**: corrupt/unreadable storage fails closed instead of wiping the DB, retries with exponential backoff + jitter for AWS Rekognition and AEM, throttling no longer creates duplicate people, failure-safe ingest ordering, non-fatal AEM metadata write reporting, 128-bit group IDs, and 5 MB / 25 MP image limits.
-- **Library growth & AWS cost (`P2`, `P6`, `R9`, `R11`, `C1`–`C4`)**: paged group list + server-side search/filter, names-only picker endpoint, paged per-group faces (keeps every response well under the 1 MB Runtime limit), DAM folder pagination past 200 items, canonical asset IDs with legacy duplicate consolidation, and AWS cost controls (skip already-scanned images, file-type allowlist, minimum image dimension).
+- **Library growth & AWS cost (`P2`, `P6`, `R9`, `R11`, `C1`–`C4`)**: paged group list + server-side search/filter, picker options endpoint with capped cover avatars, paged per-group faces (keeps every response well under the 1 MB Runtime limit), DAM folder pagination past 200 items, canonical asset IDs with legacy duplicate consolidation, and AWS cost controls (skip already-scanned images, file-type allowlist, minimum image dimension).
+- **Concurrency & resumable jobs (`R1`, `R3`, `R10`, `R13`, `R14`, `R15`)**: distributed lease lock via `@adobe/aio-lib-state` + in-process mutex, record-level delta merging on `saveDatabase()` (including set-union of `faceIds`), read-only `getAssetFaces`, 24-hour I/O Event idempotency, save-before-sync mutations, and time-budgeted/resumable AEM metadata fan-outs.
 
-The remaining open items are larger architectural changes (per-record database `R1`, background job queue `R14`/`P7`, OAuth Server-to-Server `S9`, cross-account IAM role `S8`, biometric privacy/erasure `S10`, multi-org partitioning `S11`, and dependency cleanup `S15`). They are tracked below with recommended designs.
+The remaining open items are Group 4 housekeeping & compliance (`S15` dependency cleanup, `S9` OAuth Server-to-Server credentials, `S10` biometric privacy/erasure, `S11` multi-org partitioning, and the deferred `S8` cross-account IAM role).
 
 ---
 
@@ -69,7 +70,7 @@ The remaining open items are larger architectural changes (per-record database `
 | R12 | Medium | 32-bit group IDs; a collision overwrites a group. | ✅ | 128-bit IDs. |
 | R13 | Medium | `getAssetFaces` (a read) rewrote the whole database when resolving a UUID. | ✅ | Removed `saveDatabase` from `getAssetFaces`; read paths never mutate storage. |
 | R14 | High | Renaming a group, re-syncing and settings toggles did one AEM write per asset in a single request and saved only at the end. | ✅ | `renameGroup`, `splitFacesToNewGroup`, `moveFacesToGroup` and `mergeGroups` now persist the database **before** starting the AEM metadata fan-out. `syncAssetsToAem` and `resyncAllAssetsMetadata` enforce an 18s time budget (`offset`/`limit`/`timeBudgetMs`) and return `hasMoreToSync`, `nextSyncOffset`, and `remainingAssetCount`; the UI loops through `api.resyncAllAssets` until all chunks complete. |
-| R15 | Medium | Thin test coverage. | ✅ | 136 automated tests across 9 suites (`face-service`, `security`, `robustness`, `paging`, `cost`, `folder-and-asset-id`, `concurrency-and-jobs`, `ui-api`, `ui-admin-console`). |
+| R15 | Medium | Thin test coverage. | ✅ | 137 automated tests across 9 suites (`face-service`, `security`, `robustness`, `paging`, `cost`, `folder-and-asset-id`, `concurrency-and-jobs`, `ui-api`, `ui-admin-console`). |
 
 ---
 
