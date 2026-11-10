@@ -117,8 +117,20 @@ function extractAssetContext(resourceOrWrapper, context) {
     '';
 
   const aemAuthorUrl = findAemAuthorUrl(resource, resourceOrWrapper, ctxObj);
+  let imsTenant = '';
+  let experienceOrigin = '';
+  try {
+    const ref = document.referrer || '';
+    const m = ref.match(/(https:\/\/experience(?:-stage)?\.adobe\.com)/i);
+    if (m) experienceOrigin = m[1];
+  } catch (e) {
+    // ignore
+  }
+  const searchStr = JSON.stringify({ resource, ctxObj });
+  const tenantMatch = searchStr.match(/\/@([a-zA-Z0-9_-]+)\/assets/);
+  if (tenantMatch) imsTenant = tenantMatch[1];
 
-  return { folderPath, assetPath, assetName, assetId, aemAuthorUrl };
+  return { folderPath, assetPath, assetName, assetId, aemAuthorUrl, imsTenant, experienceOrigin };
 }
 
 export default function ExtensionRegistration() {

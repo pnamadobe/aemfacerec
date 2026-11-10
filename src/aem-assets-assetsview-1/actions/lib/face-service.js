@@ -954,6 +954,7 @@ async function createFaceService({
         totalAssets: new Set(
           Object.values(db.assets || {}).map((a) => safeNormalizeDamPath(a?.assetPath) || a?.assetId)
         ).size,
+        aemHost: aemHost || null,
         settings: {
           metadataProperty: settings.metadataProperty,
           includeUnnamedInMetadata: settings.includeUnnamedInMetadata

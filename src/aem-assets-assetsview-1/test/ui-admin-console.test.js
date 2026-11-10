@@ -530,3 +530,24 @@ test('UI UX: top header is sticky so Close/actions stay visible on scroll, and c
   assert.ok(optionImgs.length > 0, 'dropdown options render face avatar thumbnails');
   assert.match(optionImgs[0].getAttribute('src'), /^data:image\/jpeg;base64,/);
 });
+
+test('UI UX: each face card in "Faces in this Group" renders a new-tab link next to the filename without toggling selection on click', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  const card = screen.getAllByText('Alice Example').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  fireEvent.click(card);
+  await screen.findByText('Manage Group: Alice Example');
+
+  const link = await screen.findByLabelText('Open asset-1-0.jpg in new tab');
+  assert.equal(link.getAttribute('target'), '_blank');
+  assert.equal(link.getAttribute('rel'), 'noopener noreferrer');
+  assert.equal(
+    link.getAttribute('href'),
+    'https://author-p1-e1.adobeaemcloud.com/ui#/aem/assetdetails.html/content/dam/ui/asset-1-0.jpg'
+  );
+
+  // Clicking the external link must NOT select the face card (stopPropagation)
+  fireEvent.click(link);
+  assert.equal(screen.queryByText(/Actions for 1 Selected Face/), null);
+});

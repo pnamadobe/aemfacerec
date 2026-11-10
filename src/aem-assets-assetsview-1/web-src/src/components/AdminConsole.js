@@ -31,6 +31,24 @@ const GROUP_PAGE_SIZE = 60;
 const GROUP_FACES_PAGE_SIZE = 60;
 
 /**
+ * Builds a direct URL to open an AEM asset's detail view in a new browser tab.
+ */
+function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') {
+  if (!assetPath) return null;
+  const cleanPath = String(assetPath).startsWith('/') ? String(assetPath) : `/${assetPath}`;
+  const rawHost = hostContext.aemHost || fallbackAemHost || '';
+  if (!rawHost) return null;
+  const normalizedHost = String(rawHost).trim().replace(/\/+$/, '');
+  const repoId = normalizedHost.replace(/^https?:\/\//i, '');
+  if (hostContext.imsTenant) {
+    const expOrigin = hostContext.experienceOrigin || 'https://experience.adobe.com';
+    return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#/@${hostContext.imsTenant}/assets/detail${cleanPath}`;
+  }
+  const baseUrl = /^https?:\/\//i.test(normalizedHost) ? normalizedHost : `https://${normalizedHost}`;
+  return `${baseUrl}/ui#/aem/assetdetails.html${cleanPath}`;
+}
+
+/**
  * Renders a group option inside a Spectrum <Picker> with a circular face avatar thumbnail.
  */
 function renderGroupPickerItem(g, { includeFaceCount = true } = {}) {
@@ -82,8 +100,11 @@ export default function AdminConsole() {
     hostResolved: false,
     imsToken: null,
     imsOrg: null,
+    imsTenant: null,
+    experienceOrigin: null,
     aemHost: null
   });
+  const [serverAemHost, setServerAemHost] = useState('');
 
   useEffect(() => {
     let mounted = true;
@@ -93,8 +114,13 @@ export default function AdminConsole() {
     } catch (e) {
       storedCtx = {};
     }
-    if (storedCtx.aemAuthorUrl) {
-      setHostContext((prev) => ({ ...prev, aemHost: storedCtx.aemAuthorUrl }));
+    if (storedCtx.aemAuthorUrl || storedCtx.imsTenant || storedCtx.experienceOrigin) {
+      setHostContext((prev) => ({
+        ...prev,
+        aemHost: storedCtx.aemAuthorUrl || prev.aemHost,
+        imsTenant: storedCtx.imsTenant || prev.imsTenant,
+        experienceOrigin: storedCtx.experienceOrigin || prev.experienceOrigin
+      }));
     }
 
     (async () => {
@@ -287,6 +313,7 @@ export default function AdminConsole() {
         return;
       }
       setGroups(loaded);
+      if (res.aemHost) setServerAemHost(res.aemHost);
       setStats({
         totalGroups: res.totalGroups || 0,
         namedCount: res.namedCount || 0,
@@ -1022,17 +1049,68 @@ export default function AdminConsole() {
                                       objectFit: 'cover'
                                     }}
                                   />
-                                  <Text
-                                    UNSAFE_style={{
-                                      fontSize: 11,
-                                      fontWeight: 600,
-                                      color: '#1e293b',
-                                      textAlign: 'center',
-                                      wordBreak: 'break-all'
+                                  <span
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      gap: 4,
+                                      maxWidth: '100%'
                                     }}
                                   >
-                                    {face.assetTitle}
-                                  </Text>
+                                    <Text
+                                      UNSAFE_style={{
+                                        fontSize: 11,
+                                        fontWeight: 600,
+                                        color: '#1e293b',
+                                        textAlign: 'center',
+                                        wordBreak: 'break-all'
+                                      }}
+                                    >
+                                      {face.assetTitle}
+                                    </Text>
+                                    {(() => {
+                                      const detailUrl = buildAssetDetailUrl(
+                                        face.assetPath,
+                                        hostContext,
+                                        serverAemHost
+                                      );
+                                      if (!detailUrl) return null;
+                                      return (
+                                        <a
+                                          href={detailUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          aria-label={`Open ${face.assetTitle} in new tab`}
+                                          title={`Open ${face.assetTitle} detail page in new tab`}
+                                          onClick={(e) => e.stopPropagation()}
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            color: '#0284c7',
+                                            textDecoration: 'none',
+                                            flexShrink: 0,
+                                            padding: 2
+                                          }}
+                                        >
+                                          <svg
+                                            width="12"
+                                            height="12"
+                                            viewBox="0 0 24 24"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="2.2"
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                          >
+                                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                                            <polyline points="15 3 21 3 21 9" />
+                                            <line x1="10" y1="14" x2="21" y2="3" />
+                                          </svg>
+                                        </a>
+                                      );
+                                    })()}
+                                  </span>
                                   <Text UNSAFE_style={{ fontSize: 10, color: '#64748b' }}>
                                     {face.confidence}% conf
                                   </Text>
