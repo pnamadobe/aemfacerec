@@ -10,6 +10,12 @@ An open-source **Adobe Developer App Builder** extension template for **AEM as a
 
 > 📖 **Looking for step-by-step installation, AWS IAM key setup, AEM Processing Profile setup, and Adobe I/O Events wiring?** See **[SETUP.md](./SETUP.md)** and **[SECURITY_AUDIT.md](./SECURITY_AUDIT.md)**.
 
+## Demo Video
+
+[![Watch the AEM Assets Facial Recognition & Grouping Demo](https://img.youtube.com/vi/hmwMZpjIb4Q/maxresdefault.jpg)](https://youtu.be/hmwMZpjIb4Q)
+
+▶️ **[Watch on YouTube: AEM Assets View — Facial Recognition & Grouping Extension](https://youtu.be/hmwMZpjIb4Q)**
+
 ---
 
 ## Table of Contents
