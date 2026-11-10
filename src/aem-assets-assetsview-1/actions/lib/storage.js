@@ -205,6 +205,27 @@ async function createStorage(options = {}) {
       return { groups, faces, assets, counters };
     },
 
+    async exportRawSnapshot() {
+      const [groups, faces, assets, counters, settingsRaw] = await Promise.all([
+        readJson('db/groups.json', {}),
+        readJson('db/faces.json', {}),
+        readJson('db/assets.json', {}),
+        readJson('db/counters.json', { nextPersonNumber: 1 }),
+        readJson('db/settings.json', {})
+      ]);
+      return { groups, faces, assets, counters, settingsRaw };
+    },
+
+    async importRawSnapshot({ groups, faces, assets, counters, settingsRaw }) {
+      const ops = [];
+      if (groups) ops.push(writeJson('db/groups.json', groups));
+      if (faces) ops.push(writeJson('db/faces.json', faces));
+      if (assets) ops.push(writeJson('db/assets.json', assets));
+      if (counters) ops.push(writeJson('db/counters.json', counters));
+      if (settingsRaw) ops.push(writeJson('db/settings.json', settingsRaw));
+      await Promise.all(ops);
+    },
+
     async saveDatabase({ groups, faces, assets, counters }) {
       const ops = [];
       if (groups) ops.push(writeJson('db/groups.json', groups));

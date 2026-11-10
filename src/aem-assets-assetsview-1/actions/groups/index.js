@@ -110,6 +110,19 @@ async function main(params = {}) {
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 
+      case 'exportSnapshot': {
+        const storage = await require('../lib/storage').createStorage();
+        const snapshot = await storage.exportRawSnapshot();
+        return { statusCode: 200, headers: corsHeaders, body: snapshot };
+      }
+
+      case 'importSnapshot': {
+        const storage = await require('../lib/storage').createStorage();
+        await storage.importRawSnapshot(params.snapshot || {});
+        const result = await faceService.listGroups();
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
       default:
         return {
           statusCode: 400,
