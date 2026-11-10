@@ -79,6 +79,11 @@ function createRekognitionService(settings, customClient = null) {
   function getClient() {
     if (customClient) return customClient;
     if (!settings.awsAccessKeyId || !settings.awsSecretAccessKey) {
+      if (settings.awsSecretKeyUnreadable) {
+        throw new PublicError(
+          'The stored AWS Secret Access Key can no longer be decrypted (the encryption secret changed). Please re-enter it in the Face Recognition Settings tab.'
+        );
+      }
       throw new PublicError(
         'AWS Rekognition credentials are not configured. Please provide your AWS Access Key ID and Secret Access Key in the Face Recognition Settings tab.'
       );

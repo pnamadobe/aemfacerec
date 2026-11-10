@@ -32,6 +32,7 @@ export default function AdminConsole() {
   const [guestConnection, setGuestConnection] = useState(null);
   const [hostContext, setHostContext] = useState({
     inAemHost: false,
+    hostResolved: false,
     imsToken: null,
     imsOrg: null,
     aemHost: null
@@ -51,7 +52,12 @@ export default function AdminConsole() {
 
     (async () => {
       try {
-        const gc = await attach({ id: extensionId });
+        const gc = await Promise.race([
+          attach({ id: extensionId }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Host connection timed out')), 10000)
+          )
+        ]);
         if (!gc || !mounted) return;
         setGuestConnection(gc);
 
@@ -93,6 +99,10 @@ export default function AdminConsole() {
         }
       } catch (e) {
         // Standalone mode outside AEM host
+      } finally {
+        if (mounted) {
+          setHostContext((prev) => ({ ...prev, hostResolved: true }));
+        }
       }
     })();
 
@@ -165,6 +175,7 @@ export default function AdminConsole() {
   const [banner, setBanner] = useState(null);
 
   const loadAll = useCallback(async () => {
+    if (!hostContext.hostResolved) return;
     setLoading(true);
     try {
       const [groupsRes, settingsRes] = await Promise.all([

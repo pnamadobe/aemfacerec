@@ -26,6 +26,7 @@ export default function AssetDetailsSidePanel() {
   const [guestConnection, setGuestConnection] = useState(null);
   const [hostContext, setHostContext] = useState({
     inAemHost: false,
+    hostResolved: false,
     imsToken: null,
     imsOrg: null,
     aemHost: null,
@@ -93,7 +94,12 @@ export default function AssetDetailsSidePanel() {
 
     const connectToHost = async () => {
       try {
-        const gc = await attach({ id: extensionId });
+        const gc = await Promise.race([
+          attach({ id: extensionId }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Host connection timed out')), 10000)
+          )
+        ]);
         if (!gc || !mounted) return;
         setGuestConnection(gc);
 
@@ -152,6 +158,12 @@ export default function AssetDetailsSidePanel() {
         }
       } catch (e) {
         // Standalone mode outside AEM iframe
+      } finally {
+        // Only load data once we know whether an IMS token is available, so the first
+        // requests are not sent unauthenticated (they would be rejected with 401).
+        if (mounted) {
+          setHostContext((prev) => ({ ...prev, hostResolved: true }));
+        }
       }
     };
     connectToHost();
@@ -162,6 +174,7 @@ export default function AssetDetailsSidePanel() {
   }, []);
 
   const loadData = useCallback(async () => {
+    if (!hostContext.hostResolved) return;
     setLoading(true);
     try {
       const [facesRes, groupsRes] = await Promise.all([

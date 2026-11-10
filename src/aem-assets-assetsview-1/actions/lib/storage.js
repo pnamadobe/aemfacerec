@@ -293,9 +293,19 @@ async function createStorage(options = {}) {
       const stored = await readJson('db/settings.json', {});
       const merged = { ...DEFAULT_SETTINGS, ...stored };
 
-      const decryptedSecret = merged.awsSecretAccessKeyEncrypted
-        ? decryptSecret(merged.awsSecretAccessKeyEncrypted, encryptionKey)
-        : process.env.AWS_SECRET_ACCESS_KEY || '';
+      let decryptedSecret = '';
+      let secretUnreadable = false;
+      if (merged.awsSecretAccessKeyEncrypted) {
+        try {
+          decryptedSecret = decryptSecret(merged.awsSecretAccessKeyEncrypted, encryptionKey);
+        } catch (e) {
+          // Encrypted with a different ENCRYPTION_SECRET (e.g. after key rotation). Treat as
+          // not configured so the admin can re-enter it, instead of failing every request.
+          secretUnreadable = true;
+        }
+      } else {
+        decryptedSecret = process.env.AWS_SECRET_ACCESS_KEY || '';
+      }
 
       const effectiveAccessKeyId =
         merged.awsAccessKeyId || process.env.AWS_ACCESS_KEY_ID || '';
@@ -304,6 +314,7 @@ async function createStorage(options = {}) {
         awsRegion: merged.awsRegion || process.env.AWS_REGION || 'us-east-1',
         awsAccessKeyId: effectiveAccessKeyId,
         hasAwsSecretKey: Boolean(decryptedSecret),
+        awsSecretKeyUnreadable: secretUnreadable,
         awsSecretKeyMasked: maskSecret(decryptedSecret),
         collectionId:
           merged.collectionId ||

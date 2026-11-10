@@ -471,13 +471,42 @@ test('S1/S4: snapshot export omits credentials and import cannot overwrite setti
   }
 });
 
-test('S4: secrets encrypted with one key cannot be read with another (e.g. a default key)', async () => {
+test('S4: secrets encrypted with one key cannot be read with another, and that does not break the app', async () => {
   const dir = makeTmpDir();
   try {
     const a = await createStorage({ localDir: dir, encryptionSecret: 'first-secret-value-123' });
-    await a.saveSettings({ awsSecretAccessKey: 'aws-secret' });
+    await a.saveSettings({ awsAccessKeyId: 'AKIA', awsSecretAccessKey: 'aws-secret' });
+    await a.saveDatabase({ groups: {}, faces: {}, assets: {}, counters: { nextPersonNumber: 1 } });
+
     const b = await createStorage({ localDir: dir, encryptionSecret: 'other-secret-value-456' });
-    await assert.rejects(() => b.getSettings({ includeDecryptedSecret: true }));
+    const s = await b.getSettings({ includeDecryptedSecret: true });
+    assert.equal(s.awsSecretAccessKey, '');
+    assert.equal(s.hasAwsSecretKey, false);
+    assert.equal(s.awsSecretKeyUnreadable, true);
+
+    // Read paths used by the side panel and admin console keep working
+    const svc = await createFaceService({ storage: b, aemClient: {} });
+    const faces = await svc.getAssetFaces({ assetPath: '/content/dam/a.jpg' });
+    assert.equal(faces.scanned, false);
+    await svc.listGroups();
+
+    // Operations that need AWS explain how to recover
+    await assert.rejects(
+      () =>
+        svc.ingestAsset({
+          assetPath: '/content/dam/a.jpg',
+          assetId: 'id-a',
+          imageBuffer: Buffer.from('x'),
+          force: true
+        }),
+      (err) => err instanceof PublicError && /re-enter/.test(err.message)
+    );
+
+    // Re-entering the secret with the current key recovers
+    await b.saveSettings({ awsSecretAccessKey: 'aws-secret-2' });
+    const fixed = await b.getSettings({ includeDecryptedSecret: true });
+    assert.equal(fixed.awsSecretAccessKey, 'aws-secret-2');
+    assert.equal(fixed.awsSecretKeyUnreadable, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
