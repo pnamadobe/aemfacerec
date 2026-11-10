@@ -521,6 +521,28 @@ async function invokeLocalPreviewFallback(actionName, payload) {
         remainingAssetCount: 0
       };
     }
+    if (op === 'deleteGroup') {
+      const grp = db.groups[payload.groupId];
+      if (!grp) throw new Error(`Face Group '${payload.groupId}' not found.`);
+      const deletedDisplayName = grp.name || grp.autoLabel || grp.groupId;
+      const memberFaceIds = [...(grp.faceIds || [])];
+      for (const fId of memberFaceIds) {
+        delete db.faces[fId];
+      }
+      for (const assetRecord of Object.values(db.assets || {})) {
+        assetRecord.faceIds = (assetRecord.faceIds || []).filter((id) => !memberFaceIds.includes(id));
+      }
+      delete db.groups[payload.groupId];
+      saveLocalDb(db);
+      return {
+        deletedGroupId: payload.groupId,
+        deletedDisplayName,
+        deletedFaceCount: memberFaceIds.length,
+        syncedAssetCount: 1,
+        failedAssetCount: 0,
+        failedAssets: []
+      };
+    }
     if (op === 'mergeGroups') {
       const { sourceGroupIds = [], targetGroupId } = payload;
       const targetGrp = db.groups[targetGroupId];
@@ -662,6 +684,8 @@ export const api = {
     invokeAction('groups', { operation: 'moveFaces', faceIds, targetGroupId }, ctx),
   mergeGroups: (sourceGroupIds, targetGroupId, ctx) =>
     invokeAction('groups', { operation: 'mergeGroups', sourceGroupIds, targetGroupId }, ctx),
+  deleteGroup: (groupId, ctx) =>
+    invokeAction('groups', { operation: 'deleteGroup', groupId }, ctx),
   /**
    * Re-syncs AEM metadata across all indexed assets in time-budgeted chunks (`R14`).
    */

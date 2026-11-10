@@ -1311,6 +1311,74 @@ async function createFaceService({
     },
 
     /**
+     * Permanently deletes a single Face Group ("Right to be Forgotten" / false-positive removal, `S10`):
+     * 1. Disassociates and deletes all member face vectors and the User in AWS Rekognition
+     * 2. Deletes all cropped avatar files from storage
+     * 3. Removes the group and face records from the database and detaches them from assets
+     * 4. Re-computes and syncs `xdm:faceNames` on all affected AEM assets
+     */
+    async deleteGroup({ groupId, timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS }) {
+      if (!groupId) {
+        throw new PublicError('groupId is required to delete a group.');
+      }
+
+      const [{ settings, rekognition }, db] = await Promise.all([
+        getRekognition(),
+        storage.getDatabase()
+      ]);
+
+      const group = db.groups[groupId];
+      if (!group) {
+        throw new PublicError(`Face Group '${groupId}' not found.`, 404);
+      }
+
+      const deletedDisplayName = group.name || group.autoLabel || group.groupId;
+      const memberFaceIds = [...(group.faceIds || [])];
+      const removedSet = new Set(memberFaceIds);
+      const affectedAssetIds = [];
+
+      for (const fId of memberFaceIds) {
+        const face = db.faces[fId];
+        if (face?.assetId) affectedAssetIds.push(face.assetId);
+      }
+
+      // 1. Remove from AWS Rekognition (User + Face vectors)
+      if (memberFaceIds.length > 0) {
+        await rekognition.disassociateFaces(groupId, memberFaceIds);
+      }
+      await rekognition.deleteGroup(groupId);
+      if (memberFaceIds.length > 0) {
+        await rekognition.deleteFaces(memberFaceIds);
+      }
+
+      // 2. Remove from database and detach from asset records
+      delete db.groups[groupId];
+      for (const fId of memberFaceIds) {
+        delete db.faces[fId];
+      }
+      for (const assetRecord of Object.values(db.assets || {})) {
+        if (Array.isArray(assetRecord?.faceIds) && assetRecord.faceIds.some((id) => removedSet.has(id))) {
+          assetRecord.faceIds = assetRecord.faceIds.filter((id) => !removedSet.has(id));
+        }
+      }
+
+      // 3. Delete avatar files (best effort) and persist DB before AEM metadata fan-out
+      await Promise.all(memberFaceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
+      await storage.saveDatabase(db);
+
+      // 4. Recompute and update AEM metadata on affected assets
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings, { timeBudgetMs });
+      await storage.saveDatabase(db);
+
+      return {
+        deletedGroupId: groupId,
+        deletedDisplayName,
+        deletedFaceCount: memberFaceIds.length,
+        ...syncSummary(sync)
+      };
+    },
+
+    /**
      * Re-computes and syncs `xdm:faceNames` on all indexed AEM assets
      * (e.g. after toggling `includeUnnamedInMetadata` in Settings).
      */
@@ -1537,9 +1605,36 @@ async function createFaceService({
     },
 
     /**
-     * Clears all groups, faces, and indexed asset records (e.g. to remove sample data).
+     * Clears all groups, faces, avatars, Rekognition vectors/users, and indexed asset records (`S10`).
      */
     async clearAllData() {
+      const existingDb = await storage.getDatabase();
+      const allFaceIds = Object.keys(existingDb.faces || {});
+      const allGroupIds = Object.keys(existingDb.groups || {});
+
+      // Best-effort purge of Rekognition Users/Faces and stored avatar files when credentials exist
+      try {
+        const { settings, rekognition } = await getRekognition();
+        if (settings.awsAccessKeyId && settings.awsSecretAccessKey) {
+          for (const gId of allGroupIds) {
+            const gFaces = existingDb.groups[gId]?.faceIds || [];
+            if (gFaces.length > 0) {
+              // eslint-disable-next-line no-await-in-loop
+              await rekognition.disassociateFaces(gId, gFaces).catch(() => {});
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await rekognition.deleteGroup(gId).catch(() => {});
+          }
+          if (allFaceIds.length > 0) {
+            await rekognition.deleteFaces(allFaceIds).catch(() => {});
+          }
+        }
+      } catch (e) {
+        // Proceed with local wipe even if AWS credentials are not configured
+      }
+
+      await Promise.all(allFaceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
+
       const db = {
         groups: {},
         faces: {},

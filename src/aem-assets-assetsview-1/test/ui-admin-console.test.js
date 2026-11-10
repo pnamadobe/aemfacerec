@@ -551,3 +551,25 @@ test('UI UX: each face card in "Faces in this Group" renders a new-tab link next
   fireEvent.click(link);
   assert.equal(screen.queryByText(/Actions for 1 Selected Face/), null);
 });
+
+test('UI S10: Delete Group button opens confirmation dialog and deletes the group across Rekognition and storage', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  const card = screen.getAllByText('Person #15').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  fireEvent.click(card);
+  await screen.findByText('Manage Group: Person #15');
+
+  const deleteTrigger = screen.getByText('Delete Group').closest('button');
+  assert.ok(deleteTrigger, 'Delete Group button exists in group inspector');
+  fireEvent.click(deleteTrigger);
+
+  await screen.findByText('Delete "Person #15"?');
+  const dialog = screen.getByRole('alertdialog');
+  const confirmBtn = within(dialog).getByText('Delete Group').closest('button');
+  fireEvent.click(confirmBtn);
+
+  await screen.findByText(/Deleted group "Person #15"/);
+  await waitFor(() => assert.ok(!groupCardTitles().includes('Person #15')));
+  assert.ok(awsCommands.includes('DeleteUserCommand') && awsCommands.includes('DeleteFacesCommand'));
+});

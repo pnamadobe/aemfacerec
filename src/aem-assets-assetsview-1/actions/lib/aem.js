@@ -128,52 +128,103 @@ const b64url = (x) =>
 
 const serviceTokenCache = new Map();
 
+function parseServiceCredentialsJson(scJson) {
+  const trimmed = String(scJson || '').trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('{')) {
+    return JSON.parse(trimmed);
+  }
+  return JSON.parse(Buffer.from(trimmed, 'base64').toString('utf8'));
+}
+
 /**
- * Exchanges base64-encoded AEM Service Credentials JSON (scJson) for an IMS access token,
- * falling back to a static devToken. Credentials are passed explicitly (never read from
- * process.env) so warm containers cannot leak them between invocations.
+ * Exchanges AEM Service Credentials JSON (`scJson`) for an IMS access token (`S9`).
+ * Supports both:
+ * 1. Modern OAuth Server-to-Server credentials (`/ims/token/v3` client_credentials grant)
+ * 2. Legacy JWT Service Account credentials (`/ims/exchange/jwt`, kept for backward compatibility)
+ * Falls back to `devToken` when provided.
  */
 async function getServiceToken(fetchImpl, { scJson, devToken } = {}) {
   const now = Math.floor(Date.now() / 1000);
-  const scB64 = scJson || '';
-  const cacheKey = scB64 ? crypto.createHash('sha256').update(scB64).digest('hex') : '';
+  const scRaw = scJson || '';
+  const cacheKey = scRaw ? crypto.createHash('sha256').update(scRaw).digest('hex') : '';
   const cached = cacheKey && serviceTokenCache.get(cacheKey);
   if (cached && cached.exp > now + 60) {
     return cached.token;
   }
 
-  if (scB64 && fetchImpl) {
+  if (scRaw && fetchImpl) {
     try {
-      const raw = JSON.parse(Buffer.from(scB64, 'base64').toString('utf8'));
-      const sc = raw.integration || raw;
-      const payload = {
-        exp: now + 300,
-        iss: sc.org,
-        sub: sc.id,
-        aud: `https://${sc.imsEndpoint}/c/${sc.technicalAccount.clientId}`
-      };
-      payload[`https://${sc.imsEndpoint}/s/${sc.metascopes}`] = true;
-      const si =
-        b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' })) +
-        '.' +
-        b64url(JSON.stringify(payload));
-      const jwt =
-        si + '.' + b64url(crypto.sign('RSA-SHA256', Buffer.from(si), sc.privateKey));
-      const body = new URLSearchParams({
-        client_id: sc.technicalAccount.clientId,
-        client_secret: sc.technicalAccount.clientSecret,
-        jwt_token: jwt
-      });
-      const r = await fetchImpl(`https://${sc.imsEndpoint}/ims/exchange/jwt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body
-      });
-      if (r.ok) {
-        const data = await r.json();
-        if (data.access_token) {
-          serviceTokenCache.set(cacheKey, { token: data.access_token, exp: now + 240 });
-          return data.access_token;
+      const raw = parseServiceCredentialsJson(scRaw);
+      const sc = raw?.integration || raw || {};
+      const imsHost = String(sc.imsEndpoint || raw?.imsEndpoint || 'ims-na1.adobelogin.com')
+        .replace(/^https?:\/\//i, '')
+        .replace(/\/+$/, '');
+
+      // 1. OAuth Server-to-Server credentials (recommended; replaces deprecated JWT flow)
+      const oauthClientId = sc.clientId || sc.client_id || sc.oauth?.clientId || sc.oauth?.client_id;
+      const oauthClientSecret =
+        sc.clientSecret ||
+        sc.client_secret ||
+        (Array.isArray(sc.clientSecrets) ? sc.clientSecrets[0] : null) ||
+        sc.oauth?.clientSecret ||
+        sc.oauth?.client_secret;
+      const rawScopes = sc.scopes || sc.scope || sc.oauth?.scopes || 'openid,AdobeID,aem.folders,aem.assets.author';
+
+      if (oauthClientId && oauthClientSecret && !sc.privateKey) {
+        const scopeStr = Array.isArray(rawScopes) ? rawScopes.join(',') : String(rawScopes);
+        const body = new URLSearchParams({
+          grant_type: 'client_credentials',
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: scopeStr
+        });
+        const r = await fetchImpl(`https://${imsHost}/ims/token/v3`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+        if (r.ok) {
+          const data = await r.json();
+          if (data.access_token) {
+            const ttl = Math.max(120, Math.min(Number(data.expires_in) || 3600, 86400) - 60);
+            serviceTokenCache.set(cacheKey, { token: data.access_token, exp: now + ttl });
+            return data.access_token;
+          }
+        }
+      }
+
+      // 2. Legacy JWT Service Account credentials (backward compatibility)
+      if (sc.privateKey && sc.technicalAccount?.clientId) {
+        const payload = {
+          exp: now + 300,
+          iss: sc.org,
+          sub: sc.id,
+          aud: `https://${imsHost}/c/${sc.technicalAccount.clientId}`
+        };
+        payload[`https://${imsHost}/s/${sc.metascopes}`] = true;
+        const si =
+          b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' })) +
+          '.' +
+          b64url(JSON.stringify(payload));
+        const jwt =
+          si + '.' + b64url(crypto.sign('RSA-SHA256', Buffer.from(si), sc.privateKey));
+        const body = new URLSearchParams({
+          client_id: sc.technicalAccount.clientId,
+          client_secret: sc.technicalAccount.clientSecret,
+          jwt_token: jwt
+        });
+        const r = await fetchImpl(`https://${imsHost}/ims/exchange/jwt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body
+        });
+        if (r.ok) {
+          const data = await r.json();
+          if (data.access_token) {
+            serviceTokenCache.set(cacheKey, { token: data.access_token, exp: now + 240 });
+            return data.access_token;
+          }
         }
       }
     } catch (e) {
@@ -720,5 +771,6 @@ module.exports = {
   toApiAssetsRelativePath,
   parseRetryAfterMs,
   readBodyWithLimit,
-  MAX_IMAGE_BYTES
+  MAX_IMAGE_BYTES,
+  getServiceToken
 };

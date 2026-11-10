@@ -109,6 +109,17 @@ async function main(params = {}) {
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 
+      case 'deleteGroup': {
+        if (!params.groupId) {
+          throw new PublicError('groupId is required to delete a group.');
+        }
+        const result = await faceService.deleteGroup({
+          groupId: params.groupId,
+          timeBudgetMs: params.timeBudgetMs
+        });
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
       case 'resyncAllAssets': {
         const result = await faceService.resyncAllAssetsMetadata({
           offset: params.offset,

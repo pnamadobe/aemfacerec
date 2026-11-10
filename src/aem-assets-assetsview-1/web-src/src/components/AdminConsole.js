@@ -528,6 +528,27 @@ export default function AdminConsole() {
     }
   };
 
+  const handleDeleteActiveGroup = async () => {
+    if (!activeGroup) return;
+    const groupIdToDelete = activeGroup.groupId;
+    try {
+      const res = await api.deleteGroup(groupIdToDelete, hostContext);
+      setSelectedGroupId(null);
+      setActiveGroup(null);
+      setSelectedFaceIds([]);
+      setSelectedGroupIdsForMerge((prev) => prev.filter((id) => id !== groupIdToDelete));
+      await loadAll();
+      setBanner(
+        resultBanner(
+          `Deleted group "${res.deletedDisplayName}" (${res.deletedFaceCount} face(s)) from AWS Rekognition and synced ${res.syncedAssetCount} asset(s).`,
+          res
+        )
+      );
+    } catch (err) {
+      setBanner({ type: 'negative', text: err.message });
+    }
+  };
+
   const handleSaveSettings = async () => {
     try {
       const payload = {
@@ -985,13 +1006,35 @@ export default function AdminConsole() {
                       </Flex>
                     ) : (
                       <Flex direction="column" gap="size-200">
-                        <Flex justifyContent="space-between" alignItems="center">
+                        <Flex justifyContent="space-between" alignItems="center" wrap gap="size-100">
                           <Heading level={3} margin={0}>
                             Manage Group: {activeGroup.displayName}
                           </Heading>
-                          <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
-                            ID: <code>{activeGroup.groupId}</code>
-                          </Text>
+                          <Flex alignItems="center" gap="size-100">
+                            <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
+                              ID: <code>{activeGroup.groupId}</code>
+                            </Text>
+                            <DialogTrigger>
+                              <ActionButton isQuiet>
+                                <span style={{ color: '#dc2626', fontSize: 12, fontWeight: 600 }}>
+                                  Delete Group
+                                </span>
+                              </ActionButton>
+                              <AlertDialog
+                                variant="destructive"
+                                title={`Delete "${activeGroup.displayName}"?`}
+                                primaryActionLabel="Delete Group"
+                                cancelLabel="Cancel"
+                                onPrimaryAction={handleDeleteActiveGroup}
+                              >
+                                Permanently remove &quot;{activeGroup.displayName}&quot; (
+                                {activeGroup.faceCount} face(s)), delete its vectors from AWS
+                                Rekognition, delete its cropped avatars, and remove it from{' '}
+                                <code>{settings.metadataProperty}</code> on {activeGroup.assetCount}{' '}
+                                asset(s)?
+                              </AlertDialog>
+                            </DialogTrigger>
+                          </Flex>
                         </Flex>
 
                         {/* 1. Name / Rename Group */}
