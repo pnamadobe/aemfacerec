@@ -31,7 +31,8 @@ const GROUP_PAGE_SIZE = 60;
 const GROUP_FACES_PAGE_SIZE = 60;
 
 /**
- * Builds a direct URL to open an AEM asset's detail view in a new browser tab.
+ * Builds a direct URL to open an AEM asset's detail view in AEM Assets View (`experience.adobe.com`).
+ * Never uses `/ui#/aem/assetdetails.html...` because that opens the Touch / Admin UI instead of Assets View.
  */
 function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') {
   if (!assetPath) return null;
@@ -40,12 +41,9 @@ function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') 
   if (!rawHost) return null;
   const normalizedHost = String(rawHost).trim().replace(/\/+$/, '');
   const repoId = normalizedHost.replace(/^https?:\/\//i, '');
-  if (hostContext.imsTenant) {
-    const expOrigin = hostContext.experienceOrigin || 'https://experience.adobe.com';
-    return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#/@${hostContext.imsTenant}/assets/detail${cleanPath}`;
-  }
-  const baseUrl = /^https?:\/\//i.test(normalizedHost) ? normalizedHost : `https://${normalizedHost}`;
-  return `${baseUrl}/ui#/aem/assetdetails.html${cleanPath}`;
+  const expOrigin = hostContext.experienceOrigin || 'https://experience.adobe.com';
+  const tenantPart = hostContext.imsTenant ? `/@${hostContext.imsTenant}` : '';
+  return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#${tenantPart}/assets/detail${cleanPath}`;
 }
 
 /**
@@ -136,13 +134,41 @@ export default function AdminConsole() {
 
         let imsToken = null;
         let imsOrg = null;
+        let imsTenant = storedCtx.imsTenant || null;
+        let experienceOrigin = storedCtx.experienceOrigin || null;
         let aemHost = storedCtx.aemAuthorUrl || null;
+
+        try {
+          const ref = document.referrer || '';
+          const m = ref.match(/(https:\/\/experience(?:-stage)?\.adobe\.com)/i);
+          if (m) experienceOrigin = m[1];
+          const tenantFromRef = ref.match(/\/@([a-zA-Z0-9_-]+)\//);
+          if (tenantFromRef) imsTenant = imsTenant || tenantFromRef[1];
+        } catch (e) {
+          // ignore
+        }
 
         try {
           const imsInfo = await gc.host?.auth?.getIMSInfo?.();
           if (imsInfo) {
             imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
             imsOrg = imsInfo.imsOrg || null;
+            imsTenant = imsTenant || imsInfo.tenant || imsInfo.imsTenant || null;
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        try {
+          const sharedContext = gc.sharedContext;
+          if (sharedContext && typeof sharedContext.get === 'function') {
+            const dump = JSON.stringify({
+              auth: sharedContext.get('auth'),
+              org: sharedContext.get('org'),
+              tenant: sharedContext.get('tenant')
+            });
+            const m = dump.match(/"(?:tenant|imsTenant|tenantId)"\s*:\s*"([a-zA-Z0-9_-]+)"/);
+            if (m) imsTenant = imsTenant || m[1];
           }
         } catch (e) {
           // ignore
@@ -167,6 +193,8 @@ export default function AdminConsole() {
             inAemHost: true,
             imsToken: imsToken || prev.imsToken,
             imsOrg: imsOrg || prev.imsOrg,
+            imsTenant: imsTenant || prev.imsTenant,
+            experienceOrigin: experienceOrigin || prev.experienceOrigin,
             aemHost: aemHost || prev.aemHost
           }));
         }

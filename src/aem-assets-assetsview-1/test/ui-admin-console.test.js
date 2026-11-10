@@ -544,7 +544,7 @@ test('UI UX: each face card in "Faces in this Group" renders a new-tab link next
   assert.equal(link.getAttribute('rel'), 'noopener noreferrer');
   assert.equal(
     link.getAttribute('href'),
-    'https://author-p1-e1.adobeaemcloud.com/ui#/aem/assetdetails.html/content/dam/ui/asset-1-0.jpg'
+    'https://experience.adobe.com/?repoId=author-p1-e1.adobeaemcloud.com#/assets/detail/content/dam/ui/asset-1-0.jpg'
   );
 
   // Clicking the external link must NOT select the face card (stopPropagation)
