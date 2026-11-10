@@ -1,4 +1,5 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { unstable_batchedUpdates } from 'react-dom';
 import { attach } from '@adobe/uix-guest';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -25,6 +26,9 @@ import {
 } from '@adobe/react-spectrum';
 import { api, resultBanner } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
+
+const GROUP_PAGE_SIZE = 60;
+const GROUP_FACES_PAGE_SIZE = 60;
 
 export default function AdminConsole() {
   const navigate = useNavigate();
@@ -111,8 +115,24 @@ export default function AdminConsole() {
     };
   }, []);
 
+  // Current page of group summaries (filtered/searched server-side)
   const [groups, setGroups] = useState([]);
-  const [stats, setStats] = useState({ totalGroups: 0, totalFaces: 0, totalAssets: 0 });
+  const [groupOffset, setGroupOffset] = useState(0);
+  const [stats, setStats] = useState({
+    totalGroups: 0,
+    namedCount: 0,
+    unnamedCount: 0,
+    matchedCount: 0,
+    hasMore: false,
+    totalFaces: 0,
+    totalAssets: 0
+  });
+  // Lightweight list (no images) for the "combine into..." pickers
+  const [groupOptions, setGroupOptions] = useState([]);
+  // Selected group with a page of its faces
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [activeGroupHasMoreFaces, setActiveGroupHasMoreFaces] = useState(false);
+  const [loadingMoreFaces, setLoadingMoreFaces] = useState(false);
   const [settings, setSettings] = useState({
     awsRegion: 'us-east-1',
     awsAccessKeyId: '',
@@ -131,6 +151,7 @@ export default function AdminConsole() {
   const [loading, setLoading] = useState(true);
   const [filterMode, setFilterMode] = useState('all'); // 'all' | 'named' | 'unnamed'
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [selectedGroupId, setSelectedGroupId] = useState(null);
   const [selectedGroupIdsForMerge, setSelectedGroupIdsForMerge] = useState([]);
   const [mergeTargetGroupId, setMergeTargetGroupId] = useState('');
@@ -174,22 +195,116 @@ export default function AdminConsole() {
 
   const [banner, setBanner] = useState(null);
 
-  const loadAll = useCallback(async () => {
+  // Guards against out-of-order responses (fast typing / paging / switching groups)
+  const groupsRequestRef = useRef(0);
+  const selectedGroupIdRef = useRef(selectedGroupId);
+  selectedGroupIdRef.current = selectedGroupId;
+  const lastLoadedGroupIdRef = useRef(null);
+
+  // Filter or search changes always start from the first page. The page reset happens in the
+  // same update so only one request is sent.
+  const debouncedQueryRef = useRef('');
+  useEffect(() => {
+    const next = searchQuery.trim();
+    const t = setTimeout(() => {
+      if (next === debouncedQueryRef.current) return;
+      debouncedQueryRef.current = next;
+      unstable_batchedUpdates(() => {
+        setDebouncedQuery(next);
+        setGroupOffset(0);
+      });
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  const handleFilterChange = (key) => {
+    setFilterMode(key);
+    setGroupOffset(0);
+  };
+
+  const loadGroupsPage = useCallback(async () => {
     if (!hostContext.hostResolved) return;
+    const requestId = ++groupsRequestRef.current;
     setLoading(true);
     try {
-      const [groupsRes, settingsRes] = await Promise.all([
-        api.listGroups(hostContext),
-        api.getSettings(hostContext)
-      ]);
-      const loadedGroups = groupsRes.groups || [];
-      setGroups(loadedGroups);
-      setStats({
-        totalGroups: groupsRes.totalGroups || loadedGroups.length,
-        totalFaces: groupsRes.totalFaces || 0,
-        totalAssets: groupsRes.totalAssets || 0
+      const res = await api.listGroups(hostContext, {
+        offset: groupOffset,
+        limit: GROUP_PAGE_SIZE,
+        filter: filterMode,
+        query: debouncedQuery
       });
+      if (requestId !== groupsRequestRef.current) return;
+      const loaded = res.groups || [];
+      // Deleting/merging can leave us past the last page
+      if (loaded.length === 0 && groupOffset > 0 && res.matchedCount > 0) {
+        setGroupOffset(Math.max(0, Math.floor((res.matchedCount - 1) / GROUP_PAGE_SIZE) * GROUP_PAGE_SIZE));
+        return;
+      }
+      setGroups(loaded);
+      setStats({
+        totalGroups: res.totalGroups || 0,
+        namedCount: res.namedCount || 0,
+        unnamedCount: res.unnamedCount || 0,
+        matchedCount: res.matchedCount ?? loaded.length,
+        hasMore: Boolean(res.hasMore),
+        totalFaces: res.totalFaces || 0,
+        totalAssets: res.totalAssets || 0
+      });
+    } catch (err) {
+      if (requestId === groupsRequestRef.current) {
+        setBanner({ type: 'negative', text: err.message });
+      }
+    } finally {
+      if (requestId === groupsRequestRef.current) setLoading(false);
+    }
+  }, [hostContext, groupOffset, filterMode, debouncedQuery]);
 
+  const loadActiveGroup = useCallback(async () => {
+    if (!hostContext.hostResolved) return;
+    const requestedId = selectedGroupId;
+    if (!requestedId) {
+      setActiveGroup(null);
+      setActiveGroupHasMoreFaces(false);
+      lastLoadedGroupIdRef.current = null;
+      return;
+    }
+    try {
+      const res = await api.getGroup(requestedId, hostContext, {
+        faceOffset: 0,
+        faceLimit: GROUP_FACES_PAGE_SIZE
+      });
+      if (selectedGroupIdRef.current !== requestedId) return;
+      setActiveGroup(res.group);
+      setActiveGroupHasMoreFaces(Boolean(res.hasMoreFaces));
+      if (lastLoadedGroupIdRef.current !== requestedId) {
+        setGroupNameInput(res.group.name || '');
+        lastLoadedGroupIdRef.current = requestedId;
+      }
+    } catch (err) {
+      if (err.status === 404) {
+        // Group was merged away or emptied; clear the selection only if it is still current
+        setSelectedGroupId((cur) => (cur === requestedId ? null : cur));
+        if (selectedGroupIdRef.current === requestedId) setActiveGroup(null);
+      } else if (selectedGroupIdRef.current === requestedId) {
+        setBanner({ type: 'negative', text: err.message });
+      }
+    }
+  }, [hostContext, selectedGroupId]);
+
+  const loadGroupOptions = useCallback(async () => {
+    if (!hostContext.hostResolved) return;
+    try {
+      const res = await api.listGroupOptions(hostContext);
+      setGroupOptions(res.options || []);
+    } catch (err) {
+      setBanner({ type: 'negative', text: err.message });
+    }
+  }, [hostContext]);
+
+  const loadSettings = useCallback(async () => {
+    if (!hostContext.hostResolved) return;
+    try {
+      const settingsRes = await api.getSettings(hostContext);
       if (settingsRes.settings) {
         setSettings((prev) => ({
           ...prev,
@@ -198,31 +313,61 @@ export default function AdminConsole() {
           enabledFoldersText: (settingsRes.settings.enabledFolders || ['/content/dam']).join('\n')
         }));
       }
+    } catch (err) {
+      setBanner({ type: 'negative', text: err.message });
+    }
+  }, [hostContext]);
 
-      if (selectedGroupId) {
-        const updatedActive = loadedGroups.find((g) => g.groupId === selectedGroupId);
-        if (updatedActive) {
-          setGroupNameInput(updatedActive.name || '');
-        } else {
-          setSelectedGroupId(null);
-        }
-      }
+  useEffect(() => {
+    loadGroupsPage();
+  }, [loadGroupsPage]);
+
+  useEffect(() => {
+    loadActiveGroup();
+  }, [loadActiveGroup]);
+
+  useEffect(() => {
+    loadGroupOptions();
+    loadSettings();
+  }, [loadGroupOptions, loadSettings]);
+
+  /** Refreshes everything after a change (rename, split, merge, scan, settings). */
+  const loadAll = useCallback(
+    () => Promise.all([loadGroupsPage(), loadActiveGroup(), loadGroupOptions(), loadSettings()]),
+    [loadGroupsPage, loadActiveGroup, loadGroupOptions, loadSettings]
+  );
+
+  const handleLoadMoreFaces = async () => {
+    if (!activeGroup) return;
+    const requestedId = activeGroup.groupId;
+    setLoadingMoreFaces(true);
+    try {
+      const res = await api.getGroup(requestedId, hostContext, {
+        faceOffset: activeGroup.faces.length,
+        faceLimit: GROUP_FACES_PAGE_SIZE
+      });
+      if (selectedGroupIdRef.current !== requestedId) return;
+      setActiveGroup((prev) =>
+        prev && prev.groupId === requestedId
+          ? { ...res.group, faces: [...prev.faces, ...(res.group.faces || [])] }
+          : prev
+      );
+      setActiveGroupHasMoreFaces(Boolean(res.hasMoreFaces));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     } finally {
-      setLoading(false);
+      setLoadingMoreFaces(false);
     }
-  }, [selectedGroupId, hostContext]);
-
-  useEffect(() => {
-    loadAll();
-  }, [loadAll]);
-
-  const activeGroup = groups.find((g) => g.groupId === selectedGroupId) || null;
+  };
 
   const handleSelectGroupForDetail = (grp) => {
+    if (grp.groupId !== selectedGroupId) {
+      setActiveGroup(null);
+      setActiveGroupHasMoreFaces(false);
+    }
     setSelectedGroupId(grp.groupId);
     setGroupNameInput(grp.name || '');
+    lastLoadedGroupIdRef.current = grp.groupId;
     setSelectedFaceIds([]);
     setSplitNewGroupName('');
     setMoveTargetGroupId('');
@@ -337,27 +482,18 @@ export default function AdminConsole() {
   };
 
   const handleClearAllData = async () => {
-    await api.clearAllData(hostContext);
-    setSelectedGroupId(null);
-    await loadAll();
-    setBanner({
-      type: 'positive',
-      text: 'Cleared all face groups and asset records.'
-    });
-  };
-
-  const filteredGroups = groups.filter((g) => {
-    if (filterMode === 'named' && !g.isNamed) return false;
-    if (filterMode === 'unnamed' && g.isNamed) return false;
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        g.displayName.toLowerCase().includes(q) ||
-        g.groupId.toLowerCase().includes(q)
-      );
+    try {
+      await api.clearAllData(hostContext);
+      setSelectedGroupId(null);
+      await loadAll();
+      setBanner({
+        type: 'positive',
+        text: 'Cleared all face groups and asset records.'
+      });
+    } catch (err) {
+      setBanner({ type: 'negative', text: err.message });
     }
-    return true;
-  });
+  };
 
   return (
     <View padding="size-300" maxWidth="1280px" marginX="auto">
@@ -496,15 +632,13 @@ export default function AdminConsole() {
                           <Picker
                             label="Filter Groups"
                             selectedKey={filterMode}
-                            onSelectionChange={setFilterMode}
+                            onSelectionChange={handleFilterChange}
                             width="size-2000"
                           >
-                            <Item key="all">All Groups ({groups.length})</Item>
-                            <Item key="named">
-                              Named People ({groups.filter((g) => g.isNamed).length})
-                            </Item>
+                            <Item key="all">All Groups ({stats.totalGroups})</Item>
+                            <Item key="named">Named People ({stats.namedCount})</Item>
                             <Item key="unnamed">
-                              Unnamed Placeholders ({groups.filter((g) => !g.isNamed).length})
+                              Unnamed Placeholders ({stats.unnamedCount})
                             </Item>
                           </Picker>
                           <TextField
@@ -525,7 +659,7 @@ export default function AdminConsole() {
                               onSelectionChange={setMergeTargetGroupId}
                               width="size-2400"
                             >
-                              {groups
+                              {groupOptions
                                 .filter((g) => selectedGroupIdsForMerge.includes(g.groupId))
                                 .map((g) => (
                                   <Item key={g.groupId}>{g.displayName}</Item>
@@ -555,7 +689,13 @@ export default function AdminConsole() {
                       <Flex justifyContent="center" paddingY="size-400">
                         <ProgressCircle aria-label="Loading groups..." isIndeterminate />
                       </Flex>
-                    ) : filteredGroups.length === 0 ? (
+                    ) : groups.length === 0 && stats.totalGroups > 0 ? (
+                      <Well>
+                        <Text UNSAFE_style={{ color: '#475569' }}>
+                          No face groups match this filter or search.
+                        </Text>
+                      </Well>
+                    ) : groups.length === 0 ? (
                       <Well>
                         <Flex direction="column" gap="size-150" alignItems="start">
                           <Heading level={3} margin={0}>
@@ -578,7 +718,7 @@ export default function AdminConsole() {
                           gap: 16
                         }}
                       >
-                        {filteredGroups.map((grp) => {
+                        {groups.map((grp) => {
                           const isSelected = grp.groupId === selectedGroupId;
                           const isCheckedForMerge = selectedGroupIdsForMerge.includes(
                             grp.groupId
@@ -663,13 +803,43 @@ export default function AdminConsole() {
                         })}
                       </div>
                     )}
+
+                    {/* Pagination */}
+                    {!loading && stats.matchedCount > GROUP_PAGE_SIZE && (
+                      <Flex justifyContent="space-between" alignItems="center">
+                        <Text UNSAFE_style={{ fontSize: 12, color: '#475569' }}>
+                          Showing {groupOffset + 1}–{groupOffset + groups.length} of{' '}
+                          {stats.matchedCount} group(s)
+                        </Text>
+                        <Flex gap="size-100">
+                          <Button
+                            variant="secondary"
+                            isDisabled={groupOffset === 0}
+                            onPress={() => setGroupOffset(Math.max(0, groupOffset - GROUP_PAGE_SIZE))}
+                          >
+                            Previous
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            isDisabled={!stats.hasMore}
+                            onPress={() => setGroupOffset(groupOffset + GROUP_PAGE_SIZE)}
+                          >
+                            Next
+                          </Button>
+                        </Flex>
+                      </Flex>
+                    )}
                   </Flex>
                 </View>
 
                 {/* Right Column: Selected Group Inspector (Rename, Split Face, Merge Group) */}
                 <View flex="2" minWidth="380px">
                   <Well>
-                    {!activeGroup ? (
+                    {!activeGroup && selectedGroupId ? (
+                      <Flex justifyContent="center" paddingY="size-400">
+                        <ProgressCircle aria-label="Loading group..." isIndeterminate />
+                      </Flex>
+                    ) : !activeGroup ? (
                       <Flex direction="column" gap="size-100" paddingY="size-300">
                         <Heading level={3} margin={0}>
                           Select a Face Group
@@ -706,7 +876,7 @@ export default function AdminConsole() {
                         </Flex>
 
                         {/* 2. Combine Entire Group Into Another Group */}
-                        {groups.length > 1 && (
+                        {groupOptions.length > 1 && (
                           <Flex gap="size-100" alignItems="end">
                             <Picker
                               label="Combine this entire group into another group:"
@@ -715,7 +885,7 @@ export default function AdminConsole() {
                                 handleMergeGroups([activeGroup.groupId], targetId)
                               }
                             >
-                              {groups
+                              {groupOptions
                                 .filter((g) => g.groupId !== activeGroup.groupId)
                                 .map((g) => (
                                   <Item key={g.groupId}>
@@ -731,7 +901,7 @@ export default function AdminConsole() {
                         {/* 3. Individual Faces in Group (Select to Split or Reassign) */}
                         <Flex justifyContent="space-between" alignItems="center">
                           <Text UNSAFE_style={{ fontWeight: 700, fontSize: 13 }}>
-                            Faces in this Group ({activeGroup.faces.length})
+                            Faces in this Group ({activeGroup.faceCount})
                           </Text>
                           <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
                             Check face(s) below to remove/split or move
@@ -801,6 +971,20 @@ export default function AdminConsole() {
                           })}
                         </div>
 
+                        {activeGroupHasMoreFaces && (
+                          <Flex justifyContent="center">
+                            <Button
+                              variant="secondary"
+                              isDisabled={loadingMoreFaces}
+                              onPress={handleLoadMoreFaces}
+                            >
+                              {loadingMoreFaces
+                                ? 'Loading...'
+                                : `Load more faces (${activeGroup.faces.length} of ${activeGroup.faceCount})`}
+                            </Button>
+                          </Flex>
+                        )}
+
                         {/* Actions when 1 or more faces are checked */}
                         {selectedFaceIds.length > 0 && (
                           <View
@@ -831,7 +1015,7 @@ export default function AdminConsole() {
                               </Flex>
 
                               {/* Option B: Move selected face(s) to another existing group */}
-                              {groups.length > 1 && (
+                              {groupOptions.length > 1 && (
                                 <Flex gap="size-100" alignItems="end">
                                   <Picker
                                     label="Or combine selected face(s) into existing group:"
@@ -839,7 +1023,7 @@ export default function AdminConsole() {
                                     onSelectionChange={setMoveTargetGroupId}
                                     width="100%"
                                   >
-                                    {groups
+                                    {groupOptions
                                       .filter((g) => g.groupId !== activeGroup.groupId)
                                       .map((g) => (
                                         <Item key={g.groupId}>

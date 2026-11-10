@@ -35,7 +35,29 @@ async function main(params = {}) {
 
     switch (operation) {
       case 'listGroups': {
-        const result = await faceService.listGroups();
+        const result = await faceService.listGroups({
+          offset: params.offset,
+          limit: params.limit,
+          filter: params.filter,
+          query: params.query
+        });
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
+      case 'listGroupOptions': {
+        const result = await faceService.listGroupOptions({ query: params.query, limit: params.limit });
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
+      case 'getGroup': {
+        if (!params.groupId) {
+          throw new PublicError('groupId is required.');
+        }
+        const result = await faceService.getGroup({
+          groupId: params.groupId,
+          faceOffset: params.faceOffset,
+          faceLimit: params.faceLimit
+        });
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 

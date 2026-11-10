@@ -36,7 +36,6 @@ export default function AssetDetailsSidePanel() {
   });
 
   const [assetData, setAssetData] = useState(null);
-  const [allGroups, setAllGroups] = useState([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [hoveredFaceId, setHoveredFaceId] = useState(null);
@@ -177,19 +176,15 @@ export default function AssetDetailsSidePanel() {
     if (!hostContext.hostResolved) return;
     setLoading(true);
     try {
-      const [facesRes, groupsRes] = await Promise.all([
-        api.getAssetFaces(
-          {
-            assetId: hostContext.assetId,
-            assetPath: hostContext.assetPath,
-            assetName: hostContext.assetName
-          },
-          hostContext
-        ),
-        api.listGroups(hostContext)
-      ]);
+      const facesRes = await api.getAssetFaces(
+        {
+          assetId: hostContext.assetId,
+          assetPath: hostContext.assetPath,
+          assetName: hostContext.assetName
+        },
+        hostContext
+      );
       setAssetData(facesRes);
-      setAllGroups(groupsRes.groups || []);
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
     } finally {
@@ -210,8 +205,6 @@ export default function AssetDetailsSidePanel() {
         hostContext
       );
       setAssetData(res);
-      const groupsRes = await api.listGroups(hostContext);
-      setAllGroups(groupsRes.groups || []);
       setStatusBanner(resultBanner(`Scanned ${res.faceCount || 0} face(s) and synced ${res.metadataProperty || 'xdm:faceNames'}.`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
@@ -467,7 +460,6 @@ export default function AssetDetailsSidePanel() {
             {faces.map((face, index) => {
               const isEditing = editingGroupId === face.groupId;
               const isMoving = movingFaceId === face.faceId;
-              const otherGroups = allGroups.filter((g) => g.groupId !== face.groupId);
 
               return (
                 <div

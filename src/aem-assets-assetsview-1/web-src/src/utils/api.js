@@ -59,11 +59,13 @@ async function invokeAction(actionName, payload = {}, authContext = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(
+    const err = new Error(
       data.error ||
         data.body?.error ||
         `Action '${actionName}' failed with HTTP ${response.status}`
     );
+    err.status = response.status;
+    throw err;
   }
   return data.body || data;
 }
@@ -366,19 +368,71 @@ async function invokeLocalPreviewFallback(actionName, payload) {
       saveLocalDb(fresh);
       return invokeLocalPreviewFallback('groups', { operation: 'listGroups' });
     }
-    if (op === 'listGroups') {
-      const groups = Object.values(db.groups)
+    if (op === 'listGroups' || op === 'listGroupOptions') {
+      const all = Object.values(db.groups)
         .map((g) => enrichGroupLocal(g, db))
-        .sort((a, b) => (a.isNamed !== b.isNamed ? (a.isNamed ? -1 : 1) : b.faceCount - a.faceCount));
+        .sort((a, b) =>
+          a.isNamed !== b.isNamed
+            ? a.isNamed
+              ? -1
+              : 1
+            : b.faceCount - a.faceCount || a.displayName.localeCompare(b.displayName)
+        );
+      const q = String(payload.query || '').trim().toLowerCase();
+      const filter = op === 'listGroups' ? payload.filter || 'all' : 'all';
+      const matched = all.filter((g) => {
+        if (filter === 'named' && !g.isNamed) return false;
+        if (filter === 'unnamed' && g.isNamed) return false;
+        return !q || `${g.displayName} ${g.autoLabel || ''} ${g.groupId}`.toLowerCase().includes(q);
+      });
+      if (op === 'listGroupOptions') {
+        return {
+          options: matched.map(({ groupId, displayName, isNamed, faceCount }) => ({
+            groupId,
+            displayName,
+            isNamed,
+            faceCount
+          })),
+          total: matched.length,
+          truncated: false
+        };
+      }
+      const offset = Number(payload.offset) || 0;
+      const limit = Number(payload.limit) || 60;
+      const page = matched.slice(offset, offset + limit).map(({ faces, ...summary }) => summary);
+      const namedCount = all.filter((g) => g.isNamed).length;
       return {
-        groups,
-        totalGroups: groups.length,
+        groups: page,
+        offset,
+        limit,
+        matchedCount: matched.length,
+        hasMore: offset + page.length < matched.length,
+        totalGroups: all.length,
+        namedCount,
+        unnamedCount: all.length - namedCount,
         totalFaces: Object.keys(db.faces).length,
         totalAssets: Object.keys(db.assets).length,
         settings: {
           metadataProperty: db.settings.metadataProperty,
           includeUnnamedInMetadata: db.settings.includeUnnamedInMetadata
         }
+      };
+    }
+    if (op === 'getGroup') {
+      const grp = db.groups[payload.groupId];
+      if (!grp) {
+        const notFound = new Error(`Face Group '${payload.groupId}' not found.`);
+        notFound.status = 404;
+        throw notFound;
+      }
+      const enriched = enrichGroupLocal(grp, db);
+      const faceOffset = Number(payload.faceOffset) || 0;
+      const faceLimit = Number(payload.faceLimit) || 60;
+      return {
+        group: { ...enriched, faces: enriched.faces.slice(faceOffset, faceOffset + faceLimit) },
+        faceOffset,
+        faceLimit,
+        hasMoreFaces: faceOffset + faceLimit < enriched.faces.length
       };
     }
     if (op === 'getAssetFaces') {
@@ -528,7 +582,14 @@ export function resultBanner(successText, res = {}) {
 }
 
 export const api = {
-  listGroups: (ctx) => invokeAction('groups', { operation: 'listGroups' }, ctx),
+  /** params: { offset, limit, filter: 'all'|'named'|'unnamed', query } */
+  listGroups: (ctx, params = {}) =>
+    invokeAction('groups', { operation: 'listGroups', ...params }, ctx),
+  listGroupOptions: (ctx, params = {}) =>
+    invokeAction('groups', { operation: 'listGroupOptions', ...params }, ctx),
+  /** params: { faceOffset, faceLimit } */
+  getGroup: (groupId, ctx, params = {}) =>
+    invokeAction('groups', { operation: 'getGroup', groupId, ...params }, ctx),
   getAssetFaces: (params, ctx) =>
     invokeAction('groups', { operation: 'getAssetFaces', ...params }, ctx),
   renameGroup: (groupId, name, ctx) =>

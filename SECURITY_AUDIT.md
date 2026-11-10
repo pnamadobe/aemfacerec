@@ -73,7 +73,7 @@ This round fixes the critical security issues (S1–S7, S9 partially) and the wo
 | ID | Finding | Status | Remediation |
 |---|---|---|---|
 | P1 | Every request loads and rewrites the full database. Base64 avatars are stored inline (around 2–4 KB per face), so 100k faces is over 300 MB of JSON, more than the 512 MB action memory once parsed. | 🟡 | Pretty-printing removed (about 30% smaller). ⬜ Per-record store (R1). Store avatars only as files and drop `avatarDataUrl` from the records. |
-| P2 | `listGroups` returns every group with every face and avatar. **Measured in production on 2026-11-10: 972 KB for 163 faces, just under the 1 MB Runtime response limit.** It will fail after roughly 5–10 more faces. | ⬜ **Next** | Paged, summarized group listing. Load faces per group on demand. Serve avatars by URL (short-lived signed URL or a dedicated action) instead of inline data. |
+| P2 | `listGroups` returned every group with every face and avatar: **972 KB in production for 163 faces, just under the 1 MB Runtime limit.** | ✅ | Groups are paged (60 per page, max 100), and filtering and search moved to the server. A names-only `listGroupOptions` feeds the pickers. `getGroup` loads one group's faces in pages of 60. Rename, split, move and merge return summaries without member faces. The side panel no longer downloads the groups list at all (it never used it). Production after deploy: groups page 183 KB, options 17.5 KB, group view 18 KB. Tests show every read stays under 900 KB with 3,100 groups and a 1,500-face group. ⬜ Avatars are still stored inline in `faces.json` (P1).
 | P3 | Full linear scans for asset lookups; quadratic `includes` in merges. | ⬜ | Indexed lookups (R1); use `Set`s in merge, split and move. |
 | P4 | Everything is sequential: Rekognition per face, AEM per asset, and an uncached ancestor-folder walk on every event. | ⬜ | Bounded parallelism (for example 4–8). Cache folder eligibility per ancestor with a TTL. |
 | P5 | Pure-JS JPEG decode with `maxMemoryUsageInMB: 512` in a 512 MB container. The `original` rendition fallback could be up to 100 MP. | ✅ | Downloads are capped at 5 MB (Rekognition's own limit), checked by `Content-Length` and while streaming. The original is used only if it's under the cap. Decoding is capped at 25 MP / 192 MB, and PNG dimensions are checked from the header before decoding. |
@@ -123,6 +123,12 @@ Against the original code, 11 of these tests fail. With the fixes, the full suit
 - AEM metadata failures don't lose renames, merges, splits, moves or scans, are reported per asset, and can be retried via re-sync.
 - AEM retries on 429/503/network errors, no retries on 4xx/500, image size caps (header and streaming), the original rendition as last resort, decode limits.
 - UI warning banners for partial failures.
+
+`test/paging.test.js` (15 tests) and `test/ui-admin-console.test.js` (8 tests), added in the third round (P2). The UI tests render the real Admin Console and side panel in jsdom against the real Runtime actions and storage, with only AWS, AEM and the host connection mocked. Against the previous UI, 7 of the 8 fail. Covered:
+
+- Response-size budget (<900 KB) for every read operation on a 3,100-group dataset, including a 1,500-face group and a 100-face crowd photo.
+- Complete, duplicate-free, stable paging; named-first ordering; server-side filter and search; input clamping; 404s.
+- UI: no requests before the IMS token is available; Next/Previous paging; debounced search sends one request and resets to page 1 (this caught a double-request bug during development); "Load more faces"; rename; merging the selected group selects the target; the side panel makes exactly one request.
 - Avatar path safety; 128-bit group IDs; group name limits.
 
 ## 6. Deployment checklist for this change

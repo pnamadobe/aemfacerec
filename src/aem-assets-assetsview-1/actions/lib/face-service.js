@@ -6,6 +6,14 @@ const { PublicError, assertDamPath } = require('./security');
 const { mapWithConcurrency } = require('./retry');
 
 const AEM_WRITE_CONCURRENCY = 4;
+
+// Page sizes keep every response far below the 1 MB Adobe I/O Runtime limit.
+// A 72px JPEG avatar is ~2-4 KB as a data URL.
+const GROUP_PAGE_SIZE = 60;
+const MAX_GROUP_PAGE_SIZE = 100;
+const GROUP_FACES_PAGE_SIZE = 60;
+const MAX_GROUP_FACES_PAGE_SIZE = 100;
+const MAX_GROUP_OPTIONS = 2000;
 const {
   AVATAR_SIZE,
   cropFaceAvatar,
@@ -105,26 +113,55 @@ async function createFaceService({
   }
 
   /**
-   * Enriches a group record with its member faces and cover avatar data URL.
+   * Compact group summary for lists and mutation responses. Never includes member faces,
+   * so responses stay small regardless of how many faces a group has.
    */
-  function enrichGroup(group, faces) {
+  function summarizeGroup(group, faces, { includeCover = true } = {}) {
     if (!group) return null;
-    const memberFaces = (group.faceIds || [])
-      .map((id) => faces[id])
-      .filter(Boolean);
+    const memberFaces = (group.faceIds || []).map((id) => faces[id]).filter(Boolean);
     const uniqueAssets = new Set(memberFaces.map((f) => f.assetId).filter(Boolean));
-    const coverFace =
-      faces[group.coverFaceId] || memberFaces[0] || null;
+    const coverFace = faces[group.coverFaceId] || memberFaces[0] || null;
 
-    return {
-      ...group,
+    const summary = {
+      groupId: group.groupId,
+      name: group.name || null,
+      autoLabel: group.autoLabel || null,
       displayName: group.name || group.autoLabel || group.groupId,
-      isNamed: Boolean(group.name && group.name.trim()),
+      isNamed: Boolean(group.name && String(group.name).trim()),
       faceCount: memberFaces.length,
       assetCount: uniqueAssets.size,
-      coverAvatarDataUrl: coverFace?.avatarDataUrl || null,
-      faces: memberFaces
+      coverFaceId: coverFace?.faceId || null,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt
     };
+    if (includeCover) summary.coverAvatarDataUrl = coverFace?.avatarDataUrl || null;
+    return summary;
+  }
+
+  /**
+   * Named people first, then by size; ties broken by name and id so paging is stable.
+   */
+  function compareGroupSummaries(a, b) {
+    if (a.isNamed !== b.isNamed) return a.isNamed ? -1 : 1;
+    if (b.faceCount !== a.faceCount) return b.faceCount - a.faceCount;
+    const byName = a.displayName.localeCompare(b.displayName);
+    return byName !== 0 ? byName : a.groupId.localeCompare(b.groupId);
+  }
+
+  function matchesGroupFilter(summary, filter, query) {
+    if (filter === 'named' && !summary.isNamed) return false;
+    if (filter === 'unnamed' && summary.isNamed) return false;
+    if (query) {
+      const haystack = `${summary.displayName} ${summary.autoLabel || ''} ${summary.groupId}`.toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  }
+
+  function clampInt(value, { min, max, fallback }) {
+    const n = Number.parseInt(value, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
   }
 
   /**
@@ -692,29 +729,97 @@ async function createFaceService({
     /**
      * Lists all Face Groups (Named and Unnamed) for the Admin Console and group pickers.
      */
-    async listGroups() {
+    /**
+     * Lists Face Groups one page at a time (filtered and searched server-side) so the
+     * response stays well under the 1 MB Runtime limit however many groups exist.
+     */
+    async listGroups({ offset = 0, limit = GROUP_PAGE_SIZE, filter = 'all', query = '' } = {}) {
       const [db, settings] = await Promise.all([
         storage.getDatabase(),
         storage.getSettings()
       ]);
 
-      const groupsList = Object.values(db.groups)
-        .map((g) => enrichGroup(g, db.faces))
-        .filter(Boolean)
-        .sort((a, b) => {
-          if (a.isNamed !== b.isNamed) return a.isNamed ? -1 : 1;
-          return b.faceCount - a.faceCount;
-        });
+      const pageOffset = clampInt(offset, { min: 0, max: Number.MAX_SAFE_INTEGER, fallback: 0 });
+      const pageLimit = clampInt(limit, { min: 1, max: MAX_GROUP_PAGE_SIZE, fallback: GROUP_PAGE_SIZE });
+      const normalizedFilter = ['named', 'unnamed'].includes(filter) ? filter : 'all';
+      const normalizedQuery = String(query || '').trim().toLowerCase().slice(0, 200);
+
+      const all = Object.values(db.groups)
+        .map((g) => summarizeGroup(g, db.faces, { includeCover: false }))
+        .filter(Boolean);
+      const namedCount = all.filter((g) => g.isNamed).length;
+
+      const matched = all
+        .filter((g) => matchesGroupFilter(g, normalizedFilter, normalizedQuery))
+        .sort(compareGroupSummaries);
+
+      const page = matched
+        .slice(pageOffset, pageOffset + pageLimit)
+        .map((g) => summarizeGroup(db.groups[g.groupId], db.faces));
 
       return {
-        groups: groupsList,
-        totalGroups: groupsList.length,
+        groups: page,
+        offset: pageOffset,
+        limit: pageLimit,
+        matchedCount: matched.length,
+        hasMore: pageOffset + page.length < matched.length,
+        totalGroups: all.length,
+        namedCount,
+        unnamedCount: all.length - namedCount,
         totalFaces: Object.keys(db.faces).length,
         totalAssets: Object.keys(db.assets).length,
         settings: {
           metadataProperty: settings.metadataProperty,
           includeUnnamedInMetadata: settings.includeUnnamedInMetadata
         }
+      };
+    },
+
+    /**
+     * Lightweight list (no images) used by the "combine into..." pickers.
+     */
+    async listGroupOptions({ query = '', limit = MAX_GROUP_OPTIONS } = {}) {
+      const db = await storage.getDatabase();
+      const optionLimit = clampInt(limit, { min: 1, max: MAX_GROUP_OPTIONS, fallback: MAX_GROUP_OPTIONS });
+      const normalizedQuery = String(query || '').trim().toLowerCase().slice(0, 200);
+
+      const matched = Object.values(db.groups)
+        .map((g) => summarizeGroup(g, db.faces, { includeCover: false }))
+        .filter((g) => g && matchesGroupFilter(g, 'all', normalizedQuery))
+        .sort(compareGroupSummaries);
+
+      return {
+        options: matched.slice(0, optionLimit).map((g) => ({
+          groupId: g.groupId,
+          displayName: g.displayName,
+          isNamed: g.isNamed,
+          faceCount: g.faceCount
+        })),
+        total: matched.length,
+        truncated: matched.length > optionLimit
+      };
+    },
+
+    /**
+     * Returns one group with a page of its member faces (including avatars).
+     */
+    async getGroup({ groupId, faceOffset = 0, faceLimit = GROUP_FACES_PAGE_SIZE } = {}) {
+      const db = await storage.getDatabase();
+      const group = db.groups[groupId];
+      if (!group) {
+        throw new PublicError(`Face Group '${groupId}' not found.`, 404);
+      }
+
+      const offset = clampInt(faceOffset, { min: 0, max: Number.MAX_SAFE_INTEGER, fallback: 0 });
+      const limit = clampInt(faceLimit, { min: 1, max: MAX_GROUP_FACES_PAGE_SIZE, fallback: GROUP_FACES_PAGE_SIZE });
+      const memberFaces = (group.faceIds || []).map((id) => db.faces[id]).filter(Boolean);
+      const facesPage = memberFaces.slice(offset, offset + limit);
+
+      return {
+        group: { ...summarizeGroup(group, db.faces), faces: facesPage },
+        faceOffset: offset,
+        faceLimit: limit,
+        hasMoreFaces: offset + facesPage.length < memberFaces.length
       };
     },
 
@@ -748,7 +853,7 @@ async function createFaceService({
       await storage.saveDatabase(db);
 
       return {
-        group: enrichGroup(group, db.faces),
+        group: summarizeGroup(group, db.faces),
         ...syncSummary(sync)
       };
     },
@@ -828,7 +933,7 @@ async function createFaceService({
       await storage.saveDatabase(db);
 
       return {
-        newGroup: enrichGroup(db.groups[newGroupId], db.faces),
+        newGroup: summarizeGroup(db.groups[newGroupId], db.faces),
         ...syncSummary(sync)
       };
     },
@@ -857,7 +962,7 @@ async function createFaceService({
 
       if (facesToMove.length === 0) {
         return {
-          targetGroup: enrichGroup(targetGroup, db.faces),
+          targetGroup: summarizeGroup(targetGroup, db.faces),
           ...syncSummary({ synced: [], failed: [] })
         };
       }
@@ -903,7 +1008,7 @@ async function createFaceService({
       await storage.saveDatabase(db);
 
       return {
-        targetGroup: enrichGroup(targetGroup, db.faces),
+        targetGroup: summarizeGroup(targetGroup, db.faces),
         ...syncSummary(sync)
       };
     },
@@ -981,7 +1086,7 @@ async function createFaceService({
       await storage.saveDatabase(db);
 
       return {
-        targetGroup: enrichGroup(targetGroup, db.faces),
+        targetGroup: summarizeGroup(targetGroup, db.faces),
         mergedGroupIds: sources,
         movedFaceCount: allMovedFaceIds.length,
         ...syncSummary(sync)
