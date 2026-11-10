@@ -39,8 +39,8 @@ runtimeManifest:
             AEM_SC_JSON: $AEM_SC_JSON
             AEM_DEV_TOKEN: $AEM_DEV_TOKEN
           limits:
-            timeout: 60000
-            memorySize: 256
+            timeout: 120000
+            memorySize: 512
           annotations:
             require-adobe-auth: false
             provide-api-key: true

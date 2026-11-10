@@ -104,6 +104,11 @@ async function main(params = {}) {
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
 
+      case 'recropAllAvatars': {
+        const result = await faceService.recropAllAvatars();
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
       default:
         return {
           statusCode: 400,

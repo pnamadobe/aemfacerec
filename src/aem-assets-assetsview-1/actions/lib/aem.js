@@ -28,9 +28,21 @@ function normalizeDamPath(assetPath) {
   return clean;
 }
 
+function encodeDamPath(damPath) {
+  return String(damPath || '')
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+}
+
 function toApiAssetsRelativePath(assetPath) {
   const clean = normalizeDamPath(assetPath);
-  return clean.replace(/^\/content\/dam\/?/, '');
+  const rel = clean.replace(/^\/content\/dam\/?/, '');
+  return rel
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
 }
 
 const b64url = (x) =>
@@ -309,11 +321,12 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         throw new Error('AEM host URL is required to download asset renditions.');
       }
 
+      const encodedPath = encodeDamPath(cleanPath);
       const candidateUrls = [
-        `${baseUrl}${cleanPath}/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg`,
-        `${baseUrl}${cleanPath}/jcr:content/renditions/cq5dam.web.1280.1280.jpeg`,
-        `${baseUrl}${cleanPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`,
-        `${baseUrl}${cleanPath}/_jcr_content/renditions/original`
+        `${baseUrl}${encodedPath}/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg`,
+        `${baseUrl}${encodedPath}/jcr:content/renditions/cq5dam.web.1280.1280.jpeg`,
+        `${baseUrl}${encodedPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`,
+        `${baseUrl}${encodedPath}/_jcr_content/renditions/original`
       ];
 
       for (const url of candidateUrls) {
@@ -455,7 +468,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
       formData.append('xdm:faceCount', String(faceCount));
       formData.append('xdm:faceCount@TypeHint', 'Long');
 
-      const metadataUrl = `${baseUrl}${cleanPath}/jcr:content/metadata`;
+      const metadataUrl = `${baseUrl}${encodeDamPath(cleanPath)}/jcr:content/metadata`;
       const slingRes = await fetchAemWithFallback(metadataUrl, {
         method: 'POST',
         headers: {

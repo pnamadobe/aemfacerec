@@ -2,7 +2,12 @@ const crypto = require('crypto');
 const { createStorage } = require('./storage');
 const { createRekognitionService } = require('./rekognition');
 const { createAemClient, normalizeDamPath } = require('./aem');
-const { cropFaceAvatar } = require('./cropper');
+const {
+  AVATAR_SIZE,
+  cropFaceAvatar,
+  decodeImageBuffer,
+  cropAndResizeRgbaToJpeg
+} = require('./cropper');
 
 function generateGroupId() {
   return `grp_${crypto.randomBytes(4).toString('hex')}`;
@@ -231,11 +236,20 @@ async function createFaceService({
       const now = new Date().toISOString();
       const newFaceIds = [];
 
+      let decodedImage = buffer;
+      if (detectedFaces.length > 0) {
+        try {
+          decodedImage = decodeImageBuffer(buffer);
+        } catch (e) {
+          decodedImage = buffer;
+        }
+      }
+
       for (const detected of detectedFaces) {
         const { faceId, confidence, boundingBox } = detected;
 
         // 1. Crop 160x160 padded avatar from the in-memory rendition buffer
-        const avatar = await cropFaceAvatar(buffer, boundingBox);
+        const avatar = await cropFaceAvatar(decodedImage, boundingBox);
         const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
 
         // 2. Search Rekognition Collection for a matching Face Group
@@ -933,6 +947,73 @@ async function createFaceService({
       };
       await storage.saveDatabase(db);
       return this.listGroups();
+    },
+
+    /**
+     * Re-crops or compacts JPEG avatars so they are crisp 72x72 JPEGs and stay well under
+     * Adobe I/O Runtime's 1 MB HTTP response payload limit even with 100+ faces.
+     */
+    async recropAllAvatars({ limit = 15 } = {}) {
+      const db = await storage.getDatabase();
+      const facesByAssetPath = {};
+      let compactedInMemory = 0;
+
+      for (const face of Object.values(db.faces || {})) {
+        const url = face.avatarDataUrl || '';
+        if (url.startsWith('data:image/jpeg;base64,') && url.length > 4000) {
+          try {
+            const rawB64 = url.slice('data:image/jpeg;base64,'.length);
+            const buf = Buffer.from(rawB64, 'base64');
+            const decoded = decodeImageBuffer(buf);
+            const resized = cropAndResizeRgbaToJpeg(
+              decoded,
+              { left: 0, top: 0, width: decoded.width, height: decoded.height },
+              AVATAR_SIZE,
+              66
+            );
+            face.avatarDataUrl = `data:image/jpeg;base64,${resized.toString('base64')}`;
+            compactedInMemory++;
+          } catch (e) {
+            // ignore
+          }
+        } else if (face.assetPath && (!url || url.startsWith('data:image/svg+xml'))) {
+          facesByAssetPath[face.assetPath] = facesByAssetPath[face.assetPath] || [];
+          facesByAssetPath[face.assetPath].push(face);
+        }
+      }
+
+      const pendingPaths = Object.keys(facesByAssetPath);
+      const batchPaths = pendingPaths.slice(0, limit);
+      let updatedCount = compactedInMemory;
+      const errors = [];
+
+      for (const assetPath of batchPaths) {
+        const assetFaces = facesByAssetPath[assetPath];
+        try {
+          const buffer = await aemClient.fetchAssetRenditionBuffer(assetPath);
+          const decoded = decodeImageBuffer(buffer);
+          for (const face of assetFaces) {
+            const avatar = await cropFaceAvatar(decoded, face.boundingBox);
+            await storage.saveAvatar(face.faceId, avatar.buffer);
+            db.faces[face.faceId].avatarDataUrl = avatar.dataUrl;
+            updatedCount++;
+          }
+        } catch (err) {
+          errors.push({ assetPath, error: err.message });
+        }
+      }
+
+      if (updatedCount > 0) {
+        await storage.saveDatabase(db);
+      }
+
+      return {
+        updatedCount,
+        compactedInMemory,
+        processedAssets: batchPaths.length,
+        remainingAssets: Math.max(0, pendingPaths.length - batchPaths.length),
+        errors
+      };
     }
   };
 }
