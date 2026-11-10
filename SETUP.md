@@ -172,7 +172,7 @@ To have AEM automatically invoke the extension whenever an image finishes upload
    - Enter your **AWS Region** (e.g., `us-east-1`), **AWS Access Key ID**, and **AWS Secret Access Key**.
    - Click **`Test AWS Connection & Verify Collection`**.
    - This both encrypts/saves your AWS credentials in App Builder storage and creates the `aem-assets-faces` Rekognition Collection in your AWS account.
-   - Adjust the **Include unnamed placeholder labels (e.g. "Person #3") in `xdm:faceNames`** switch if you want to show or hide placeholder names on assets before a group is named, then click **`Save Settings & Sync Asset Metadata`**.
+   - Adjust the **Include unnamed placeholder labels (e.g. "Person #3") in `xdm:faceNames`** switch if you want to show or hide placeholder names on assets before a group is named, select your **AEM Processing Profile Name** from the dropdown, and optionally enable **Restrict group management to Administrators & Curator Groups** (adding any custom AEM Curator Groups such as `face-curators`), then click **`Save Settings & Sync Asset Metadata`**.
 
 ---
 

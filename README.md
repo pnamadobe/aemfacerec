@@ -50,6 +50,7 @@ An open-source **Adobe Developer App Builder** extension template for **AEM as a
 | **Combine / Merge Faces & Groups** | Admins can move individual face(s) into another group or merge entire Face Groups together (`DisassociateFaces` -> `AssociateFaces` -> `DeleteUser`), using dropdown pickers with circular face avatar thumbnails. |
 | **Per-Person Erasure (`Delete Group`)** | Admins can permanently delete any Face Group (false positive or "right to be forgotten"), removing its User and Face vectors from AWS Rekognition, deleting its cropped avatars, and updating `xdm:faceNames` on affected AEM assets. |
 | **AWS Cost Controls** | Skips already-scanned images on folder/bulk scans, enforces a configurable MIME-type allowlist (`allowedImageTypes`), and skips small logos/icons below `minImageSize` (default `200px`) before calling AWS Rekognition. |
+| **Role-Based Governance & Curator Groups** | The **BYOK AWS Settings** tab is restricted to AEM Administrators (`administrators` / `dam-administrators`). Admins can also enable **Restrict group management to Administrators & Curator Groups** and specify custom AEM user groups (e.g. `face-curators`) allowed to name, merge, split, or delete groups while giving all other DAM users a read-only view. |
 | **Name Group & Sync to `xdm:faceNames`** | Naming or renaming a Face Group writes the name to `./jcr:content/metadata/xdm:faceNames` (`String[]`) across every AEM asset containing a face from that group. |
 | **Unnamed Placeholder Toggle** | Includes a Settings toggle (`includeUnnamedInMetadata`) to control whether unnamed groups appear on `xdm:faceNames` as placeholder labels (`Person #1`, `Person #2`) or remain hidden from `xdm:faceNames` until given a real name. |
 
@@ -176,7 +177,7 @@ Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AssetDetailsS
 
 ### Surface 2: Face Management & BYOK Settings Console (`/#modal-face-management`)
 Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AdminConsole.js`:
-- **Sticky Top Action Bar**: Keeps **Scan Current Folder**, **Include already-scanned images**, **Clear All Data**, and **Close** pinned at the top of the modal while scrolling.
+- **Sticky Top Action Bar**: Keeps **Scan Current Folder**, **Include already-scanned images**, and **Close** pinned at the top of the modal while scrolling.
 - **Tab 1 — Face Groups & Split / Merge Manager**:
   - Server-paged groups grid (`60` per page) with server-side search and `All Groups` / `Named People` / `Unnamed Placeholders` filtering.
   - Check multiple groups in the grid to **Merge Groups** in bulk (with circular face avatar thumbnails in the dropdown).
@@ -185,10 +186,12 @@ Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AdminConsole.
     - Combine the entire group into another group using a dropdown with face avatar thumbnails.
     - Inspect individual face avatars in the group (`60` per page with **Load more faces**), along with a **new-tab deep link (`↗`)** next to each filename that opens the asset directly in AEM Assets View (`experience.adobe.com`).
     - Select one or more individual faces to **Split into a New Standalone Group** or **Move to an Existing Group**.
-- **Tab 2 — BYOK AWS Rekognition & Metadata Settings**:
+    - When **Restrict group management to Administrators & Curator Groups** is enabled, non-curator DAM users automatically see a **`Read-Only View`** without mutation controls.
+- **Tab 2 — BYOK AWS Rekognition & Metadata Settings (AEM Administrators Only)**:
+  - Hidden and blocked (`403 Forbidden`) for non-admin DAM users.
   - Configure `AWS Region`, `Access Key ID`, `Secret Access Key`, `Rekognition Collection ID`, and `Similarity Threshold (%)`.
   - Click **Test AWS Connection & Verify Collection** to validate credentials and auto-create the Rekognition Collection if needed.
-  - Configure target metadata property (`xdm:faceNames`), toggle **Include unnamed placeholder labels (`Person #N`) in `xdm:faceNames`**, configure the **AEM Processing Profile Name** (`Face Recognition`), and configure **AWS cost controls** (`allowedImageTypes` and `minImageSize`).
+  - Configure target metadata property (`xdm:faceNames`), toggle **Include unnamed placeholder labels (`Person #N`) in `xdm:faceNames`**, select the **AEM Processing Profile Name** from a dropdown populated directly from AEM (`/conf/global/settings/dam/processing`), configure **AWS cost controls** (`allowedImageTypes` and `minImageSize`), and configure **Face Curation & Role Permissions** (`restrictCuratorActionsToAdmins` and `curatorGroups`).
 
 ---
 
@@ -386,7 +389,9 @@ To display the recognized face group names on Asset Details / Properties in AEM:
       "processingProfileName": "Face Recognition",
       "enabledFolders": ["/content/dam/events"],
       "allowedImageTypes": ["image/jpeg", "image/png", "image/tiff", "image/vnd.adobe.photoshop", "image/webp", "image/heic", "image/heif", "image/bmp"],
-      "minImageSize": 200
+      "minImageSize": 200,
+      "restrictCuratorActionsToAdmins": false,
+      "curatorGroups": ["administrators", "dam-administrators", "face-curators"]
     }
   }
   ```
