@@ -262,6 +262,7 @@ export default function AdminConsole() {
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [selectedGroupId, setSelectedGroupId] = useState(null);
+  const [bulkMergeMode, setBulkMergeMode] = useState(false);
   const [selectedGroupIdsForMerge, setSelectedGroupIdsForMerge] = useState([]);
   const [mergeTargetGroupId, setMergeTargetGroupId] = useState('');
 
@@ -724,38 +725,39 @@ export default function AdminConsole() {
           </View>
         )}
 
-        {/* Summary KPI Bar */}
-        <Flex gap="size-200" wrap>
-          <Well flex="1" minWidth="180px">
-            <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>FACE GROUPS (CLUSTERS)</Text>
-            <Heading level={2} margin={0}>
-              {stats.totalGroups}
-            </Heading>
-          </Well>
-          <Well flex="1" minWidth="180px">
-            <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>INDEXED FACE VECTORS</Text>
-            <Heading level={2} margin={0}>
-              {stats.totalFaces}
-            </Heading>
-          </Well>
-          <Well flex="1" minWidth="180px">
-            <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>TAGGED AEM ASSETS</Text>
-            <Heading level={2} margin={0}>
-              {stats.totalAssets}
-            </Heading>
-          </Well>
-          <Well flex="1" minWidth="240px">
-            <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>
-              UNNAMED PLACEHOLDERS IN <code>{settings.metadataProperty}</code>
-            </Text>
-            <Flex alignItems="center" justifyContent="space-between" marginTop="size-50">
-              <Badge variant={settings.includeUnnamedInMetadata ? 'info' : 'neutral'}>
-                {settings.includeUnnamedInMetadata
-                  ? 'Shown (e.g. Person #3)'
-                  : 'Hidden until named'}
-              </Badge>
-            </Flex>
-          </Well>
+        {/* Compact Summary Pill Bar */}
+        <Flex
+          gap="size-150"
+          wrap
+          alignItems="center"
+          UNSAFE_style={{
+            background: '#f8fafc',
+            border: '1px solid #e2e8f0',
+            borderRadius: 8,
+            padding: '8px 14px',
+            fontSize: 12,
+            color: '#334155'
+          }}
+        >
+          <span>
+            <strong>{stats.totalGroups}</strong> Groups ({stats.namedCount} named,{' '}
+            {stats.unnamedCount} placeholders)
+          </span>
+          <span style={{ color: '#cbd5e1' }}>•</span>
+          <span>
+            <strong>{stats.totalFaces}</strong> Faces
+          </span>
+          <span style={{ color: '#cbd5e1' }}>•</span>
+          <span>
+            <strong>{stats.totalAssets}</strong> Assets
+          </span>
+          <span style={{ color: '#cbd5e1' }}>•</span>
+          <span>
+            Placeholders in <code>{settings.metadataProperty}</code>:{' '}
+            <strong>
+              {settings.includeUnnamedInMetadata ? 'Shown' : 'Hidden until named'}
+            </strong>
+          </span>
         </Flex>
 
         {/* Main Workspace Tabs */}
@@ -804,10 +806,24 @@ export default function AdminConsole() {
                             placeholder="Search Sarah, Person #3..."
                             width="size-2400"
                           />
+                          {canManageGroups && (
+                            <Switch
+                              isSelected={bulkMergeMode}
+                              onChange={(val) => {
+                                setBulkMergeMode(val);
+                                if (!val) {
+                                  setSelectedGroupIdsForMerge([]);
+                                  setMergeTargetGroupId('');
+                                }
+                              }}
+                            >
+                              Bulk Merge Mode
+                            </Switch>
+                          )}
                         </Flex>
 
                         {/* Bulk Combine / Merge Selected Groups */}
-                        {canManageGroups && selectedGroupIdsForMerge.length >= 2 && (
+                        {canManageGroups && bulkMergeMode && selectedGroupIdsForMerge.length >= 2 && (
                           <Flex gap="size-100" alignItems="end">
                             <Picker
                               label={`Combine ${selectedGroupIdsForMerge.length} checked groups into:`}
@@ -895,7 +911,7 @@ export default function AdminConsole() {
                               }}
                             >
                               <Flex justifyContent="space-between" alignItems="start">
-                                {canManageGroups ? (
+                                {canManageGroups && bulkMergeMode ? (
                                   <Checkbox
                                     isSelected={isCheckedForMerge}
                                     onChange={(checked) => {
@@ -911,9 +927,10 @@ export default function AdminConsole() {
                                     </span>
                                   </Checkbox>
                                 ) : (
-                                  <span style={{ fontSize: 11, color: '#64748b' }}>View Only</span>
+                                  <span />
                                 )}
                                 <span
+                                  title={`Group ID: ${grp.groupId}`}
                                   style={{
                                     fontSize: 10,
                                     padding: '2px 7px',
@@ -992,8 +1009,17 @@ export default function AdminConsole() {
                   </Flex>
                 </View>
 
-                {/* Right Column: Selected Group Inspector (Rename, Split Face, Merge Group) */}
-                <View flex="2" minWidth="380px">
+                {/* Right Column: Sticky Selected Group Inspector (follows scroll) */}
+                <div
+                  style={{
+                    flex: 2,
+                    minWidth: 380,
+                    position: 'sticky',
+                    top: 72,
+                    maxHeight: 'calc(100vh - 90px)',
+                    overflowY: 'auto'
+                  }}
+                >
                   <Well>
                     {!activeGroup && selectedGroupId ? (
                       <Flex justifyContent="center" paddingY="size-400">
@@ -1013,13 +1039,16 @@ export default function AdminConsole() {
                     ) : (
                       <Flex direction="column" gap="size-200">
                         <Flex justifyContent="space-between" alignItems="center" wrap gap="size-100">
-                          <Heading level={3} margin={0}>
-                            Manage Group: {activeGroup.displayName}
+                          <Heading
+                            level={3}
+                            margin={0}
+                            UNSAFE_style={{ cursor: 'default' }}
+                          >
+                            <span title={`Group ID: ${activeGroup.groupId}`}>
+                              Manage Group: {activeGroup.displayName}
+                            </span>
                           </Heading>
                           <Flex alignItems="center" gap="size-100">
-                            <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
-                              ID: <code>{activeGroup.groupId}</code>
-                            </Text>
                             {canManageGroups ? (
                               <DialogTrigger>
                                 <ActionButton isQuiet>
@@ -1128,6 +1157,7 @@ export default function AdminConsole() {
                                   <img
                                     src={face.avatarDataUrl}
                                     alt={face.faceId}
+                                    title={`Face ID: ${face.faceId} • Detection confidence: ${face.confidence}%`}
                                     style={{
                                       width: 72,
                                       height: 72,
@@ -1197,9 +1227,6 @@ export default function AdminConsole() {
                                       );
                                     })()}
                                   </span>
-                                  <Text UNSAFE_style={{ fontSize: 10, color: '#64748b' }}>
-                                    {face.confidence}% conf
-                                  </Text>
                                   {canManageGroups && (
                                     <Checkbox isSelected={isFaceSelected}>
                                       <span style={{ fontSize: 11 }}>Select</span>
@@ -1282,7 +1309,7 @@ export default function AdminConsole() {
                       </Flex>
                     )}
                   </Well>
-                </View>
+                </div>
               </Flex>
             </Item>
 

@@ -19,6 +19,7 @@ const MAX_GROUP_OPTIONS_WITH_AVATARS = 180; // keeps response < 750 KB with ~3 K
 const {
   AVATAR_SIZE,
   getImageDimensions,
+  generatePreviewThumbnailDataUrl,
   cropFaceAvatar,
   decodeImageBuffer,
   cropAndResizeRgbaToJpeg
@@ -529,11 +530,13 @@ async function createFaceService({
     const indexedFaceIds = detectedFaces.map((f) => f.faceId);
 
     const prepared = [];
+    let previewDataUrl = null;
     try {
       let decodedImage = buffer;
       if (detectedFaces.length > 0) {
         try {
           decodedImage = decodeImageBuffer(buffer);
+          previewDataUrl = generatePreviewThumbnailDataUrl(decodedImage, 280, 62);
         } catch (e) {
           decodedImage = buffer;
         }
@@ -618,6 +621,7 @@ async function createFaceService({
       assetPath: resolvedPath,
       assetTitle: resolvedTitle,
       faceIds: newFaceIds,
+      ...(previewDataUrl ? { previewDataUrl } : {}),
       scannedAt: now,
       updatedAt: now
     };
@@ -884,6 +888,7 @@ async function createFaceService({
         return {
           assetId: assetId || null,
           assetPath: decodedPath || null,
+          aemHost: aemHost || null,
           scanned: false,
           faceCount: 0,
           faceNames: [],
@@ -900,6 +905,7 @@ async function createFaceService({
 
       return {
         ...assetRecord,
+        aemHost: aemHost || null,
         scanned: true,
         faceCount: computed.faceCount,
         faceNames: computed.faceNames,

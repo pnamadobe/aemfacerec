@@ -707,3 +707,50 @@ test('UI Curator Permissions: admin can restrict group management to Curator Gro
     });
   }
 });
+
+test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel, Bulk Merge Mode toggle, de-jargoned cards, and Side Panel Combine Into...', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  // 1. Compact summary pill bar is shown (not the 4 large KPI wells)
+  assert.equal(screen.queryByText('FACE GROUPS (CLUSTERS)'), null);
+  assert.ok(screen.getByText(/Groups \(2 named/));
+
+  // 2. Per-card "Select to Merge" checkboxes are hidden by default until Bulk Merge Mode is toggled ON
+  assert.equal(screen.queryAllByText('Select to Merge').length, 0);
+  const bulkSwitch = screen.getByText('Bulk Merge Mode');
+  fireEvent.click(bulkSwitch);
+  await waitFor(() => assert.ok(screen.queryAllByText('Select to Merge').length > 0));
+  fireEvent.click(bulkSwitch);
+  await waitFor(() => assert.equal(screen.queryAllByText('Select to Merge').length, 0));
+
+  // 3. Right-hand Manage Group column is sticky so it follows scroll
+  const selectPrompt = screen.getByText('Select a Face Group');
+  const stickyInspector = selectPrompt.closest('div[style*="position: sticky"]');
+  assert.ok(stickyInspector, 'Right-hand Manage Group inspector column is sticky');
+
+  // 4. Select a group: raw Group ID and "% conf" text are moved to hover tooltips (not cluttering the card)
+  const card = screen.getAllByText('Alice Example').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  fireEvent.click(card);
+  await screen.findByText('Manage Group: Alice Example');
+  assert.equal(screen.queryByText(/% conf/), null);
+  const faceImg = screen.getByAltText('face-1-0');
+  assert.match(faceImg.getAttribute('title'), /Detection confidence: 99%/);
+
+  cleanup();
+
+  // 5. Side panel: shows "Combine Into..." button and loads group options only on demand when clicked
+  requests.length = 0;
+  renderSidePanel('/content/dam/ui/asset-1-0.jpg');
+  await screen.findAllByText(/Alice Example/);
+  assert.equal(screen.queryByText(/% conf/), null);
+
+  const combineBtn = screen.getByText('Combine Into...').closest('button');
+  assert.ok(combineBtn, 'Side panel renders Combine Into... button');
+  fireEvent.click(combineBtn);
+  await screen.findAllByText('Combine into existing group:');
+  assert.ok(
+    requests.some((r) => r.action === 'groups' && r.body.operation === 'listGroupOptions'),
+    'listGroupOptions is fetched lazily when Combine Into... is clicked'
+  );
+});

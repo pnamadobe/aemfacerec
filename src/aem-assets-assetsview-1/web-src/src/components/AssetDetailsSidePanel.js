@@ -42,6 +42,7 @@ export default function AssetDetailsSidePanel() {
   const [editingGroupId, setEditingGroupId] = useState(null);
   const [editingNameValue, setEditingNameValue] = useState('');
   const [movingFaceId, setMovingFaceId] = useState(null);
+  const [groupOptions, setGroupOptions] = useState(null);
   const [statusBanner, setStatusBanner] = useState(null);
 
   // Attach to AEM Assets View guest connection if running inside AEM iframe
@@ -240,6 +241,7 @@ export default function AssetDetailsSidePanel() {
     try {
       const res = await api.moveFaces([faceId], targetGroupId, hostContext);
       setMovingFaceId(null);
+      setGroupOptions(null);
       await loadData();
       setStatusBanner(resultBanner(`Combined face into "${res.targetGroup.displayName}" and updated asset metadata.`, res));
     } catch (err) {
@@ -247,10 +249,29 @@ export default function AssetDetailsSidePanel() {
     }
   };
 
+  const handleOpenMoveFacePicker = async (faceId) => {
+    setMovingFaceId(faceId);
+    if (!groupOptions) {
+      try {
+        const res = await api.listGroupOptions(hostContext);
+        setGroupOptions(res.options || []);
+      } catch (e) {
+        setGroupOptions([]);
+      }
+    }
+  };
+
   const faces = assetData?.faces || [];
   const faceNames = assetData?.faceNames || [];
   const metadataProp = assetData?.metadataProperty || 'xdm:faceNames';
   const canManageGroups = assetData?.canManageGroups !== false;
+  const resolvedAemHost = (hostContext.aemHost || assetData?.aemHost || '').replace(/\/+$/, '');
+  const resolvedAssetPath = assetData?.assetPath || hostContext.assetPath || '';
+  const fallbackThumbUrl =
+    resolvedAemHost && resolvedAssetPath.startsWith('/content/dam')
+      ? `${resolvedAemHost.startsWith('http') ? resolvedAemHost : `https://${resolvedAemHost}`}${resolvedAssetPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`
+      : null;
+  const previewBgUrl = assetData?.previewDataUrl || fallbackThumbUrl;
 
   return (
     <View
@@ -326,20 +347,39 @@ export default function AssetDetailsSidePanel() {
               style={{
                 position: 'relative',
                 width: '100%',
-                height: 150,
+                height: 165,
                 borderRadius: 8,
                 background: 'linear-gradient(135deg, #1e293b 0%, #334155 100%)',
                 overflow: 'hidden',
                 border: '1px solid #cbd5e1'
               }}
             >
+              {previewBgUrl && (
+                <img
+                  src={previewBgUrl}
+                  alt=""
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none';
+                  }}
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'fill',
+                    opacity: 0.72,
+                    pointerEvents: 'none'
+                  }}
+                />
+              )}
               <div
                 style={{
                   position: 'absolute',
                   bottom: 6,
                   left: 10,
                   fontSize: 11,
-                  color: '#94a3b8'
+                  color: '#f1f5f9',
+                  textShadow: '0 1px 2px rgba(0,0,0,0.85)'
                 }}
               >
                 {assetData?.assetTitle || hostContext.assetPath?.split('/').pop()}
@@ -479,10 +519,11 @@ export default function AssetDetailsSidePanel() {
                   }}
                 >
                   <Flex gap="size-150" alignItems="start">
-                    {/* 160x160 Cropped Face Avatar */}
+                    {/* Cropped Face Avatar */}
                     <img
                       src={face.avatarDataUrl}
                       alt={face.groupDisplayName}
+                      title={`Group ID: ${face.groupId} • Detection confidence: ${face.confidence}%`}
                       style={{
                         width: 64,
                         height: 64,
@@ -497,7 +538,9 @@ export default function AssetDetailsSidePanel() {
                       <Flex justifyContent="space-between" alignItems="center">
                         <Flex alignItems="center" gap="size-75">
                           <Text UNSAFE_style={{ fontWeight: 700, fontSize: 14, color: '#0f172a' }}>
-                            {face.groupDisplayName}
+                            <span title={`Group ID: ${face.groupId}`}>
+                              {face.groupDisplayName}
+                            </span>
                           </Text>
                           {!face.groupName && (
                             <span
@@ -514,16 +557,13 @@ export default function AssetDetailsSidePanel() {
                             </span>
                           )}
                         </Flex>
-                        <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
-                          {face.confidence}% conf
-                        </Text>
                       </Flex>
 
                       <Text UNSAFE_style={{ fontSize: 12, color: '#475569' }}>
-                        Group ID: <code>{face.groupId}</code> • {face.groupFaceCount} face(s) in group
+                        Appears in {face.groupFaceCount} detected face(s)
                       </Text>
 
-                      {/* Inline Rename Group Input (shown only when user has curator/admin permission) */}
+                      {/* Inline Rename / Split / Move Controls (shown only when user has curator/admin permission) */}
                       {canManageGroups && (
                         isEditing ? (
                           <Flex gap="size-75" alignItems="end" marginTop="size-50">
@@ -544,6 +584,52 @@ export default function AssetDetailsSidePanel() {
                               Cancel
                             </ActionButton>
                           </Flex>
+                        ) : isMoving ? (
+                          <Flex gap="size-75" alignItems="end" marginTop="size-50">
+                            <Picker
+                              label="Combine into existing group:"
+                              width="100%"
+                              onSelectionChange={(targetId) =>
+                                handleMoveFaceToGroup(face.faceId, String(targetId))
+                              }
+                            >
+                              {(groupOptions || [])
+                                .filter((g) => g.groupId !== face.groupId)
+                                .map((g) => {
+                                  const label = `${g.displayName} (${g.faceCount} faces)`;
+                                  return (
+                                    <Item key={g.groupId} textValue={label}>
+                                      <Text>
+                                        <span
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: 6
+                                          }}
+                                        >
+                                          {g.coverAvatarDataUrl && (
+                                            <img
+                                              src={g.coverAvatarDataUrl}
+                                              alt=""
+                                              style={{
+                                                width: 18,
+                                                height: 18,
+                                                borderRadius: '50%',
+                                                objectFit: 'cover'
+                                              }}
+                                            />
+                                          )}
+                                          <span>{label}</span>
+                                        </span>
+                                      </Text>
+                                    </Item>
+                                  );
+                                })}
+                            </Picker>
+                            <ActionButton onPress={() => setMovingFaceId(null)}>
+                              Cancel
+                            </ActionButton>
+                          </Flex>
                         ) : (
                           <Flex gap="size-75" wrap marginTop="size-50">
                             <ActionButton
@@ -553,6 +639,18 @@ export default function AssetDetailsSidePanel() {
                               }}
                             >
                               {face.groupName ? 'Rename' : 'Name Person'}
+                            </ActionButton>
+                            {face.groupFaceCount > 1 && (
+                              <ActionButton
+                                onPress={() => handleSplitFaceToOwnGroup(face)}
+                              >
+                                Split Face
+                              </ActionButton>
+                            )}
+                            <ActionButton
+                              onPress={() => handleOpenMoveFacePicker(face.faceId)}
+                            >
+                              Combine Into...
                             </ActionButton>
                           </Flex>
                         )

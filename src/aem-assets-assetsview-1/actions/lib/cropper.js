@@ -265,11 +265,55 @@ function getImageDimensions(buf) {
   return null;
 }
 
+/**
+ * Downscales a decoded RGBA image (or raw image buffer) to fit within `maxSide` (default 280px)
+ * preserving aspect ratio, and returns a compact JPEG data URL (`~6–12 KB`) for the Side Panel's
+ * interactive bounding-box preview.
+ */
+function generatePreviewThumbnailDataUrl(imageBufferOrDecoded, maxSide = 280, quality = 62) {
+  try {
+    const decoded =
+      imageBufferOrDecoded &&
+      imageBufferOrDecoded.width &&
+      imageBufferOrDecoded.height &&
+      imageBufferOrDecoded.data
+        ? imageBufferOrDecoded
+        : decodeImageBuffer(imageBufferOrDecoded);
+
+    const { width: srcWidth, height: srcHeight, data: srcData } = decoded;
+    if (!srcWidth || !srcHeight) return null;
+
+    const scale = Math.min(1, maxSide / Math.max(srcWidth, srcHeight));
+    const dstWidth = Math.max(1, Math.round(srcWidth * scale));
+    const dstHeight = Math.max(1, Math.round(srcHeight * scale));
+    const dstData = new Uint8Array(dstWidth * dstHeight * 4);
+
+    for (let y = 0; y < dstHeight; y++) {
+      const srcY = Math.min(srcHeight - 1, Math.floor(((y + 0.5) / dstHeight) * srcHeight));
+      for (let x = 0; x < dstWidth; x++) {
+        const srcX = Math.min(srcWidth - 1, Math.floor(((x + 0.5) / dstWidth) * srcWidth));
+        const srcIdx = (srcY * srcWidth + srcX) * 4;
+        const dstIdx = (y * dstWidth + x) * 4;
+        dstData[dstIdx] = srcData[srcIdx];
+        dstData[dstIdx + 1] = srcData[srcIdx + 1];
+        dstData[dstIdx + 2] = srcData[srcIdx + 2];
+        dstData[dstIdx + 3] = 255;
+      }
+    }
+
+    const encoded = jpeg.encode({ data: dstData, width: dstWidth, height: dstHeight }, quality);
+    return `data:image/jpeg;base64,${Buffer.from(encoded.data).toString('base64')}`;
+  } catch (e) {
+    return null;
+  }
+}
+
 module.exports = {
   AVATAR_SIZE,
   PADDING_RATIO,
   MAX_DECODE_MEGAPIXELS,
   getImageDimensions,
+  generatePreviewThumbnailDataUrl,
   calculateSquareCropRegion,
   decodeImageBuffer,
   cropAndResizeRgbaToJpeg,
