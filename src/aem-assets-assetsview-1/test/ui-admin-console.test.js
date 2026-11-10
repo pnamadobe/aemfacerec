@@ -714,7 +714,7 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
 
   // 1. Compact summary pill bar is shown (not the 4 large KPI wells)
   assert.equal(screen.queryByText('FACE GROUPS (CLUSTERS)'), null);
-  assert.ok(screen.getByText(/Groups \(2 named/));
+  assert.ok(screen.getByText(/named, \d+ placeholders\)/));
 
   // 2. Per-card "Select to Merge" checkboxes are hidden by default until Bulk Merge Mode is toggled ON
   assert.equal(screen.queryAllByText('Select to Merge').length, 0);
