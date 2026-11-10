@@ -21,6 +21,11 @@ async function main(params = {}) {
   }
 
   try {
+    if (params.AEM_SC_JSON) process.env.AEM_SC_JSON = params.AEM_SC_JSON;
+    if (params.AEM_DEV_TOKEN) process.env.AEM_DEV_TOKEN = params.AEM_DEV_TOKEN;
+    if (params.AEM_AUTHOR_URL) process.env.AEM_AUTHOR_URL = params.AEM_AUTHOR_URL;
+    if (params.AEM_HOST) process.env.AEM_HOST = params.AEM_HOST;
+
     const encryptionSecret = params.ENCRYPTION_SECRET || process.env.ENCRYPTION_SECRET;
     const storage = await createStorage({ encryptionSecret });
     const operation = params.operation || 'getSettings';

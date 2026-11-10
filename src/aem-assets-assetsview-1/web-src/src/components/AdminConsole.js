@@ -19,7 +19,9 @@ import {
   Divider,
   Well,
   Badge,
-  ProgressCircle
+  ProgressCircle,
+  DialogTrigger,
+  AlertDialog
 } from '@adobe/react-spectrum';
 import { api } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
@@ -200,30 +202,9 @@ export default function AdminConsole() {
     }
   }, [selectedGroupId, hostContext]);
 
-  const loadFolderBrowser = useCallback(
-    async (targetFolder = currentFolderPath) => {
-      setBrowsingFolder(true);
-      try {
-        const res = await api.browseFolder(targetFolder, hostContext);
-        if (res && res.folderPath) {
-          setFolderContents(res);
-        }
-      } catch (e) {
-        // ignore if AEM host is not reachable yet
-      } finally {
-        setBrowsingFolder(false);
-      }
-    },
-    [currentFolderPath, hostContext]
-  );
-
   useEffect(() => {
     loadAll();
   }, [loadAll]);
-
-  useEffect(() => {
-    loadFolderBrowser(currentFolderPath);
-  }, [currentFolderPath, loadFolderBrowser]);
 
   const activeGroup = groups.find((g) => g.groupId === selectedGroupId) || null;
 
@@ -342,7 +323,7 @@ export default function AdminConsole() {
     try {
       const res = await api.scanFolder(currentFolderPath, hostContext);
       setScanResult(res);
-      await Promise.all([loadAll(), loadFolderBrowser(currentFolderPath)]);
+      await loadAll();
       setBanner({
         type: 'positive',
         text: `Folder scan complete for ${res.folderPath} (${res.totalAssets} assets processed).`
@@ -351,30 +332,6 @@ export default function AdminConsole() {
       setBanner({ type: 'negative', text: err.message });
     } finally {
       setScanning(false);
-    }
-  };
-
-  const handleScanSingleAssetCard = async (asset) => {
-    setScanningAssetPath(asset.assetPath);
-    try {
-      const res = await api.ingestAsset(
-        {
-          assetPath: asset.assetPath,
-          assetId: asset.assetId,
-          assetTitle: asset.assetTitle,
-          force: true
-        },
-        hostContext
-      );
-      await Promise.all([loadAll(), loadFolderBrowser(currentFolderPath)]);
-      setBanner({
-        type: 'positive',
-        text: `Scanned "${asset.assetTitle}": detected ${res.faceCount || 0} face(s).`
-      });
-    } catch (err) {
-      setBanner({ type: 'negative', text: err.message });
-    } finally {
-      setScanningAssetPath(null);
     }
   };
 
@@ -423,7 +380,22 @@ export default function AdminConsole() {
             >
               {scanning ? 'Scanning Current Folder...' : 'Scan Current Folder'}
             </Button>
-            <ActionButton onPress={handleClearAllData}>Clear All Data</ActionButton>
+            <DialogTrigger>
+              <ActionButton isDisabled={stats.totalGroups === 0 && stats.totalFaces === 0}>
+                Clear All Data
+              </ActionButton>
+              <AlertDialog
+                variant="destructive"
+                title="Clear All Face Groups & Indexed Data?"
+                primaryActionLabel="Clear All Data"
+                cancelLabel="Cancel"
+                onPrimaryAction={handleClearAllData}
+              >
+                Are you sure you want to permanently remove all {stats.totalGroups} Face
+                Group(s) and {stats.totalFaces} indexed face record(s)? This action cannot
+                be undone.
+              </AlertDialog>
+            </DialogTrigger>
             {guestConnection ? (
               <Button
                 variant="secondary"

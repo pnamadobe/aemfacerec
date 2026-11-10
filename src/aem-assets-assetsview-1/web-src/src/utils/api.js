@@ -48,11 +48,24 @@ async function invokeAction(actionName, payload = {}, authContext = {}) {
     })
   });
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error || `Action '${actionName}' failed with HTTP ${response.status}`);
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error(
+      `Action '${actionName}' returned a non-JSON response (HTTP ${response.status}).`
+    );
   }
-  return data;
+
+  if (!response.ok) {
+    throw new Error(
+      data.error ||
+        data.body?.error ||
+        `Action '${actionName}' failed with HTTP ${response.status}`
+    );
+  }
+  return data.body || data;
 }
 
 // ============================================================================

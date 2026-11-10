@@ -19,6 +19,8 @@ runtimeManifest:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
             AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+            AEM_SC_JSON: $AEM_SC_JSON
+            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
           limits:
             timeout: 120000
             memorySize: 512
@@ -34,6 +36,8 @@ runtimeManifest:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
             AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+            AEM_SC_JSON: $AEM_SC_JSON
+            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
           limits:
             timeout: 60000
             memorySize: 256
@@ -49,6 +53,8 @@ runtimeManifest:
             LOG_LEVEL: debug
             AEM_HOST: $AEM_HOST
             AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+            AEM_SC_JSON: $AEM_SC_JSON
+            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
             ENCRYPTION_SECRET: $ENCRYPTION_SECRET
           limits:
             timeout: 60000

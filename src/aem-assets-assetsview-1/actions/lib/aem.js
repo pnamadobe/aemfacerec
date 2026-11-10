@@ -10,6 +10,8 @@
  *    back to `jcr:content/metadata` on the AEM asset.
  */
 
+const crypto = require('crypto');
+
 function normalizeAemHost(aemHost) {
   if (!aemHost) return '';
   let clean = String(aemHost).trim().replace(/\/+$/, '');
@@ -31,28 +33,151 @@ function toApiAssetsRelativePath(assetPath) {
   return clean.replace(/^\/content\/dam\/?/, '');
 }
 
+const b64url = (x) =>
+  Buffer.from(x)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+let cachedServiceToken = null;
+let cachedServiceTokenExp = 0;
+
+/**
+ * Exchanges base64-encoded AEM Service Credentials JSON (AEM_SC_JSON) for an IMS access token.
+ */
+async function getFallbackServiceToken(fetchImpl = global.fetch) {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedServiceToken && cachedServiceTokenExp > now + 60) {
+    return cachedServiceToken;
+  }
+
+  const scB64 = process.env.AEM_SC_JSON;
+  if (scB64 && fetchImpl) {
+    try {
+      const raw = JSON.parse(Buffer.from(scB64, 'base64').toString('utf8'));
+      const sc = raw.integration || raw;
+      const payload = {
+        exp: now + 300,
+        iss: sc.org,
+        sub: sc.id,
+        aud: `https://${sc.imsEndpoint}/c/${sc.technicalAccount.clientId}`
+      };
+      payload[`https://${sc.imsEndpoint}/s/${sc.metascopes}`] = true;
+      const si =
+        b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' })) +
+        '.' +
+        b64url(JSON.stringify(payload));
+      const jwt =
+        si + '.' + b64url(crypto.sign('RSA-SHA256', Buffer.from(si), sc.privateKey));
+      const body = new URLSearchParams({
+        client_id: sc.technicalAccount.clientId,
+        client_secret: sc.technicalAccount.clientSecret,
+        jwt_token: jwt
+      });
+      const r = await fetchImpl(`https://${sc.imsEndpoint}/ims/exchange/jwt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      if (r.ok) {
+        const data = await r.json();
+        if (data.access_token) {
+          cachedServiceToken = data.access_token;
+          cachedServiceTokenExp = now + 240;
+          return cachedServiceToken;
+        }
+      }
+    } catch (e) {
+      // Fall through to AEM_DEV_TOKEN
+    }
+  }
+
+  if (process.env.AEM_DEV_TOKEN) {
+    return String(process.env.AEM_DEV_TOKEN).trim();
+  }
+
+  return '';
+}
+
+function isHtmlPayload(textOrBuf) {
+  if (!textOrBuf) return false;
+  const sample = Buffer.isBuffer(textOrBuf)
+    ? textOrBuf.slice(0, 64).toString('utf8').trimStart()
+    : String(textOrBuf).slice(0, 64).trimStart();
+  return /^<!doctype\s+html/i.test(sample) || /^<html/i.test(sample);
+}
+
 /**
  * Creates an AEM client bound to an author host and IMS bearer token.
  */
 function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
-  const baseUrl = normalizeAemHost(aemHost || process.env.AEM_HOST);
+  const baseUrl = normalizeAemHost(
+    aemHost || process.env.AEM_AUTHOR_URL || process.env.AEM_HOST
+  );
 
-  function authHeaders(extra = {}) {
+  function buildAuthHeaders(bearerToken, extra = {}) {
     const headers = { ...extra };
-    if (token) {
-      headers.Authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+    if (bearerToken) {
+      headers.Authorization = bearerToken.startsWith('Bearer ')
+        ? bearerToken
+        : `Bearer ${bearerToken}`;
     }
     return headers;
   }
 
+  /**
+   * Executes a fetch against AEM with automatic fallback to AEM_SC_JSON / AEM_DEV_TOKEN
+   * if the caller token is missing or if AEM returns an HTML login redirect (`<!DOCTYPE html>`).
+   */
+  async function fetchAemWithFallback(url, options = {}) {
+    let activeToken = token || (await getFallbackServiceToken(fetchImpl));
+    let res = await fetchImpl(url, {
+      ...options,
+      headers: buildAuthHeaders(activeToken, options.headers)
+    });
+
+    const contentType = String(res.headers?.get?.('content-type') || '').toLowerCase();
+    const needsRetry = !res.ok || contentType.includes('text/html');
+
+    if (needsRetry && token) {
+      const fallbackToken = await getFallbackServiceToken(fetchImpl);
+      if (fallbackToken && fallbackToken !== activeToken) {
+        res = await fetchImpl(url, {
+          ...options,
+          headers: buildAuthHeaders(fallbackToken, options.headers)
+        });
+      }
+    }
+
+    return res;
+  }
+
+  /**
+   * Fetches and safely parses JSON from AEM, throwing a clear error if AEM returns an HTML login page.
+   */
+  async function fetchAemJson(url, options = {}) {
+    const res = await fetchAemWithFallback(url, options);
+    if (!res.ok) {
+      throw new Error(`AEM request failed (HTTP ${res.status}) for ${url}`);
+    }
+
+    if (typeof res.text === 'function') {
+      const text = await res.text();
+      if (isHtmlPayload(text)) {
+        throw new Error(
+          `AEM returned an HTML login page instead of JSON for ${url}. Please check your AEM session or service credentials.`
+        );
+      }
+      return JSON.parse(text);
+    }
+
+    return res.json();
+  }
+
   return {
     /**
-     * Checks whether an asset's folder is eligible for Face Recognition:
-     * 1. Checks if the folder (or an ancestor folder up to /content/dam) has
-     *    `dam:processingProfile` matching `settings.processingProfileName`
-     *    or `jcr:content/metadata/faceRecognitionEnabled == true`.
-     * 2. Or, if `requireProcessingProfile` is false, checks if `assetPath` starts with
-     *    one of `settings.enabledFolders`.
+     * Checks whether an asset's folder is eligible for Face Recognition.
      */
     async checkFolderEligibility(assetPath, settings) {
       const cleanPath = normalizeDamPath(assetPath);
@@ -73,7 +198,6 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         };
       }
 
-      // If no live AEM host is configured (e.g. local/offline test), fall back to folder prefix check
       if (!baseUrl || !fetchImpl) {
         return {
           eligible: matchesFolderPrefix,
@@ -81,9 +205,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         };
       }
 
-      // Walk up folder hierarchy from asset's parent folder up to /content/dam
       const segments = cleanPath.split('/').filter(Boolean);
-      // Remove the asset filename itself
       segments.pop();
 
       const targetProfile = (settings.processingProfileName || 'Face Recognition').toLowerCase();
@@ -92,27 +214,24 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         const folderPath = `/${segments.join('/')}`;
         try {
           const url = `${baseUrl}${folderPath}/jcr:content.1.json`;
-          const res = await fetchImpl(url, { headers: authHeaders() });
-          if (res.ok) {
-            const jcrContent = await res.json();
-            const assignedProfile = String(
-              jcrContent['dam:processingProfile'] ||
-                jcrContent.processingProfile ||
-                jcrContent.metadata?.['dam:processingProfile'] ||
-                ''
-            ).toLowerCase();
+          const jcrContent = await fetchAemJson(url);
+          const assignedProfile = String(
+            jcrContent['dam:processingProfile'] ||
+              jcrContent.processingProfile ||
+              jcrContent.metadata?.['dam:processingProfile'] ||
+              ''
+          ).toLowerCase();
 
-            const explicitFlag =
-              jcrContent.faceRecognitionEnabled === true ||
-              jcrContent.metadata?.faceRecognitionEnabled === true ||
-              jcrContent.metadata?.['xdm:faceRecognitionEnabled'] === 'true';
+          const explicitFlag =
+            jcrContent.faceRecognitionEnabled === true ||
+            jcrContent.metadata?.faceRecognitionEnabled === true ||
+            jcrContent.metadata?.['xdm:faceRecognitionEnabled'] === 'true';
 
-            if (explicitFlag || (assignedProfile && assignedProfile.includes(targetProfile))) {
-              return {
-                eligible: true,
-                reason: `Folder ${folderPath} has Processing Profile '${assignedProfile || targetProfile}' enabled`
-              };
-            }
+          if (explicitFlag || (assignedProfile && assignedProfile.includes(targetProfile))) {
+            return {
+              eligible: true,
+              reason: `Folder ${folderPath} has Processing Profile '${assignedProfile || targetProfile}' enabled`
+            };
           }
         } catch (err) {
           // Continue walking up ancestor folders
@@ -120,7 +239,6 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         segments.pop();
       }
 
-      // Also honor explicit folder prefix allowlist if configured for a specific subfolder
       const specificFolderConfigured = enabledFolders.some(
         (prefix) =>
           normalizeDamPath(prefix) !== '/content/dam' &&
@@ -157,25 +275,20 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
 
       const relPath = toApiAssetsRelativePath(cleanPath);
       try {
-        const res = await fetchImpl(`${baseUrl}/api/assets/${relPath}.json`, {
-          headers: authHeaders()
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const uuid =
-            data.properties?.['jcr:uuid'] ||
-            data['jcr:uuid'] ||
-            `urn:aaid:aem:${Buffer.from(cleanPath).toString('hex').slice(0, 24)}`;
-          const title =
-            data.properties?.['dc:title'] ||
-            data.properties?.name ||
-            fallbackTitle;
-          return {
-            assetId: uuid,
-            assetPath: cleanPath,
-            assetTitle: Array.isArray(title) ? title[0] : title
-          };
-        }
+        const data = await fetchAemJson(`${baseUrl}/api/assets/${relPath}.json`);
+        const uuid =
+          data.properties?.['jcr:uuid'] ||
+          data['jcr:uuid'] ||
+          `urn:aaid:aem:${Buffer.from(cleanPath).toString('hex').slice(0, 24)}`;
+        const title =
+          data.properties?.['dc:title'] ||
+          data.properties?.name ||
+          fallbackTitle;
+        return {
+          assetId: uuid,
+          assetPath: cleanPath,
+          assetTitle: Array.isArray(title) ? title[0] : title
+        };
       } catch (err) {
         // Fallback if API call fails
       }
@@ -205,10 +318,17 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
 
       for (const url of candidateUrls) {
         try {
-          const res = await fetchImpl(url, { headers: authHeaders() });
+          const res = await fetchAemWithFallback(url);
           if (res.ok) {
+            const contentType = String(res.headers?.get?.('content-type') || '').toLowerCase();
+            if (contentType.includes('text/html')) {
+              continue;
+            }
             const arrayBuf = await res.arrayBuffer();
-            return Buffer.from(arrayBuf);
+            const buf = Buffer.from(arrayBuf);
+            if (!isHtmlPayload(buf) && buf.length > 0) {
+              return buf;
+            }
           }
         } catch (err) {
           // Try next rendition URL
@@ -219,8 +339,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     },
 
     /**
-     * Lists both child folders and image assets inside a DAM folder via the AEM Assets HTTP API
-     * to power the visual folder & asset browser UI (no manual path typing).
+     * Lists both child folders and image assets inside a DAM folder via the AEM Assets HTTP API.
      */
     async browseDamFolder(folderPath = '/content/dam') {
       const cleanFolder = normalizeDamPath(folderPath) || '/content/dam';
@@ -236,12 +355,8 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
       const relFolder = toApiAssetsRelativePath(cleanFolder);
       const apiPath = relFolder ? `/api/assets/${relFolder}.json?limit=200` : '/api/assets.json?limit=200';
       const url = `${baseUrl}${apiPath}`;
-      const res = await fetchImpl(url, { headers: authHeaders() });
-      if (!res.ok) {
-        throw new Error(`Unable to browse folder ${cleanFolder} (HTTP ${res.status})`);
-      }
+      const data = await fetchAemJson(url);
 
-      const data = await res.json();
       const entities = data.entities || [];
       const folders = [];
       const assets = [];
@@ -278,7 +393,11 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
 
       return {
         folderPath: cleanFolder,
-        folderTitle: data.properties?.['dc:title'] || data.properties?.title || cleanFolder.split('/').pop() || 'Assets',
+        folderTitle:
+          data.properties?.['dc:title'] ||
+          data.properties?.title ||
+          cleanFolder.split('/').pop() ||
+          'Assets',
         folders,
         assets
       };
@@ -295,11 +414,11 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     /**
      * Writes multi-value face metadata (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`)
      * back to `jcr:content/metadata` on the AEM Asset.
-     *
-     * Uses both the AEM Assets HTTP API (`PUT /api/assets/<path>`) and Sling POST `@TypeHint=String[]`
-     * so single-person and multi-person arrays are always stored as `String[]` on `jcr:content/metadata`.
      */
-    async updateAssetFaceMetadata(assetPath, { faceNames = [], faceGroupIds = [], faceCount = 0, metadataProperty = 'xdm:faceNames' }) {
+    async updateAssetFaceMetadata(
+      assetPath,
+      { faceNames = [], faceGroupIds = [], faceCount = 0, metadataProperty = 'xdm:faceNames' }
+    ) {
       const cleanPath = normalizeDamPath(assetPath);
       if (!baseUrl || !fetchImpl) {
         return {
@@ -314,7 +433,6 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         };
       }
 
-      // 1. Update via Sling POST to jcr:content/metadata with explicit String[] @TypeHint
       const formData = new URLSearchParams();
       formData.append(`${metadataProperty}@TypeHint`, 'String[]');
       if (faceNames.length === 0) {
@@ -338,22 +456,21 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
       formData.append('xdm:faceCount@TypeHint', 'Long');
 
       const metadataUrl = `${baseUrl}${cleanPath}/jcr:content/metadata`;
-      const slingRes = await fetchImpl(metadataUrl, {
+      const slingRes = await fetchAemWithFallback(metadataUrl, {
         method: 'POST',
-        headers: authHeaders({
+        headers: {
           'Content-Type': 'application/x-www-form-urlencoded'
-        }),
+        },
         body: formData.toString()
       });
 
       if (!slingRes.ok) {
-        // Fallback to AEM Assets HTTP API PUT /api/assets/<relPath>
         const relPath = toApiAssetsRelativePath(cleanPath);
-        await fetchImpl(`${baseUrl}/api/assets/${relPath}`, {
+        await fetchAemWithFallback(`${baseUrl}/api/assets/${relPath}`, {
           method: 'PUT',
-          headers: authHeaders({
+          headers: {
             'Content-Type': 'application/json'
-          }),
+          },
           body: JSON.stringify({
             class: 'asset',
             properties: {

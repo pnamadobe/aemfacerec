@@ -19,8 +19,19 @@ async function main(params = {}) {
   }
 
   try {
+    if (params.AEM_SC_JSON) process.env.AEM_SC_JSON = params.AEM_SC_JSON;
+    if (params.AEM_DEV_TOKEN) process.env.AEM_DEV_TOKEN = params.AEM_DEV_TOKEN;
+    if (params.AEM_AUTHOR_URL) process.env.AEM_AUTHOR_URL = params.AEM_AUTHOR_URL;
+    if (params.AEM_HOST) process.env.AEM_HOST = params.AEM_HOST;
+
     const token = extractBearerToken(params);
-    const aemHost = params.aemHost || params.AEM_HOST || process.env.AEM_HOST;
+    const aemHost =
+      params.aemHost ||
+      params.aemAuthorUrl ||
+      params.AEM_AUTHOR_URL ||
+      params.AEM_HOST ||
+      process.env.AEM_AUTHOR_URL ||
+      process.env.AEM_HOST;
     const faceService = await createFaceService({ aemHost, token });
 
     const operation = params.operation || 'listGroups';
