@@ -514,9 +514,9 @@ test('UI UX: top header is sticky so Close/actions stay visible on scroll, and c
   assert.ok(within(stickyBar).getByText('Close'));
 
   // Select a group and open the "Combine this entire group into another group:" Picker popover
-  const card = screen.getAllByText('Person #4').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  const card = screen.getAllByText('Person #5').find((el) => el.closest('div[style*="cursor: pointer"]'));
   fireEvent.click(card);
-  await screen.findByText('Manage Group: Person #4');
+  await screen.findByText('Manage Group: Person #5');
 
   const combineButtons = screen
     .getAllByText('Combine this entire group into another group:')
