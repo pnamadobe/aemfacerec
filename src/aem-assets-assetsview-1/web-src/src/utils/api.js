@@ -342,7 +342,16 @@ async function invokeLocalPreviewFallback(actionName, payload) {
 
   if (actionName === 'settings') {
     if (op === 'getSettings') {
-      return { settings: db.settings };
+      return {
+        isAdmin: true,
+        processingProfiles: [
+          {
+            name: db.settings.processingProfileName || 'Face Recognition',
+            path: '/conf/global/settings/dam/processing/face-recognition'
+          }
+        ],
+        settings: db.settings
+      };
     }
     if (op === 'saveSettings') {
       db.settings = { ...db.settings, ...(payload.settings || {}) };

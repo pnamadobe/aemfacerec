@@ -204,10 +204,33 @@ function jsonResponse(obj) {
   const text = JSON.stringify(obj);
   return { ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => text, json: async () => obj };
 }
+let mockAemUserRole = 'admin';
 global.fetch = async (url, opts = {}) => {
-  // Backend -> AEM calls (metadata write-back): accept them
+  // Backend -> AEM calls (metadata write-back, admin status, processing profiles): accept them
   if (String(url).startsWith('https://author-p1-e1.adobeaemcloud.com/')) {
     aemRequests.push({ url: String(url), method: opts.method || 'GET' });
+    if (String(url).includes('/libs/granite/security/currentuser.json')) {
+      if (mockAemUserRole === 'author') {
+        return jsonResponse({ authorizableId: 'regular-author', memberOf: ['contributors', 'dam-users'] });
+      }
+      return jsonResponse({ authorizableId: 'admin', memberOf: ['administrators', 'dam-users'] });
+    }
+    if (String(url).includes('/conf/global/settings/dam/processing.2.json')) {
+      if (mockAemUserRole === 'author') {
+        return { ok: false, status: 403, headers: { get: () => 'text/plain' }, text: async () => 'Forbidden' };
+      }
+      return jsonResponse({
+        'jcr:primaryType': 'sling:Folder',
+        'face-recognition': {
+          'jcr:primaryType': 'cq:Page',
+          'jcr:content': { 'jcr:title': 'Face Recognition' }
+        },
+        'brand-portal-sync': {
+          'jcr:primaryType': 'cq:Page',
+          'jcr:content': { 'jcr:title': 'Brand Portal Sync' }
+        }
+      });
+    }
     if (String(url).includes('/api/assets.json')) {
       return jsonResponse({ entities: DAM_ROOT_LISTING });
     }
@@ -572,4 +595,51 @@ test('UI S10: Delete Group button opens confirmation dialog and deletes the grou
   await screen.findByText(/Deleted group "Person #15"/);
   await waitFor(() => assert.ok(!groupCardTitles().includes('Person #15')));
   assert.ok(awsCommands.includes('DeleteUserCommand') && awsCommands.includes('DeleteFacesCommand'));
+});
+
+test('UI Admin & Profiles: Processing Profile dropdown lists AEM profiles for admins, and BYOK Settings tab is hidden/blocked for non-admin authors', async () => {
+  mockAemUserRole = 'admin';
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  const settingsTab = screen
+    .getAllByText('BYOK AWS Rekognition & Metadata Settings')
+    .find((el) => el.closest('[role="tab"]'));
+  assert.ok(settingsTab, 'Admin sees the BYOK Settings tab');
+  fireEvent.click(settingsTab);
+
+  // Processing Profile Picker lists profiles discovered from AEM (/conf/global/settings/dam/processing.2.json)
+  const profileSelect = screen
+    .getAllByText('AEM Processing Profile Name')
+    .map((el) => el.closest('label')?.querySelector('select'))
+    .find(Boolean);
+  assert.ok(profileSelect, 'Processing Profile Name renders a Picker <select>');
+  const optionTexts = Array.from(profileSelect.querySelectorAll('option')).map((o) => o.textContent.trim());
+  assert.ok(optionTexts.includes('Face Recognition'));
+  assert.ok(optionTexts.includes('Brand Portal Sync'));
+
+  cleanup();
+
+  // Now render as a regular non-admin DAM author
+  mockAemUserRole = 'author';
+  try {
+    renderConsole();
+    await screen.findByText('Alice Example');
+    await waitFor(() => {
+      const tabs = screen.queryAllByText('BYOK AWS Rekognition & Metadata Settings');
+      assert.equal(tabs.length, 0, 'BYOK Settings tab must be hidden for non-admin users');
+    });
+
+    // Direct backend call to saveSettings as a non-admin is rejected with 403 Forbidden
+    const forbiddenSave = await settingsAction.main({
+      operation: 'saveSettings',
+      settings: { similarityThreshold: 90 },
+      __ow_method: 'post',
+      __ow_headers: { authorization: `Bearer ${IMS_TOKEN}` },
+      AEM_HOST: 'https://author-p1-e1.adobeaemcloud.com'
+    });
+    assert.equal(forbiddenSave.statusCode, 403);
+  } finally {
+    mockAemUserRole = 'admin';
+  }
 });

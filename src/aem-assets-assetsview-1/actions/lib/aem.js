@@ -684,6 +684,118 @@ function createAemClient({
     },
 
     /**
+     * Checks whether the caller is an AEM Administrator (via `/libs/granite/security/currentuser.json`
+     * or read access to `/conf/global/settings/dam/processing.2.json`) and lists the DAM Processing
+     * Profiles configured on the AEM instance for the Settings dropdown.
+     */
+    async getAdminStatusAndProfiles() {
+      if (!baseUrl || !fetchImpl) {
+        return {
+          isAdmin: true,
+          processingProfiles: [
+            {
+              name: 'Face Recognition',
+              path: '/conf/global/settings/dam/processing/face-recognition'
+            }
+          ]
+        };
+      }
+
+      const [userRes, profilesRes] = await Promise.allSettled([
+        fetchAemWithFallback(
+          `${baseUrl}/libs/granite/security/currentuser.json?props=authorizableId,memberOf`
+        ),
+        fetchAemWithFallback(`${baseUrl}/conf/global/settings/dam/processing.2.json`)
+      ]);
+
+      let explicitlyNonAdmin = false;
+      let isAdminByGroup = false;
+
+      if (userRes.status === 'fulfilled') {
+        const res = userRes.value;
+        if (res.status === 401 || res.status === 403) {
+          explicitlyNonAdmin = true;
+        } else if (res.ok) {
+          try {
+            const text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+            if (!isHtmlPayload(text)) {
+              const data = JSON.parse(text);
+              const authId = String(data.authorizableId || '').toLowerCase();
+              const rawMembers = Array.isArray(data.memberOf) ? data.memberOf : [];
+              const groupNames = rawMembers.map((m) =>
+                String(typeof m === 'string' ? m : m?.authorizableId || m?.name || '').toLowerCase()
+              );
+              if (authId || groupNames.length > 0) {
+                isAdminByGroup =
+                  authId === 'admin' ||
+                  groupNames.some(
+                    (g) =>
+                      g === 'administrators' ||
+                      g === 'dam-administrators' ||
+                      g.includes('administrators')
+                  );
+                if (!isAdminByGroup) {
+                  explicitlyNonAdmin = true;
+                }
+              }
+            }
+          } catch (e) {
+            // ignore parse error
+          }
+        }
+      }
+
+      const processingProfiles = [];
+      let canReadProcessingConf = false;
+
+      if (profilesRes.status === 'fulfilled') {
+        const res = profilesRes.value;
+        if (res.status === 401 || res.status === 403) {
+          explicitlyNonAdmin = true;
+        } else if (res.ok) {
+          try {
+            const text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+            if (!isHtmlPayload(text)) {
+              const data = JSON.parse(text);
+              for (const [key, val] of Object.entries(data || {})) {
+                if (key.startsWith('jcr:') || key.startsWith('rep:') || key.startsWith('sling:')) {
+                  continue;
+                }
+                if (val && typeof val === 'object') {
+                  canReadProcessingConf = true;
+                  const jcr = val['jcr:content'] || val;
+                  const title =
+                    jcr['jcr:title'] ||
+                    jcr.title ||
+                    jcr['dc:title'] ||
+                    val['jcr:title'] ||
+                    key;
+                  const cleanTitle = String(Array.isArray(title) ? title[0] : title).trim();
+                  if (cleanTitle) {
+                    processingProfiles.push({
+                      name: cleanTitle,
+                      nodeName: key,
+                      path: `/conf/global/settings/dam/processing/${key}`
+                    });
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // ignore parse error
+          }
+        }
+      }
+
+      const isAdmin = isAdminByGroup || (canReadProcessingConf && !explicitlyNonAdmin) || !explicitlyNonAdmin;
+
+      return {
+        isAdmin,
+        processingProfiles
+      };
+    },
+
+    /**
      * Writes multi-value face metadata (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`)
      * back to `jcr:content/metadata` on the AEM Asset.
      */

@@ -246,6 +246,13 @@ export default function AdminConsole() {
     allowedImageTypesText: '',
     minImageSize: 200
   });
+  const [isAdmin, setIsAdmin] = useState(true);
+  const [processingProfiles, setProcessingProfiles] = useState([
+    {
+      name: 'Face Recognition',
+      path: '/conf/global/settings/dam/processing/face-recognition'
+    }
+  ]);
 
   const [loading, setLoading] = useState(true);
   const [filterMode, setFilterMode] = useState('all'); // 'all' | 'named' | 'unnamed'
@@ -406,6 +413,12 @@ export default function AdminConsole() {
     if (!hostContext.hostResolved) return;
     try {
       const settingsRes = await api.getSettings(hostContext);
+      if (typeof settingsRes.isAdmin === 'boolean') {
+        setIsAdmin(settingsRes.isAdmin);
+      }
+      if (Array.isArray(settingsRes.processingProfiles) && settingsRes.processingProfiles.length > 0) {
+        setProcessingProfiles(settingsRes.processingProfiles);
+      }
       if (settingsRes.settings) {
         setSettings((prev) => ({
           ...prev,
@@ -732,7 +745,9 @@ export default function AdminConsole() {
         <Tabs aria-label="Face Recognition Admin Tabs">
           <TabList>
             <Item key="groups">Face Groups & Split / Merge Manager</Item>
-            <Item key="settings">BYOK AWS Rekognition & Metadata Settings</Item>
+            {isAdmin && (
+              <Item key="settings">BYOK AWS Rekognition & Metadata Settings</Item>
+            )}
           </TabList>
 
           <TabPanels marginTop="size-250">
@@ -1240,8 +1255,9 @@ export default function AdminConsole() {
             </Item>
 
             {/* ============================================================ */}
-            {/* TAB 2: BYOK AWS REKOGNITION & METADATA SETTINGS              */}
+            {/* TAB 2: BYOK AWS REKOGNITION & METADATA SETTINGS (ADMIN ONLY) */}
             {/* ============================================================ */}
+            {isAdmin && (
             <Item key="settings">
               <Flex direction="column" gap="size-300">
                 <Flex gap="size-300" wrap>
@@ -1366,15 +1382,20 @@ export default function AdminConsole() {
                         Profile enabled
                       </Switch>
 
-                      <TextField
+                      <Picker
                         label="AEM Processing Profile Name"
-                        value={settings.processingProfileName}
-                        onChange={(v) =>
-                          setSettings((s) => ({ ...s, processingProfileName: v }))
+                        selectedKey={settings.processingProfileName}
+                        onSelectionChange={(val) =>
+                          setSettings((s) => ({ ...s, processingProfileName: String(val) }))
                         }
-                        placeholder="Face Recognition"
                         width="100%"
-                      />
+                      >
+                        {processingProfiles.map((p) => (
+                          <Item key={p.name} textValue={p.name}>
+                            {p.name}
+                          </Item>
+                        ))}
+                      </Picker>
 
                       <Divider size="S" />
 
@@ -1411,6 +1432,7 @@ export default function AdminConsole() {
                 </Flex>
               </Flex>
             </Item>
+            )}
           </TabPanels>
         </Tabs>
       </Flex>
