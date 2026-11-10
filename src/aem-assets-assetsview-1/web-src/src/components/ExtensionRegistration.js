@@ -34,20 +34,59 @@ function findAemAuthorUrl(...sources) {
 
 const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic)$/i;
 
-function extractAssetContext(resource, context) {
-  const rawPath =
-    (resource &&
-      (resource.path ||
-        resource.repositoryPath ||
-        resource['repo:path'] ||
-        resource.repositoryMetadata?.['repo:path'] ||
-        resource.repositoryMetadata?.path)) ||
-    '';
+function extractAssetContext(resourceOrWrapper, context) {
+  const resource =
+    resourceOrWrapper &&
+    typeof resourceOrWrapper === 'object' &&
+    resourceOrWrapper.resource
+      ? resourceOrWrapper.resource
+      : resourceOrWrapper;
 
-  let cleanPath = String(rawPath).trim();
-  const damIdx = cleanPath.indexOf('/content/dam');
-  if (damIdx > 0) cleanPath = cleanPath.slice(damIdx);
-  cleanPath = cleanPath.replace(/\/+$/, '');
+  const ctxObj =
+    resourceOrWrapper &&
+    typeof resourceOrWrapper === 'object' &&
+    resourceOrWrapper.context
+      ? resourceOrWrapper.context
+      : context;
+
+  // Deep-search for any /content/dam/... path in resource or wrapper
+  function findDamPath(obj, depth = 0) {
+    if (depth > 4 || !obj) return '';
+    if (typeof obj === 'string') {
+      const idx = obj.indexOf('/content/dam');
+      if (idx >= 0) {
+        try {
+          return decodeURIComponent(obj.slice(idx));
+        } catch (e) {
+          return obj.slice(idx);
+        }
+      }
+      return '';
+    }
+    if (typeof obj !== 'object') return '';
+    const priorityKeys = [
+      'path',
+      'repositoryPath',
+      'repo:path',
+      'assetPath',
+      'folderPath',
+      'repositoryMetadata'
+    ];
+    for (const k of priorityKeys) {
+      if (obj[k]) {
+        const hit = findDamPath(obj[k], depth + 1);
+        if (hit) return hit;
+      }
+    }
+    for (const val of Object.values(obj)) {
+      const hit = findDamPath(val, depth + 1);
+      if (hit) return hit;
+    }
+    return '';
+  }
+
+  let cleanPath = findDamPath(resource) || findDamPath(resourceOrWrapper) || findDamPath(ctxObj);
+  cleanPath = String(cleanPath).trim().replace(/\/+$/, '');
 
   const isAssetFile = IMAGE_EXT_RE.test(cleanPath);
   const folderPath = isAssetFile
@@ -58,17 +97,28 @@ function extractAssetContext(resource, context) {
 
   const assetPath = isAssetFile ? cleanPath : '';
 
+  const assetName =
+    (resource &&
+      (resource.name ||
+        resource['repo:name'] ||
+        resource.assetName ||
+        resource.title ||
+        resource.repositoryMetadata?.['repo:name'])) ||
+    (assetPath ? assetPath.split('/').pop() : '') ||
+    '';
+
   const assetId =
     (resource &&
       (resource.id ||
         resource.assetId ||
         resource['repo:id'] ||
-        resource.repositoryMetadata?.['repo:id'])) ||
+        resource.repositoryMetadata?.['repo:id'] ||
+        resource.repositoryMetadata?.id)) ||
     '';
 
-  const aemAuthorUrl = findAemAuthorUrl(resource, context);
+  const aemAuthorUrl = findAemAuthorUrl(resource, resourceOrWrapper, ctxObj);
 
-  return { folderPath, assetPath, assetId, aemAuthorUrl };
+  return { folderPath, assetPath, assetName, assetId, aemAuthorUrl };
 }
 
 export default function ExtensionRegistration() {

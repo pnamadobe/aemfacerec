@@ -30,7 +30,8 @@ export default function AssetDetailsSidePanel() {
     imsOrg: null,
     aemHost: null,
     assetId: '',
-    assetPath: ''
+    assetPath: '',
+    assetName: ''
   });
 
   const [assetData, setAssetData] = useState(null);
@@ -59,16 +60,36 @@ export default function AssetDetailsSidePanel() {
 
     const initialAssetPath = sp.get('assetPath') || storedCtx.assetPath || '';
     const initialAssetId = sp.get('assetId') || storedCtx.assetId || '';
+    const initialAssetName = sp.get('assetName') || storedCtx.assetName || '';
     const initialAuthorUrl = sp.get('aemAuthorUrl') || storedCtx.aemAuthorUrl || '';
 
-    if (initialAssetPath || initialAssetId) {
+    if (initialAssetPath || initialAssetId || initialAssetName) {
       setHostContext((prev) => ({
         ...prev,
         assetId: initialAssetId || prev.assetId,
         assetPath: initialAssetPath || prev.assetPath,
+        assetName: initialAssetName || prev.assetName,
         aemHost: initialAuthorUrl || prev.aemHost
       }));
     }
+
+    const onStorageChange = (e) => {
+      if (e.key === STORAGE_KEY_CTX && e.newValue) {
+        try {
+          const next = JSON.parse(e.newValue);
+          setHostContext((prev) => ({
+            ...prev,
+            assetId: next.assetId || prev.assetId,
+            assetPath: next.assetPath || prev.assetPath,
+            assetName: next.assetName || prev.assetName,
+            aemHost: next.aemAuthorUrl || prev.aemHost
+          }));
+        } catch (err) {
+          // ignore
+        }
+      }
+    };
+    window.addEventListener('storage', onStorageChange);
 
     const connectToHost = async () => {
       try {
@@ -93,15 +114,16 @@ export default function AssetDetailsSidePanel() {
         const sharedContext = gc.sharedContext;
         if (sharedContext) {
           const auth = sharedContext.get('auth') || {};
-          const asset = sharedContext.get('asset') || {};
+          const asset = sharedContext.get('asset') || sharedContext.get('resource') || {};
           imsToken = imsToken || auth.imsToken || null;
           imsOrg = imsOrg || auth.imsOrg || null;
           aemHost = aemHost || sharedContext.get('aemHost') || auth.aemHost || null;
-          if (asset.assetId || asset.id || asset.path) {
+          if (asset.assetId || asset.id || asset.path || asset.name) {
             setHostContext((prev) => ({
               ...prev,
               assetId: asset.assetId || asset.id || prev.assetId,
-              assetPath: asset.path || asset.assetPath || prev.assetPath
+              assetPath: asset.path || asset.assetPath || prev.assetPath,
+              assetName: asset.name || asset['repo:name'] || prev.assetName
             }));
           }
         }
@@ -135,6 +157,7 @@ export default function AssetDetailsSidePanel() {
     connectToHost();
     return () => {
       mounted = false;
+      window.removeEventListener('storage', onStorageChange);
     };
   }, []);
 
@@ -143,7 +166,11 @@ export default function AssetDetailsSidePanel() {
     try {
       const [facesRes, groupsRes] = await Promise.all([
         api.getAssetFaces(
-          { assetId: hostContext.assetId, assetPath: hostContext.assetPath },
+          {
+            assetId: hostContext.assetId,
+            assetPath: hostContext.assetPath,
+            assetName: hostContext.assetName
+          },
           hostContext
         ),
         api.listGroups(hostContext)

@@ -201,7 +201,13 @@ async function createFaceService({
      */
     async ingestAsset({ assetPath, assetId, assetTitle, imageBuffer, force = false }) {
       const { settings, rekognition } = await getRekognition();
-      const cleanPath = normalizeDamPath(assetPath);
+      let cleanPath = normalizeDamPath(assetPath);
+      if (!cleanPath && assetId) {
+        const resolvedFromUuid = await aemClient.resolvePathByAssetUuid(assetId);
+        if (resolvedFromUuid) {
+          cleanPath = normalizeDamPath(resolvedFromUuid);
+        }
+      }
 
       if (!force && cleanPath) {
         const eligibility = await aemClient.checkFolderEligibility(cleanPath, settings);
@@ -371,24 +377,68 @@ async function createFaceService({
     },
 
     /**
-     * Retrieves all detected faces and metadata for a specific AEM asset (by assetId or assetPath).
+     * Retrieves all detected faces and metadata for a specific AEM asset (by assetId, assetPath, or assetName).
      */
-    async getAssetFaces({ assetId, assetPath }) {
+    async getAssetFaces({ assetId, assetPath, assetName }) {
       const [db, settings] = await Promise.all([
         storage.getDatabase(),
         storage.getSettings()
       ]);
 
-      let assetRecord = assetId ? db.assets[assetId] : null;
-      if (!assetRecord && assetPath) {
-        const cleanPath = normalizeDamPath(assetPath);
-        assetRecord = Object.values(db.assets).find((a) => a.assetPath === cleanPath) || null;
+      const rawUuid = assetId ? String(assetId).replace(/^urn:aaid:aem:/i, '').trim() : '';
+      let decodedPath = '';
+      if (assetPath) {
+        try {
+          decodedPath = normalizeDamPath(decodeURIComponent(assetPath));
+        } catch (e) {
+          decodedPath = normalizeDamPath(assetPath);
+        }
+      }
+
+      const allAssets = Object.values(db.assets || {});
+      let assetRecord =
+        (assetId && db.assets[assetId]) ||
+        (rawUuid && db.assets[rawUuid]) ||
+        (rawUuid && allAssets.find((a) => a.uuid === rawUuid || a.assetId === rawUuid || a.assetId === `urn:aaid:aem:${rawUuid}`)) ||
+        null;
+
+      if (!assetRecord && decodedPath) {
+        assetRecord =
+          allAssets.find((a) => {
+            try {
+              return normalizeDamPath(decodeURIComponent(a.assetPath || '')) === decodedPath;
+            } catch (e) {
+              return a.assetPath === decodedPath;
+            }
+          }) || null;
+      }
+
+      if (!assetRecord && assetName) {
+        const cleanName = String(assetName).trim();
+        assetRecord =
+          allAssets.find(
+            (a) => a.assetTitle === cleanName || (a.assetPath && a.assetPath.endsWith(`/${cleanName}`))
+          ) || null;
+      }
+
+      // If AEM Assets View only passed `urn:aaid:aem:<uuid>`, resolve the DAM path via AEM QueryBuilder
+      if (!assetRecord && rawUuid) {
+        const resolvedPath = await aemClient.resolvePathByAssetUuid(rawUuid);
+        if (resolvedPath) {
+          decodedPath = normalizeDamPath(resolvedPath);
+          assetRecord =
+            allAssets.find((a) => a.assetPath === decodedPath) || null;
+          if (assetRecord) {
+            assetRecord.uuid = rawUuid;
+            await storage.saveDatabase(db);
+          }
+        }
       }
 
       if (!assetRecord) {
         return {
           assetId: assetId || null,
-          assetPath: assetPath ? normalizeDamPath(assetPath) : null,
+          assetPath: decodedPath || null,
           scanned: false,
           faceCount: 0,
           faceNames: [],

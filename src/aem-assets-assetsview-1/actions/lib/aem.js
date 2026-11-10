@@ -271,6 +271,30 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     },
 
     /**
+     * Resolves an AEM `urn:aaid:aem:<uuid>` or raw `jcr:uuid` to its `/content/dam/...` path
+     * via AEM QueryBuilder.
+     */
+    async resolvePathByAssetUuid(assetId) {
+      if (!assetId || !baseUrl || !fetchImpl) return null;
+      const rawUuid = String(assetId).replace(/^urn:aaid:aem:/i, '').trim();
+      if (!rawUuid || rawUuid.startsWith('/content/dam')) return rawUuid;
+
+      try {
+        const qbUrl = `${baseUrl}/bin/querybuilder.json?property=jcr:uuid&property.value=${encodeURIComponent(
+          rawUuid
+        )}&p.limit=1`;
+        const data = await fetchAemJson(qbUrl);
+        const hitPath = data.hits?.[0]?.path;
+        if (hitPath && hitPath.startsWith('/content/dam')) {
+          return hitPath;
+        }
+      } catch (e) {
+        // ignore if QueryBuilder is unavailable
+      }
+      return null;
+    },
+
+    /**
      * Fetches basic asset info (assetId / jcr:uuid, title, mimeType) from AEM.
      */
     async getAssetInfo(assetPath) {

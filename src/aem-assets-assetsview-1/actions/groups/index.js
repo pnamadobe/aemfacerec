@@ -45,7 +45,8 @@ async function main(params = {}) {
       case 'getAssetFaces': {
         const result = await faceService.getAssetFaces({
           assetId: params.assetId,
-          assetPath: params.assetPath
+          assetPath: params.assetPath,
+          assetName: params.assetName
         });
         return { statusCode: 200, headers: corsHeaders, body: result };
       }
