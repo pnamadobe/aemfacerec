@@ -684,14 +684,20 @@ function createAemClient({
     },
 
     /**
-     * Checks whether the caller is an AEM Administrator (via `/libs/granite/security/currentuser.json`
-     * or read access to `/conf/global/settings/dam/processing.2.json`) and lists the DAM Processing
+     * Checks whether the caller is an AEM Administrator or member of the configured
+     * `curatorGroups` (via `/libs/granite/security/currentuser.json` or read access to
+     * `/conf/global/settings/dam/processing.2.json`) and optionally lists the DAM Processing
      * Profiles configured on the AEM instance for the Settings dropdown.
      */
-    async getAdminStatusAndProfiles() {
+    async getAdminStatusAndProfiles({
+      includeProfiles = true,
+      curatorGroups = ['administrators', 'dam-administrators']
+    } = {}) {
       if (!baseUrl || !fetchImpl) {
         return {
           isAdmin: true,
+          isCurator: true,
+          userGroups: ['administrators'],
           processingProfiles: [
             {
               name: 'Face Recognition',
@@ -701,15 +707,29 @@ function createAemClient({
         };
       }
 
-      const [userRes, profilesRes] = await Promise.allSettled([
+      const requests = [
         fetchAemWithFallback(
           `${baseUrl}/libs/granite/security/currentuser.json?props=authorizableId,memberOf`
-        ),
-        fetchAemWithFallback(`${baseUrl}/conf/global/settings/dam/processing.2.json`)
-      ]);
+        )
+      ];
+      if (includeProfiles) {
+        requests.push(
+          fetchAemWithFallback(`${baseUrl}/conf/global/settings/dam/processing.2.json`)
+        );
+      }
+
+      const [userRes, profilesRes] = await Promise.allSettled(requests);
 
       let explicitlyNonAdmin = false;
       let isAdminByGroup = false;
+      let isCuratorByGroup = false;
+      let userGroups = [];
+
+      const allowedCurators = new Set(
+        (Array.isArray(curatorGroups) ? curatorGroups : ['administrators', 'dam-administrators'])
+          .map((g) => String(g || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
 
       if (userRes.status === 'fulfilled') {
         const res = userRes.value;
@@ -717,14 +737,22 @@ function createAemClient({
           explicitlyNonAdmin = true;
         } else if (res.ok) {
           try {
-            const text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+            const text =
+              typeof res.text === 'function'
+                ? await res.text()
+                : JSON.stringify(await res.json());
             if (!isHtmlPayload(text)) {
               const data = JSON.parse(text);
               const authId = String(data.authorizableId || '').toLowerCase();
               const rawMembers = Array.isArray(data.memberOf) ? data.memberOf : [];
-              const groupNames = rawMembers.map((m) =>
-                String(typeof m === 'string' ? m : m?.authorizableId || m?.name || '').toLowerCase()
-              );
+              const groupNames = rawMembers
+                .map((m) =>
+                  String(typeof m === 'string' ? m : m?.authorizableId || m?.name || '')
+                    .trim()
+                    .toLowerCase()
+                )
+                .filter(Boolean);
+              userGroups = groupNames;
               if (authId || groupNames.length > 0) {
                 isAdminByGroup =
                   authId === 'admin' ||
@@ -734,6 +762,10 @@ function createAemClient({
                       g === 'dam-administrators' ||
                       g.includes('administrators')
                   );
+                isCuratorByGroup =
+                  isAdminByGroup ||
+                  (authId && allowedCurators.has(authId)) ||
+                  groupNames.some((g) => allowedCurators.has(g));
                 if (!isAdminByGroup) {
                   explicitlyNonAdmin = true;
                 }
@@ -748,13 +780,16 @@ function createAemClient({
       const processingProfiles = [];
       let canReadProcessingConf = false;
 
-      if (profilesRes.status === 'fulfilled') {
+      if (profilesRes && profilesRes.status === 'fulfilled') {
         const res = profilesRes.value;
         if (res.status === 401 || res.status === 403) {
           explicitlyNonAdmin = true;
         } else if (res.ok) {
           try {
-            const text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+            const text =
+              typeof res.text === 'function'
+                ? await res.text()
+                : JSON.stringify(await res.json());
             if (!isHtmlPayload(text)) {
               const data = JSON.parse(text);
               for (const [key, val] of Object.entries(data || {})) {
@@ -787,10 +822,14 @@ function createAemClient({
         }
       }
 
-      const isAdmin = isAdminByGroup || (canReadProcessingConf && !explicitlyNonAdmin) || !explicitlyNonAdmin;
+      const isAdmin =
+        isAdminByGroup || (canReadProcessingConf && !explicitlyNonAdmin) || !explicitlyNonAdmin;
+      const isCurator = isAdmin || isCuratorByGroup;
 
       return {
         isAdmin,
+        isCurator,
+        userGroups,
         processingProfiles
       };
     },

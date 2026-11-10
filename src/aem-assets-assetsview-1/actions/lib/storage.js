@@ -57,10 +57,15 @@ const DEFAULT_SETTINGS = {
     'image/bmp'
   ],
   // Images whose shorter side is below this many pixels (logos, icons) are skipped
-  minImageSize: 200
+  minImageSize: 200,
+  // Governance: when true, only AEM Administrators or members of curatorGroups can
+  // name, rename, merge, split, or delete face groups
+  restrictCuratorActionsToAdmins: false,
+  curatorGroups: ['administrators', 'dam-administrators']
 };
 
 const MIME_TYPE_PATTERN = /^image\/[a-z0-9][a-z0-9.+-]{0,99}$/;
+const CURATOR_GROUP_PATTERN = /^[a-zA-Z0-9_.\-: ]{1,128}$/;
 
 /**
  * Encrypts a plaintext string using AES-256-GCM with a key derived from secret.
@@ -645,7 +650,12 @@ async function createStorage(options = {}) {
             : DEFAULT_SETTINGS.allowedImageTypes,
         minImageSize: Number.isFinite(Number(merged.minImageSize))
           ? Number(merged.minImageSize)
-          : DEFAULT_SETTINGS.minImageSize
+          : DEFAULT_SETTINGS.minImageSize,
+        restrictCuratorActionsToAdmins: Boolean(merged.restrictCuratorActionsToAdmins ?? false),
+        curatorGroups:
+          Array.isArray(merged.curatorGroups) && merged.curatorGroups.length > 0
+            ? merged.curatorGroups
+            : DEFAULT_SETTINGS.curatorGroups
       };
 
       if (includeDecryptedSecret) {
@@ -736,6 +746,27 @@ async function createStorage(options = {}) {
           throw new PublicError('Minimum image size must be a whole number of pixels between 0 and 4000.');
         }
         updated.minImageSize = size;
+      }
+
+      if (typeof newSettings.restrictCuratorActionsToAdmins === 'boolean') {
+        updated.restrictCuratorActionsToAdmins = newSettings.restrictCuratorActionsToAdmins;
+      }
+      if (Array.isArray(newSettings.curatorGroups)) {
+        const groups = Array.from(
+          new Set(
+            newSettings.curatorGroups
+              .map((g) => String(g).trim().toLowerCase())
+              .filter(Boolean)
+          )
+        );
+        const invalid = groups.filter((g) => !CURATOR_GROUP_PATTERN.test(g));
+        if (invalid.length > 0) {
+          throw new PublicError(
+            `Invalid curator group name(s): ${invalid.join(', ')}. Use AEM group IDs such as 'administrators' or 'face-curators'.`
+          );
+        }
+        updated.curatorGroups =
+          groups.length > 0 ? groups : DEFAULT_SETTINGS.curatorGroups;
       }
 
       await writeJson('db/settings.json', updated);

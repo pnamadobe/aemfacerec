@@ -213,10 +213,13 @@ global.fetch = async (url, opts = {}) => {
       if (mockAemUserRole === 'author') {
         return jsonResponse({ authorizableId: 'regular-author', memberOf: ['contributors', 'dam-users'] });
       }
+      if (mockAemUserRole === 'curator') {
+        return jsonResponse({ authorizableId: 'curator-user', memberOf: ['face-curators', 'dam-users'] });
+      }
       return jsonResponse({ authorizableId: 'admin', memberOf: ['administrators', 'dam-users'] });
     }
     if (String(url).includes('/conf/global/settings/dam/processing.2.json')) {
-      if (mockAemUserRole === 'author') {
+      if (mockAemUserRole === 'author' || mockAemUserRole === 'curator') {
         return { ok: false, status: 403, headers: { get: () => 'text/plain' }, text: async () => 'Forbidden' };
       }
       return jsonResponse({
@@ -641,5 +644,66 @@ test('UI Admin & Profiles: Processing Profile dropdown lists AEM profiles for ad
     assert.equal(forbiddenSave.statusCode, 403);
   } finally {
     mockAemUserRole = 'admin';
+  }
+});
+
+test('UI Curator Permissions: admin can restrict group management to Curator Groups, giving regular authors a read-only view and blocking mutations with 403 while allowing curators', async () => {
+  const storage = await createStorage({});
+  await storage.saveSettings({
+    restrictCuratorActionsToAdmins: true,
+    curatorGroups: ['administrators', 'dam-administrators', 'face-curators']
+  });
+
+  try {
+    // 1. Regular author (not in face-curators): sees Read-Only View in console, no mutation controls, and 403 on backend
+    mockAemUserRole = 'author';
+    renderConsole();
+    await screen.findByText('Alice Example');
+
+    const card = screen.getAllByText('Alice Example').find((el) => el.closest('div[style*="cursor: pointer"]'));
+    fireEvent.click(card);
+    await screen.findByText('Manage Group: Alice Example');
+    await screen.findByText('Read-Only View');
+    assert.equal(screen.queryByText('Save Name'), null);
+    assert.equal(screen.queryByText('Delete Group'), null);
+    assert.equal(screen.queryByText('Combine this entire group into another group:'), null);
+
+    // Direct backend call to renameGroup as non-curator is rejected with 403 Forbidden
+    const forbiddenRename = await groupsAction.main({
+      operation: 'renameGroup',
+      groupId: 'grp_001',
+      name: 'Hacked Name',
+      __ow_method: 'post',
+      __ow_headers: { authorization: `Bearer ${IMS_TOKEN}` },
+      AEM_HOST: 'https://author-p1-e1.adobeaemcloud.com'
+    });
+    assert.equal(forbiddenRename.statusCode, 403);
+
+    cleanup();
+
+    // Side panel for regular author also hides the Rename / Name Person button
+    renderSidePanel('/content/dam/ui/asset-1-0.jpg');
+    await screen.findAllByText(/Alice Example/);
+    assert.equal(screen.queryByText('Rename'), null);
+    assert.equal(screen.queryByText('Name Person'), null);
+    cleanup();
+
+    // 2. Member of 'face-curators' (non-admin): CAN manage groups (sees Save Name / Delete Group), but does NOT see BYOK Settings tab
+    mockAemUserRole = 'curator';
+    renderConsole();
+    await screen.findByText('Alice Example');
+    assert.equal(screen.queryAllByText('BYOK AWS Rekognition & Metadata Settings').length, 0);
+
+    const cardCurator = screen.getAllByText('Alice Example').find((el) => el.closest('div[style*="cursor: pointer"]'));
+    fireEvent.click(cardCurator);
+    await screen.findByText('Manage Group: Alice Example');
+    await screen.findByText('Save Name');
+    await screen.findByText('Delete Group');
+  } finally {
+    mockAemUserRole = 'admin';
+    await storage.saveSettings({
+      restrictCuratorActionsToAdmins: false,
+      curatorGroups: ['administrators', 'dam-administrators']
+    });
   }
 });

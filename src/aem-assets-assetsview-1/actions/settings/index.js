@@ -46,24 +46,32 @@ async function main(params = {}) {
     });
     const operation = params.operation || 'getSettings';
 
-    const { isAdmin, processingProfiles } = await aemClient.getAdminStatusAndProfiles();
+    const settings = await storage.getSettings({ includeDecryptedSecret: false });
+    const { isAdmin, isCurator, processingProfiles } = await aemClient.getAdminStatusAndProfiles({
+      includeProfiles: true,
+      curatorGroups: settings.curatorGroups
+    });
+    const canManageGroups = settings.restrictCuratorActionsToAdmins ? isCurator : true;
 
     if (operation === 'getSettings') {
-      const settings = await storage.getSettings({ includeDecryptedSecret: false });
       const profiles = mergeProfileChoices(processingProfiles, settings.processingProfileName);
       if (!isAdmin) {
-        // Non-admin authors only receive non-sensitive display settings and isAdmin: false
+        // Non-admin authors only receive non-sensitive display settings and role flags
         return {
           statusCode: 200,
           headers: corsHeaders,
           body: {
             isAdmin: false,
+            isCurator,
+            canManageGroups,
             processingProfiles: profiles,
             settings: {
               metadataProperty: settings.metadataProperty,
               includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
               processingProfileName: settings.processingProfileName,
-              requireProcessingProfile: settings.requireProcessingProfile
+              requireProcessingProfile: settings.requireProcessingProfile,
+              restrictCuratorActionsToAdmins: settings.restrictCuratorActionsToAdmins,
+              curatorGroups: settings.curatorGroups
             }
           }
         };
@@ -73,6 +81,8 @@ async function main(params = {}) {
         headers: corsHeaders,
         body: {
           isAdmin: true,
+          isCurator: true,
+          canManageGroups: true,
           processingProfiles: profiles,
           settings
         }

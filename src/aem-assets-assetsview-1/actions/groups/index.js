@@ -1,5 +1,6 @@
 const { createFaceService } = require('../lib/face-service');
 const { createStorage } = require('../lib/storage');
+const { createAemClient } = require('../lib/aem');
 const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
 const { PublicError, errorResponse } = require('../lib/security');
 
@@ -9,6 +10,26 @@ const MAINTENANCE_OPERATIONS = new Set([
   'exportSnapshot',
   'importSnapshot'
 ]);
+
+const CURATOR_MUTATION_OPERATIONS = new Set([
+  'renameGroup',
+  'splitFaces',
+  'moveFaces',
+  'mergeGroups',
+  'deleteGroup',
+  'resyncAllAssets'
+]);
+
+async function resolveCallerPermissions(aemClient, settings) {
+  if (!settings.restrictCuratorActionsToAdmins) {
+    return { canManageGroups: true };
+  }
+  const { isCurator } = await aemClient.getAdminStatusAndProfiles({
+    includeProfiles: false,
+    curatorGroups: settings.curatorGroups
+  });
+  return { canManageGroups: Boolean(isCurator) };
+}
 
 async function main(params = {}) {
   const corsHeaders = buildCors('GET, POST, OPTIONS');
@@ -26,12 +47,31 @@ async function main(params = {}) {
     }
 
     const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
+    const aemClient = createAemClient({
+      aemHost: ctx.aemHost,
+      token: ctx.token,
+      serviceCredentials: ctx.serviceCredentials
+    });
     const faceService = await createFaceService({
       aemHost: ctx.aemHost,
       token: ctx.token,
       serviceCredentials: ctx.serviceCredentials,
-      storage
+      storage,
+      aemClient
     });
+
+    if (CURATOR_MUTATION_OPERATIONS.has(operation)) {
+      const settings = await storage.getSettings({ includeDecryptedSecret: false });
+      const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+      if (!canManageGroups) {
+        throw new PublicError(
+          `Only AEM Administrators or members of the configured Curator Groups (${(
+            settings.curatorGroups || []
+          ).join(', ')}) are permitted to name, merge, split, or delete face groups.`,
+          403
+        );
+      }
+    }
 
     switch (operation) {
       case 'listGroups': {
@@ -41,7 +81,13 @@ async function main(params = {}) {
           filter: params.filter,
           query: params.query
         });
-        return { statusCode: 200, headers: corsHeaders, body: result };
+        const settings = await storage.getSettings({ includeDecryptedSecret: false });
+        const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: { ...result, canManageGroups }
+        };
       }
 
       case 'listGroupOptions': {
@@ -67,7 +113,13 @@ async function main(params = {}) {
           assetPath: params.assetPath,
           assetName: params.assetName
         });
-        return { statusCode: 200, headers: corsHeaders, body: result };
+        const settings = await storage.getSettings({ includeDecryptedSecret: false });
+        const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: { ...result, canManageGroups }
+        };
       }
 
       case 'renameGroup': {

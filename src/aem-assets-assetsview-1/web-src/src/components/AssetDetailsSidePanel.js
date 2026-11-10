@@ -250,6 +250,7 @@ export default function AssetDetailsSidePanel() {
   const faces = assetData?.faces || [];
   const faceNames = assetData?.faceNames || [];
   const metadataProp = assetData?.metadataProperty || 'xdm:faceNames';
+  const canManageGroups = assetData?.canManageGroups !== false;
 
   return (
     <View
@@ -522,37 +523,39 @@ export default function AssetDetailsSidePanel() {
                         Group ID: <code>{face.groupId}</code> • {face.groupFaceCount} face(s) in group
                       </Text>
 
-                      {/* Inline Rename Group Input */}
-                      {isEditing ? (
-                        <Flex gap="size-75" alignItems="end" marginTop="size-50">
-                          <TextField
-                            label="Person Name (updates xdm:faceNames)"
-                            value={editingNameValue}
-                            onChange={setEditingNameValue}
-                            placeholder="Enter person's name..."
-                            width="100%"
-                          />
-                          <Button
-                            variant="cta"
-                            onPress={() => handleSaveGroupName(face.groupId)}
-                          >
-                            Save
-                          </Button>
-                          <ActionButton onPress={() => setEditingGroupId(null)}>
-                            Cancel
-                          </ActionButton>
-                        </Flex>
-                      ) : (
-                        <Flex gap="size-75" wrap marginTop="size-50">
-                          <ActionButton
-                            onPress={() => {
-                              setEditingGroupId(face.groupId);
-                              setEditingNameValue(face.groupName || '');
-                            }}
-                          >
-                            {face.groupName ? 'Rename' : 'Name Person'}
-                          </ActionButton>
-                        </Flex>
+                      {/* Inline Rename Group Input (shown only when user has curator/admin permission) */}
+                      {canManageGroups && (
+                        isEditing ? (
+                          <Flex gap="size-75" alignItems="end" marginTop="size-50">
+                            <TextField
+                              label="Person Name (updates xdm:faceNames)"
+                              value={editingNameValue}
+                              onChange={setEditingNameValue}
+                              placeholder="Enter person's name..."
+                              width="100%"
+                            />
+                            <Button
+                              variant="cta"
+                              onPress={() => handleSaveGroupName(face.groupId)}
+                            >
+                              Save
+                            </Button>
+                            <ActionButton onPress={() => setEditingGroupId(null)}>
+                              Cancel
+                            </ActionButton>
+                          </Flex>
+                        ) : (
+                          <Flex gap="size-75" wrap marginTop="size-50">
+                            <ActionButton
+                              onPress={() => {
+                                setEditingGroupId(face.groupId);
+                                setEditingNameValue(face.groupName || '');
+                              }}
+                            >
+                              {face.groupName ? 'Rename' : 'Name Person'}
+                            </ActionButton>
+                          </Flex>
+                        )
                       )}
                     </Flex>
                   </Flex>

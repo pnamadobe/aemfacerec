@@ -244,9 +244,12 @@ export default function AdminConsole() {
     requireProcessingProfile: true,
     enabledFoldersText: '/content/dam/events\n/content/dam/campaigns',
     allowedImageTypesText: '',
-    minImageSize: 200
+    minImageSize: 200,
+    restrictCuratorActionsToAdmins: false,
+    curatorGroupsText: 'administrators, dam-administrators'
   });
   const [isAdmin, setIsAdmin] = useState(true);
+  const [canManageGroups, setCanManageGroups] = useState(true);
   const [processingProfiles, setProcessingProfiles] = useState([
     {
       name: 'Face Recognition',
@@ -349,6 +352,9 @@ export default function AdminConsole() {
       }
       setGroups(loaded);
       if (res.aemHost) setServerAemHost(res.aemHost);
+      if (typeof res.canManageGroups === 'boolean') {
+        setCanManageGroups(res.canManageGroups);
+      }
       setStats({
         totalGroups: res.totalGroups || 0,
         namedCount: res.namedCount || 0,
@@ -416,6 +422,9 @@ export default function AdminConsole() {
       if (typeof settingsRes.isAdmin === 'boolean') {
         setIsAdmin(settingsRes.isAdmin);
       }
+      if (typeof settingsRes.canManageGroups === 'boolean') {
+        setCanManageGroups(settingsRes.canManageGroups);
+      }
       if (Array.isArray(settingsRes.processingProfiles) && settingsRes.processingProfiles.length > 0) {
         setProcessingProfiles(settingsRes.processingProfiles);
       }
@@ -425,7 +434,10 @@ export default function AdminConsole() {
           ...settingsRes.settings,
           awsSecretAccessKey: '',
           enabledFoldersText: (settingsRes.settings.enabledFolders || ['/content/dam']).join('\n'),
-          allowedImageTypesText: (settingsRes.settings.allowedImageTypes || []).join(', ')
+          allowedImageTypesText: (settingsRes.settings.allowedImageTypes || []).join(', '),
+          curatorGroupsText: (
+            settingsRes.settings.curatorGroups || ['administrators', 'dam-administrators']
+          ).join(', ')
         }));
       }
     } catch (err) {
@@ -571,6 +583,11 @@ export default function AdminConsole() {
           .map((t) => t.trim())
           .filter(Boolean),
         minImageSize: Number(settings.minImageSize),
+        restrictCuratorActionsToAdmins: Boolean(settings.restrictCuratorActionsToAdmins),
+        curatorGroups: (settings.curatorGroupsText || '')
+          .split(',')
+          .map((g) => g.trim())
+          .filter(Boolean),
         enabledFolders: settings.enabledFoldersText
           .split('\n')
           .map((s) => s.trim())
@@ -790,7 +807,7 @@ export default function AdminConsole() {
                         </Flex>
 
                         {/* Bulk Combine / Merge Selected Groups */}
-                        {selectedGroupIdsForMerge.length >= 2 && (
+                        {canManageGroups && selectedGroupIdsForMerge.length >= 2 && (
                           <Flex gap="size-100" alignItems="end">
                             <Picker
                               label={`Combine ${selectedGroupIdsForMerge.length} checked groups into:`}
@@ -878,20 +895,24 @@ export default function AdminConsole() {
                               }}
                             >
                               <Flex justifyContent="space-between" alignItems="start">
-                                <Checkbox
-                                  isSelected={isCheckedForMerge}
-                                  onChange={(checked) => {
-                                    setSelectedGroupIdsForMerge((prev) =>
-                                      checked
-                                        ? [...prev, grp.groupId]
-                                        : prev.filter((id) => id !== grp.groupId)
-                                    );
-                                  }}
-                                >
-                                  <span style={{ fontSize: 11, color: '#64748b' }}>
-                                    Select to Merge
-                                  </span>
-                                </Checkbox>
+                                {canManageGroups ? (
+                                  <Checkbox
+                                    isSelected={isCheckedForMerge}
+                                    onChange={(checked) => {
+                                      setSelectedGroupIdsForMerge((prev) =>
+                                        checked
+                                          ? [...prev, grp.groupId]
+                                          : prev.filter((id) => id !== grp.groupId)
+                                      );
+                                    }}
+                                  >
+                                    <span style={{ fontSize: 11, color: '#64748b' }}>
+                                      Select to Merge
+                                    </span>
+                                  </Checkbox>
+                                ) : (
+                                  <span style={{ fontSize: 11, color: '#64748b' }}>View Only</span>
+                                )}
                                 <span
                                   style={{
                                     fontSize: 10,
@@ -999,45 +1020,51 @@ export default function AdminConsole() {
                             <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
                               ID: <code>{activeGroup.groupId}</code>
                             </Text>
-                            <DialogTrigger>
-                              <ActionButton isQuiet>
-                                <span style={{ color: '#dc2626', fontSize: 12, fontWeight: 600 }}>
-                                  Delete Group
-                                </span>
-                              </ActionButton>
-                              <AlertDialog
-                                variant="destructive"
-                                title={`Delete "${activeGroup.displayName}"?`}
-                                primaryActionLabel="Delete Group"
-                                cancelLabel="Cancel"
-                                onPrimaryAction={handleDeleteActiveGroup}
-                              >
-                                Permanently remove &quot;{activeGroup.displayName}&quot; (
-                                {activeGroup.faceCount} face(s)), delete its vectors from AWS
-                                Rekognition, delete its cropped avatars, and remove it from{' '}
-                                <code>{settings.metadataProperty}</code> on {activeGroup.assetCount}{' '}
-                                asset(s)?
-                              </AlertDialog>
-                            </DialogTrigger>
+                            {canManageGroups ? (
+                              <DialogTrigger>
+                                <ActionButton isQuiet>
+                                  <span style={{ color: '#dc2626', fontSize: 12, fontWeight: 600 }}>
+                                    Delete Group
+                                  </span>
+                                </ActionButton>
+                                <AlertDialog
+                                  variant="destructive"
+                                  title={`Delete "${activeGroup.displayName}"?`}
+                                  primaryActionLabel="Delete Group"
+                                  cancelLabel="Cancel"
+                                  onPrimaryAction={handleDeleteActiveGroup}
+                                >
+                                  Permanently remove &quot;{activeGroup.displayName}&quot; (
+                                  {activeGroup.faceCount} face(s)), delete its vectors from AWS
+                                  Rekognition, delete its cropped avatars, and remove it from{' '}
+                                  <code>{settings.metadataProperty}</code> on {activeGroup.assetCount}{' '}
+                                  asset(s)?
+                                </AlertDialog>
+                              </DialogTrigger>
+                            ) : (
+                              <Badge variant="neutral">Read-Only View</Badge>
+                            )}
                           </Flex>
                         </Flex>
 
                         {/* 1. Name / Rename Group */}
-                        <Flex gap="size-100" alignItems="end">
-                          <TextField
-                            label={`Person Name (synced to ${settings.metadataProperty} on ${activeGroup.assetCount} asset(s))`}
-                            value={groupNameInput}
-                            onChange={setGroupNameInput}
-                            placeholder={`Leave blank to use placeholder (${activeGroup.autoLabel})`}
-                            width="100%"
-                          />
-                          <Button variant="cta" onPress={handleRenameActiveGroup}>
-                            Save Name
-                          </Button>
-                        </Flex>
+                        {canManageGroups && (
+                          <Flex gap="size-100" alignItems="end">
+                            <TextField
+                              label={`Person Name (synced to ${settings.metadataProperty} on ${activeGroup.assetCount} asset(s))`}
+                              value={groupNameInput}
+                              onChange={setGroupNameInput}
+                              placeholder={`Leave blank to use placeholder (${activeGroup.autoLabel})`}
+                              width="100%"
+                            />
+                            <Button variant="cta" onPress={handleRenameActiveGroup}>
+                              Save Name
+                            </Button>
+                          </Flex>
+                        )}
 
                         {/* 2. Combine Entire Group Into Another Group */}
-                        {groupOptions.length > 1 && (
+                        {canManageGroups && groupOptions.length > 1 && (
                           <Flex gap="size-100" alignItems="end">
                             <Picker
                               label="Combine this entire group into another group:"
@@ -1061,7 +1088,9 @@ export default function AdminConsole() {
                             Faces in this Group ({activeGroup.faceCount})
                           </Text>
                           <Text UNSAFE_style={{ fontSize: 11, color: '#64748b' }}>
-                            Check face(s) below to remove/split or move
+                            {canManageGroups
+                              ? 'Check face(s) below to remove/split or move'
+                              : `${activeGroup.assetCount} asset(s)`}
                           </Text>
                         </Flex>
 
@@ -1073,17 +1102,18 @@ export default function AdminConsole() {
                           }}
                         >
                           {activeGroup.faces.map((face) => {
-                            const isFaceSelected = selectedFaceIds.includes(face.faceId);
+                            const isFaceSelected = canManageGroups && selectedFaceIds.includes(face.faceId);
                             return (
                               <div
                                 key={face.faceId}
-                                onClick={() =>
+                                onClick={() => {
+                                  if (!canManageGroups) return;
                                   setSelectedFaceIds((prev) =>
                                     prev.includes(face.faceId)
                                       ? prev.filter((id) => id !== face.faceId)
                                       : [...prev, face.faceId]
-                                  )
-                                }
+                                  );
+                                }}
                                 style={{
                                   border: isFaceSelected
                                     ? '2px solid #0284c7'
@@ -1170,9 +1200,11 @@ export default function AdminConsole() {
                                   <Text UNSAFE_style={{ fontSize: 10, color: '#64748b' }}>
                                     {face.confidence}% conf
                                   </Text>
-                                  <Checkbox isSelected={isFaceSelected}>
-                                    <span style={{ fontSize: 11 }}>Select</span>
-                                  </Checkbox>
+                                  {canManageGroups && (
+                                    <Checkbox isSelected={isFaceSelected}>
+                                      <span style={{ fontSize: 11 }}>Select</span>
+                                    </Checkbox>
+                                  )}
                                 </Flex>
                               </div>
                             );
@@ -1194,7 +1226,7 @@ export default function AdminConsole() {
                         )}
 
                         {/* Actions when 1 or more faces are checked */}
-                        {selectedFaceIds.length > 0 && (
+                        {canManageGroups && selectedFaceIds.length > 0 && (
                           <View
                             backgroundColor="gray-100"
                             padding="size-150"
@@ -1420,6 +1452,33 @@ export default function AdminConsole() {
                         logos and icons are never sent to AWS. Folder scans also skip images that
                         were already scanned unless &quot;Include already-scanned images&quot; is
                         checked.
+                      </Text>
+
+                      <Divider size="S" />
+
+                      <Heading level={4} margin={0}>
+                        Face Curation &amp; Role Permissions
+                      </Heading>
+                      <Switch
+                        isSelected={settings.restrictCuratorActionsToAdmins}
+                        onChange={(val) =>
+                          setSettings((s) => ({ ...s, restrictCuratorActionsToAdmins: val }))
+                        }
+                      >
+                        Restrict group management (name, rename, merge, split, delete) to
+                        Administrators &amp; Curator Groups only
+                      </Switch>
+                      <TextField
+                        label="Allowed AEM Curator Groups (comma-separated)"
+                        value={settings.curatorGroupsText}
+                        onChange={(v) => setSettings((s) => ({ ...s, curatorGroupsText: v }))}
+                        placeholder="administrators, dam-administrators, face-curators"
+                        width="100%"
+                      />
+                      <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>
+                        When enabled, only members of these AEM user groups can name, rename,
+                        combine/merge, split, or delete Face Groups. All other DAM users get a
+                        read-only view of recognized faces.
                       </Text>
                     </Flex>
                   </Well>
