@@ -118,6 +118,9 @@ So that recognized people appear on Asset Details / Properties and are searchabl
 
    # Deploy actions and web bundle to Adobe I/O Runtime & CDN
    aio app deploy
+
+   # Subsequent updates to an already-published Production workspace (skips Exchange revoke/re-approve):
+   npx aio app deploy --force-deploy
    ```
 4. At the end of `aio app deploy`, the CLI prints the **AEM Assets View Extension Manager Preview URL**:
    ```text

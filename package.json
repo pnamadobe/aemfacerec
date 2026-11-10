@@ -7,6 +7,7 @@
     "test": "node --test src/aem-assets-assetsview-1/test/*.test.js",
     "build": "aio app build",
     "deploy": "aio app deploy",
+    "deploy:force": "aio app deploy --force-deploy",
     "undeploy": "aio app undeploy",
     "run": "aio app run"
   },
