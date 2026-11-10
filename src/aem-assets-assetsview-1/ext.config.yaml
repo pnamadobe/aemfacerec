@@ -28,6 +28,22 @@ runtimeManifest:
             require-adobe-auth: false
             provide-api-key: true
             final: true
+        ingest-event:
+          function: actions/ingest/index.js
+          web: 'no'
+          runtime: nodejs:22
+          inputs:
+            LOG_LEVEL: debug
+            AEM_HOST: $AEM_HOST
+            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+            AEM_SC_JSON: $AEM_SC_JSON
+            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
+          limits:
+            timeout: 120000
+            memorySize: 512
+          annotations:
+            provide-api-key: true
+            final: true
         groups:
           function: actions/groups/index.js
           web: 'yes'
