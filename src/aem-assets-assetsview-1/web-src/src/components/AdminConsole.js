@@ -620,20 +620,6 @@ export default function AdminConsole() {
     }
   };
 
-  const handleClearAllData = async () => {
-    try {
-      await api.clearAllData(hostContext);
-      setSelectedGroupId(null);
-      await loadAll();
-      setBanner({
-        type: 'positive',
-        text: 'Cleared all face groups and asset records.'
-      });
-    } catch (err) {
-      setBanner({ type: 'negative', text: err.message });
-    }
-  };
-
   return (
     <View padding="size-300" maxWidth="1280px" marginX="auto">
       <Flex direction="column" gap="size-250">
@@ -674,22 +660,6 @@ export default function AdminConsole() {
             <Checkbox isSelected={rescanExisting} onChange={setRescanExisting} isDisabled={scanning}>
               <span style={{ fontSize: 12 }}>Include already-scanned images</span>
             </Checkbox>
-            <DialogTrigger>
-              <ActionButton isDisabled={stats.totalGroups === 0 && stats.totalFaces === 0}>
-                Clear All Data
-              </ActionButton>
-              <AlertDialog
-                variant="destructive"
-                title="Clear All Face Groups & Indexed Data?"
-                primaryActionLabel="Clear All Data"
-                cancelLabel="Cancel"
-                onPrimaryAction={handleClearAllData}
-              >
-                Are you sure you want to permanently remove all {stats.totalGroups} Face
-                Group(s) and {stats.totalFaces} indexed face record(s)? This action cannot
-                be undone.
-              </AlertDialog>
-            </DialogTrigger>
             {guestConnection ? (
               <Button
                 variant="secondary"

@@ -282,6 +282,36 @@ test('5. AEM Folder Processing Profile inspection checks ancestor folder jcr:con
   );
   assert.equal(eligibleRes.eligible, true);
 
+  // Also test folders with spaces (URL-encoded) and hyphenated JCR profile node name ('face-recognition')
+  const aemSlug = createAemClient({
+    aemHost: 'https://author-p12345-e67890.adobeaemcloud.com',
+    token: 'test-ims-token',
+    fetchImpl: async (url) => {
+      if (url.includes('/content/dam/26H2/hertz/hertz-2026-fall%20shoot/jcr:content.2.json')) {
+        return {
+          ok: true,
+          async json() {
+            return {
+              metadata: {
+                'dam:processingProfile': '/conf/global/settings/dam/processing/face-recognition'
+              }
+            };
+          }
+        };
+      }
+      return { ok: false, status: 404 };
+    }
+  });
+  const slugRes = await aemSlug.checkFolderEligibility(
+    '/content/dam/26H2/hertz/hertz-2026-fall shoot/sub/photo.jpg',
+    {
+      requireProcessingProfile: true,
+      processingProfileName: 'Face Recognition',
+      enabledFolders: ['/content/dam']
+    }
+  );
+  assert.equal(slugRes.eligible, true);
+
   const ineligibleRes = await aem.checkFolderEligibility(
     '/content/dam/other-folder/hero.jpg',
     {

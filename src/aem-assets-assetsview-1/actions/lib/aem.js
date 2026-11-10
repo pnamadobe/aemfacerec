@@ -383,26 +383,40 @@ function createAemClient({
       const segments = cleanPath.split('/').filter(Boolean);
       segments.pop();
 
-      const targetProfile = (settings.processingProfileName || 'Face Recognition').toLowerCase();
+      const targetProfile = (settings.processingProfileName || 'Face Recognition').toLowerCase().trim();
+      const targetProfileSlug = targetProfile.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 
       while (segments.length >= 2 && segments[0] === 'content' && segments[1] === 'dam') {
         const folderPath = `/${segments.join('/')}`;
+        const encodedFolderPath = encodeDamPath(folderPath);
         try {
-          const url = `${baseUrl}${folderPath}/jcr:content.1.json`;
-          const jcrContent = await fetchAemJson(url);
+          const url = `${baseUrl}${encodedFolderPath}/jcr:content.2.json`;
+          let jcrContent;
+          try {
+            jcrContent = await fetchAemJson(url);
+          } catch (e) {
+            jcrContent = await fetchAemJson(`${baseUrl}${encodedFolderPath}/jcr:content.1.json`);
+          }
           const assignedProfile = String(
             jcrContent['dam:processingProfile'] ||
               jcrContent.processingProfile ||
               jcrContent.metadata?.['dam:processingProfile'] ||
+              jcrContent.metadata?.processingProfile ||
               ''
           ).toLowerCase();
+          const assignedProfileSlug = assignedProfile.replace(/[^a-z0-9/]+/g, '-');
 
           const explicitFlag =
             jcrContent.faceRecognitionEnabled === true ||
             jcrContent.metadata?.faceRecognitionEnabled === true ||
             jcrContent.metadata?.['xdm:faceRecognitionEnabled'] === 'true';
 
-          if (explicitFlag || (assignedProfile && assignedProfile.includes(targetProfile))) {
+          const profileMatched =
+            Boolean(assignedProfile) &&
+            (assignedProfile.includes(targetProfile) ||
+              (Boolean(targetProfileSlug) && assignedProfileSlug.includes(targetProfileSlug)));
+
+          if (explicitFlag || profileMatched) {
             return {
               eligible: true,
               reason: `Folder ${folderPath} has Processing Profile '${assignedProfile || targetProfile}' enabled`
