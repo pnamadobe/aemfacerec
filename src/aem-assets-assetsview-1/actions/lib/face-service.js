@@ -28,6 +28,74 @@ function generateGroupId() {
 }
 
 /**
+ * Strips the `urn:aaid:aem:` prefix so `urn:aaid:aem:123` and `123` compare as the same id.
+ */
+function stripUrnPrefix(assetId) {
+  if (!assetId) return '';
+  return String(assetId).trim().replace(/^urn:aaid:aem:/i, '');
+}
+
+function safeNormalizeDamPath(p) {
+  if (!p) return '';
+  try {
+    return normalizeDamPath(decodeURIComponent(String(p)));
+  } catch (e) {
+    return normalizeDamPath(String(p));
+  }
+}
+
+/**
+ * Returns every record in `db.assets` that represents the same asset (matched by id,
+ * `urn:aaid:aem:`-stripped id, `uuid` field, or normalized DAM path) as `{ key, record }` pairs.
+ */
+function findMatchingAssetEntries(db, { assetId, assetPath } = {}) {
+  const assets = db?.assets || {};
+  const rawId = stripUrnPrefix(assetId);
+  const cleanPath = safeNormalizeDamPath(assetPath);
+  const matches = [];
+  const seenKeys = new Set();
+
+  function add(key, record) {
+    if (record && !seenKeys.has(key)) {
+      seenKeys.add(key);
+      matches.push({ key, record });
+    }
+  }
+
+  if (assetId && assets[assetId]) add(assetId, assets[assetId]);
+  if (rawId && assets[rawId]) add(rawId, assets[rawId]);
+  if (rawId && assets[`urn:aaid:aem:${rawId}`]) add(`urn:aaid:aem:${rawId}`, assets[`urn:aaid:aem:${rawId}`]);
+
+  for (const [key, rec] of Object.entries(assets)) {
+    if (seenKeys.has(key) || !rec) continue;
+    if (rawId && (stripUrnPrefix(rec.assetId) === rawId || stripUrnPrefix(rec.uuid) === rawId)) {
+      add(key, rec);
+      continue;
+    }
+    if (cleanPath && safeNormalizeDamPath(rec.assetPath) === cleanPath) {
+      add(key, rec);
+    }
+  }
+  return matches;
+}
+
+/**
+ * Canonical storage key for an asset:
+ * - A real id (UUID / `urn:aaid` / test id) is stored without the `urn:aaid:aem:` prefix,
+ *   unless it is the synthetic hex-of-path fallback produced when AEM is unreachable.
+ * - Otherwise the normalized DAM path is used.
+ */
+function canonicalAssetKey(assetId, assetPath) {
+  const cleanPath = safeNormalizeDamPath(assetPath);
+  const raw = stripUrnPrefix(assetId);
+  const syntheticHex = cleanPath ? Buffer.from(cleanPath).toString('hex').slice(0, 24) : '';
+  if (raw && !raw.startsWith('/') && raw !== syntheticHex) {
+    return raw;
+  }
+  return cleanPath || raw;
+}
+
+/**
  * Computes the resolved display name for a group based on settings.
  */
 function getGroupEffectiveMetadataName(group, settings) {
@@ -120,7 +188,9 @@ async function createFaceService({
   function summarizeGroup(group, faces, { includeCover = true } = {}) {
     if (!group) return null;
     const memberFaces = (group.faceIds || []).map((id) => faces[id]).filter(Boolean);
-    const uniqueAssets = new Set(memberFaces.map((f) => f.assetId).filter(Boolean));
+    const uniqueAssets = new Set(
+      memberFaces.map((f) => safeNormalizeDamPath(f.assetPath) || f.assetId).filter(Boolean)
+    );
     const coverFace = faces[group.coverFaceId] || memberFaces[0] || null;
 
     const summary = {
@@ -177,9 +247,13 @@ async function createFaceService({
     const synced = [];
     const failed = [];
 
+    const seenPaths = new Set();
     await mapWithConcurrency(uniqueAssetIds, AEM_WRITE_CONCURRENCY, async (assetId) => {
-      const assetRecord = db.assets[assetId];
+      const assetRecord = findAssetRecord(db, assetId, null);
       if (!assetRecord) return;
+      const dedupeKey = safeNormalizeDamPath(assetRecord.assetPath) || assetRecord.assetId;
+      if (seenPaths.has(dedupeKey)) return;
+      seenPaths.add(dedupeKey);
 
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
 
@@ -230,75 +304,74 @@ async function createFaceService({
   }
 
   /**
-   * Removes faces previously indexed for an asset (used before re-scanning).
+   * Removes faces previously indexed for an asset (used before re-scanning), across all
+   * duplicate records for the same asset (e.g. one keyed by path and one keyed by UUID).
    *
    * All Rekognition calls run first and are idempotent; the in-memory db is only changed
    * once they have all succeeded, so a failure leaves the db untouched and safe to retry.
    */
-  async function removeExistingAssetFaces(assetId, db, rekognition) {
-    const existingAsset = db.assets[assetId];
-    if (!existingAsset || !Array.isArray(existingAsset.faceIds) || existingAsset.faceIds.length === 0) {
-      return;
+  async function removeExistingAssetFaces({ assetId, assetPath, canonicalKey }, db, rekognition) {
+    const entries = findMatchingAssetEntries(db, { assetId, assetPath });
+    const oldFaceIds = Array.from(
+      new Set(entries.flatMap(({ record }) => record.faceIds || []).filter(Boolean))
+    );
+
+    if (oldFaceIds.length > 0) {
+      const byGroup = {};
+      for (const fId of oldFaceIds) {
+        const face = db.faces[fId];
+        if (face && face.groupId) {
+          byGroup[face.groupId] = byGroup[face.groupId] || [];
+          byGroup[face.groupId].push(fId);
+        }
+      }
+
+      // 1. Rekognition (no db changes yet)
+      const emptiedGroupIds = [];
+      for (const [groupId, fIds] of Object.entries(byGroup)) {
+        await rekognition.disassociateFaces(groupId, fIds);
+        const grp = db.groups[groupId];
+        if (grp && (grp.faceIds || []).every((id) => fIds.includes(id))) {
+          await rekognition.deleteGroup(groupId);
+          emptiedGroupIds.push(groupId);
+        }
+      }
+      await rekognition.deleteFaces(oldFaceIds);
+
+      // 2. Db
+      for (const [groupId, fIds] of Object.entries(byGroup)) {
+        const grp = db.groups[groupId];
+        if (!grp) continue;
+        if (emptiedGroupIds.includes(groupId)) {
+          delete db.groups[groupId];
+          continue;
+        }
+        const removed = new Set(fIds);
+        grp.faceIds = (grp.faceIds || []).filter((id) => !removed.has(id));
+        if (removed.has(grp.coverFaceId)) {
+          grp.coverFaceId = grp.faceIds[0];
+        }
+      }
+      for (const fId of oldFaceIds) {
+        delete db.faces[fId];
+      }
     }
 
-    const oldFaceIds = [...existingAsset.faceIds];
-    const byGroup = {};
-    for (const fId of oldFaceIds) {
-      const face = db.faces[fId];
-      if (face && face.groupId) {
-        byGroup[face.groupId] = byGroup[face.groupId] || [];
-        byGroup[face.groupId].push(fId);
+    for (const { key, record } of entries) {
+      if (canonicalKey && key !== canonicalKey) {
+        delete db.assets[key];
+      } else {
+        record.faceIds = [];
       }
     }
-
-    // 1. Rekognition (no db changes yet)
-    const emptiedGroupIds = [];
-    for (const [groupId, fIds] of Object.entries(byGroup)) {
-      await rekognition.disassociateFaces(groupId, fIds);
-      const grp = db.groups[groupId];
-      if (grp && (grp.faceIds || []).every((id) => fIds.includes(id))) {
-        await rekognition.deleteGroup(groupId);
-        emptiedGroupIds.push(groupId);
-      }
-    }
-    await rekognition.deleteFaces(oldFaceIds);
-
-    // 2. Db
-    for (const [groupId, fIds] of Object.entries(byGroup)) {
-      const grp = db.groups[groupId];
-      if (!grp) continue;
-      if (emptiedGroupIds.includes(groupId)) {
-        delete db.groups[groupId];
-        continue;
-      }
-      const removed = new Set(fIds);
-      grp.faceIds = (grp.faceIds || []).filter((id) => !removed.has(id));
-      if (removed.has(grp.coverFaceId)) {
-        grp.coverFaceId = grp.faceIds[0];
-      }
-    }
-    for (const fId of oldFaceIds) {
-      delete db.faces[fId];
-    }
-    existingAsset.faceIds = [];
 
     // 3. Avatars (best effort)
     await Promise.all(oldFaceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
   }
 
-  /**
-   * Finds an existing asset record by id (with or without the urn prefix) or by DAM path.
-   */
   function findAssetRecord(db, assetId, assetPath) {
-    if (assetId) {
-      const raw = String(assetId).replace(/^urn:aaid:aem:/i, '');
-      const byId = db.assets[assetId] || db.assets[raw] || db.assets[`urn:aaid:aem:${raw}`];
-      if (byId) return byId;
-    }
-    if (assetPath) {
-      return Object.values(db.assets).find((a) => a.assetPath === assetPath) || null;
-    }
-    return null;
+    const entries = findMatchingAssetEntries(db, { assetId, assetPath });
+    return entries[0]?.record || null;
   }
 
   function skippedResult(assetPath, reasonCode, reason) {
@@ -357,8 +430,10 @@ async function createFaceService({
       }
     }
 
+    // Only skip getAssetInfo when the caller already passed a real asset id (not a path)
+    const callerHasRealId = Boolean(assetId && !stripUrnPrefix(assetId).startsWith('/'));
     const info =
-      assetId && cleanPath
+      callerHasRealId && cleanPath
         ? {
             assetId,
             assetPath: cleanPath,
@@ -367,9 +442,12 @@ async function createFaceService({
           }
         : await aemClient.getAssetInfo(cleanPath);
 
-    const resolvedAssetId = info.assetId;
     const resolvedPath = info.assetPath;
-    const resolvedTitle = info.assetTitle;
+    const resolvedAssetId = canonicalAssetKey(
+      callerHasRealId ? assetId : info.assetId,
+      resolvedPath
+    );
+    const resolvedTitle = assetTitle || info.assetTitle;
 
     // 2. File type allowlist (unknown types are allowed through; the rendition is still checked)
     const allowedTypes = (settings.allowedImageTypes || []).map((t) => String(t).toLowerCase());
@@ -417,8 +495,12 @@ async function createFaceService({
         prepared.push({ ...detected, avatar, avatarFile, match });
       }
 
-      // Re-scan: drop this asset's previous faces (Rekognition first, then db)
-      await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
+      // Re-scan: drop this asset's previous faces across any legacy keys (Rekognition first, then db)
+      await removeExistingAssetFaces(
+        { assetId: resolvedAssetId, assetPath: resolvedPath, canonicalKey: resolvedAssetId },
+        db,
+        rekognition
+      );
     } catch (err) {
       await discardIndexedFaces(indexedFaceIds, rekognition);
       throw err;
@@ -574,13 +656,8 @@ async function createFaceService({
         storage.getDatabase()
       ]);
 
-      const indexedByPath = {};
-      for (const rec of Object.values(db.assets || {})) {
-        if (rec.assetPath) indexedByPath[rec.assetPath] = rec;
-      }
-
       const enrichedAssets = (browsed.assets || []).map((a) => {
-        const indexed = db.assets[a.assetId] || indexedByPath[a.assetPath] || null;
+        const indexed = findAssetRecord(db, a.assetId, a.assetPath);
         return {
           ...a,
           scanned: Boolean(indexed),
@@ -821,7 +898,9 @@ async function createFaceService({
         namedCount,
         unnamedCount: all.length - namedCount,
         totalFaces: Object.keys(db.faces).length,
-        totalAssets: Object.keys(db.assets).length,
+        totalAssets: new Set(
+          Object.values(db.assets || {}).map((a) => safeNormalizeDamPath(a?.assetPath) || a?.assetId)
+        ).size,
         settings: {
           metadataProperty: settings.metadataProperty,
           includeUnnamedInMetadata: settings.includeUnnamedInMetadata

@@ -22,6 +22,8 @@ const { withRetry, isNetworkError, RETRYABLE_HTTP_STATUSES } = require('./retry'
 // AWS Rekognition accepts at most 5 MB of image bytes, so anything larger is useless and
 // only risks exhausting action memory.
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const FOLDER_PAGE_SIZE = 200;
+const MAX_FOLDER_PAGES = 50; // up to 10,000 entries per folder
 
 class RetryableHttpStatus extends Error {
   constructor(response) {
@@ -528,20 +530,35 @@ function createAemClient({
       let excludedAssetCount = 0;
 
       const relFolder = toApiAssetsRelativePath(cleanFolder);
-      const apiPath = relFolder ? `/api/assets/${relFolder}.json?limit=200` : '/api/assets.json?limit=200';
-      const url = `${baseUrl}${apiPath}`;
-      const data = await fetchAemJson(url);
+      const basePath = relFolder ? `/api/assets/${relFolder}.json` : '/api/assets.json';
 
-      const entities = data.entities || [];
       const folders = [];
       const assets = [];
+      const seenPaths = new Set();
+      let folderTitle = null;
+      let offset = 0;
 
-      for (const entity of entities) {
+      for (let page = 0; page < MAX_FOLDER_PAGES; page++) {
+        const data = await fetchAemJson(
+          `${baseUrl}${basePath}?limit=${FOLDER_PAGE_SIZE}&offset=${offset}`
+        );
+        if (page === 0) {
+          folderTitle = data.properties?.['dc:title'] || data.properties?.title || null;
+        }
+        const entities = data.entities || [];
+        if (entities.length === 0) break;
+
+        let newInPage = 0;
+        for (const entity of entities) {
         const classes = entity.class || [];
         const name = entity.properties?.name || '';
         if (!name) continue;
         const title = entity.properties?.['dc:title'] || entity.properties?.title || name;
         const fullPath = `${cleanFolder.replace(/\/$/, '')}/${name}`;
+
+        if (seenPaths.has(fullPath)) continue;
+        seenPaths.add(fullPath);
+        newInPage++;
 
         if (classes.includes('assets/folder')) {
           folders.push({
@@ -573,15 +590,20 @@ function createAemClient({
             });
           }
         }
+        }
+
+        const hasNextLink = Array.isArray(data.links) && data.links.some((l) => {
+          const rel = l?.rel;
+          return Array.isArray(rel) ? rel.includes('next') : rel === 'next';
+        });
+        // Stop once we see a short page (with no 'next' link) or a server that ignores offset
+        if (newInPage === 0 || (entities.length < FOLDER_PAGE_SIZE && !hasNextLink)) break;
+        offset += entities.length;
       }
 
       return {
         folderPath: cleanFolder,
-        folderTitle:
-          data.properties?.['dc:title'] ||
-          data.properties?.title ||
-          cleanFolder.split('/').pop() ||
-          'Assets',
+        folderTitle: folderTitle || cleanFolder.split('/').pop() || 'Assets',
         folders,
         assets,
         excludedAssetCount
