@@ -718,10 +718,10 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
 
   // 2. Per-card "Select to Merge" checkboxes are hidden by default until Bulk Merge Mode is toggled ON
   assert.equal(screen.queryAllByText('Select to Merge').length, 0);
-  const bulkSwitch = screen.getByText('Bulk Merge Mode');
-  fireEvent.click(bulkSwitch);
+  const bulkInput = screen.getByLabelText('Bulk Merge Mode');
+  fireEvent.click(bulkInput);
   await waitFor(() => assert.ok(screen.queryAllByText('Select to Merge').length > 0));
-  fireEvent.click(bulkSwitch);
+  fireEvent.click(bulkInput);
   await waitFor(() => assert.equal(screen.queryAllByText('Select to Merge').length, 0));
 
   // 3. Right-hand Manage Group column is sticky so it follows scroll
