@@ -1,7 +1,7 @@
 const { createFaceService } = require('../lib/face-service');
 const { createStorage } = require('../lib/storage');
 const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
-const { errorResponse } = require('../lib/security');
+const { PublicError, isRuntimeEnvironment, errorResponse } = require('../lib/security');
 
 const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -90,6 +90,12 @@ async function main(params = {}) {
 
     const operation = params.operation || 'ingestAsset';
 
+    if (operation === 'browseFolder' || operation === 'scanFolder') {
+      if (ctx.isWeb && isRuntimeEnvironment() && !ctx.token) {
+        throw new PublicError('Authentication required.', 401);
+      }
+    }
+
     if (operation === 'browseFolder') {
       const result = await faceService.browseFolder({
         folderPath: params.folderPath || '/content/dam'
@@ -127,8 +133,10 @@ async function main(params = {}) {
       };
     }
 
-    // If invoked directly from the UI ("Scan / Re-scan Asset"), force=true bypasses folder check
-    const isManualTrigger = parseFlag(params.force, false);
+    // If invoked directly from the UI ("Scan / Re-scan Asset") with a user token, force=true
+    // bypasses the folder check. Unauthenticated I/O Event webhooks are ALWAYS force=false so
+    // they strictly require the Face Recognition Processing Profile on the folder.
+    const isManualTrigger = Boolean(ctx.token || !ctx.isWeb) && parseFlag(params.force, false);
 
     // R10: I/O Event idempotency — skip duplicate/retry deliveries of the same event
     if (!isManualTrigger && eventId) {

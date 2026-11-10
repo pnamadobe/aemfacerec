@@ -217,8 +217,9 @@ test('S9: tokens passed as a body/query parameter are ignored', () => {
   assert.equal(ctx.token, '');
 });
 
-test('S1: anonymous web requests are rejected inside Runtime', async () => {
+test('S1: anonymous web requests are rejected inside Runtime (while I/O Events webhook payloads are accepted onto the force=false path)', async () => {
   const groupsAction = require('../actions/groups/index');
+  const ingestAction = require('../actions/ingest/index');
   await withEnv({ __OW_NAMESPACE: 'test-ns' }, async () => {
     const res = await groupsAction.main({
       __ow_method: 'post',
@@ -228,6 +229,40 @@ test('S1: anonymous web requests are rejected inside Runtime', async () => {
       ENCRYPTION_SECRET: 'a-sufficiently-long-random-secret'
     });
     assert.equal(res.statusCode, 401);
+
+    const unauthScan = await ingestAction.main({
+      __ow_method: 'post',
+      __ow_headers: {},
+      operation: 'scanFolder',
+      folderPath: '/content/dam',
+      AEM_HOST: AEM,
+      ENCRYPTION_SECRET: 'a-sufficiently-long-random-secret'
+    });
+    assert.equal(unauthScan.statusCode, 401);
+
+    // Adobe I/O Events webhook challenge and event payload are accepted on the web action
+    const challengeRes = await ingestAction.main({
+      __ow_method: 'get',
+      __ow_headers: {},
+      challenge: 'webhook-challenge-abc'
+    });
+    assert.equal(challengeRes.statusCode, 200);
+    assert.equal(challengeRes.body.challenge, 'webhook-challenge-abc');
+
+    const ioEvtCtx = buildActionContext({
+      __ow_method: 'post',
+      __ow_headers: {},
+      AEM_HOST: AEM,
+      aemHost: 'https://evil.example.com',
+      AEM_DEV_TOKEN: 'svc-token',
+      event: {
+        '@id': 'evt-1',
+        'activitystreams:object': { 'xdmAsset:path': '/content/dam/test/a.jpg' }
+      }
+    });
+    assert.equal(ioEvtCtx.isIoEvent, true);
+    assert.equal(ioEvtCtx.aemHost, AEM, 'I/O Event webhook cannot override configured AEM_HOST');
+    assert.deepEqual(ioEvtCtx.serviceCredentials, { scJson: '', devToken: 'svc-token' });
   });
 });
 

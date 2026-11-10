@@ -20,13 +20,15 @@ runtimeManifest:
             AEM_HOST: $AEM_HOST
             AEM_AUTHOR_URL: $AEM_AUTHOR_URL
             AEM_ALLOWED_HOSTS: $AEM_ALLOWED_HOSTS
+            AEM_SC_JSON: $AEM_SC_JSON
+            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
             ENCRYPTION_SECRET: $ENCRYPTION_SECRET
             ENABLE_MAINTENANCE_OPS: $ENABLE_MAINTENANCE_OPS
           limits:
             timeout: 120000
             memorySize: 512
           annotations:
-            require-adobe-auth: true
+            require-adobe-auth: false
             provide-api-key: true
             final: true
         ingest-event:
