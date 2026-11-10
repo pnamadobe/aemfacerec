@@ -536,7 +536,7 @@ export default function AssetDetailsSidePanel() {
                             label="Person Name (updates xdm:faceNames)"
                             value={editingNameValue}
                             onChange={setEditingNameValue}
-                            placeholder="e.g. Sarah Jenkins"
+                            placeholder="Enter person's name..."
                             width="100%"
                           />
                           <Button
@@ -559,42 +559,7 @@ export default function AssetDetailsSidePanel() {
                           >
                             {face.groupName ? 'Rename' : 'Name Person'}
                           </ActionButton>
-
-                          <ActionButton
-                            onPress={() => handleSplitFaceToOwnGroup(face)}
-                          >
-                            Split to New Group
-                          </ActionButton>
-
-                          {otherGroups.length > 0 && (
-                            <ActionButton
-                              onPress={() =>
-                                setMovingFaceId(isMoving ? null : face.faceId)
-                              }
-                            >
-                              {isMoving ? 'Close Move' : 'Combine Into...'}
-                            </ActionButton>
-                          )}
                         </Flex>
-                      )}
-
-                      {/* Move / Combine this face into another existing group */}
-                      {isMoving && otherGroups.length > 0 && (
-                        <View marginTop="size-75">
-                          <Picker
-                            label="Combine this face into existing group:"
-                            width="100%"
-                            onSelectionChange={(targetGroupId) =>
-                              handleMoveFaceToGroup(face.faceId, targetGroupId)
-                            }
-                          >
-                            {otherGroups.map((g) => (
-                              <Item key={g.groupId}>
-                                {`${g.displayName} (${g.faceCount} faces)`}
-                              </Item>
-                            ))}
-                          </Picker>
-                        </View>
                       )}
                     </Flex>
                   </Flex>
