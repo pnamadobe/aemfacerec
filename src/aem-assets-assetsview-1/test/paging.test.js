@@ -153,13 +153,19 @@ test('P2: getGroup on a 1,500-face group stays under budget and pages faces', as
   }
 });
 
-test('P2: listGroupOptions for 3,100 groups stays under budget and has no images', async () => {
+test('P2: listGroupOptions for 3,100 groups stays under budget and caps cover avatars safely', async () => {
   const res = await shared.svc.listGroupOptions();
   assert.ok(responseBytes(res) < RESPONSE_BUDGET_BYTES, `${responseBytes(res)} bytes`);
   assert.equal(res.total, 3100);
   assert.equal(res.options.length, 2000);
   assert.equal(res.truncated, true);
-  assert.deepEqual(Object.keys(res.options[0]).sort(), ['displayName', 'faceCount', 'groupId', 'isNamed']);
+  assert.deepEqual(
+    Object.keys(res.options[0]).sort(),
+    ['coverAvatarDataUrl', 'displayName', 'faceCount', 'groupId', 'isNamed']
+  );
+  // First 180 options carry a cover avatar for dropdown thumbnails; tail omits it so payload stays under budget
+  assert.ok(res.options.slice(0, 180).every((o) => Boolean(o.coverAvatarDataUrl)));
+  assert.equal(res.options[180].coverAvatarDataUrl, undefined);
 });
 
 test('P2: getAssetFaces for a 100-face crowd photo stays under budget', async () => {

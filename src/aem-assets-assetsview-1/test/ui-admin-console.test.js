@@ -502,3 +502,31 @@ test('UI cost: cost-control settings load, save, and are validated', async () =>
   fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
   await screen.findByText(/Invalid image type\(s\): application\/pdf/);
 });
+
+test('UI UX: top header is sticky so Close/actions stay visible on scroll, and combine dropdowns include face avatars', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  const heading = screen.getByText('AEM Facial Recognition & Group Management');
+  const stickyBar = heading.closest('div[style*="position: sticky"]');
+  assert.ok(stickyBar, 'top navigation bar should use position: sticky');
+  assert.equal(stickyBar.style.top, '0px');
+  assert.ok(within(stickyBar).getByText('Close'));
+
+  // Select a group and open the "Combine this entire group into another group:" Picker popover
+  const card = screen.getAllByText('Person #4').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  fireEvent.click(card);
+  await screen.findByText('Manage Group: Person #4');
+
+  const combineButtons = screen
+    .getAllByText('Combine this entire group into another group:')
+    .map((el) => el.parentElement?.querySelector('button'))
+    .filter(Boolean);
+  assert.ok(combineButtons.length > 0, 'combine Picker trigger button exists');
+  fireEvent.click(combineButtons[0]);
+
+  const listbox = await screen.findByRole('listbox');
+  const optionImgs = listbox.querySelectorAll('img');
+  assert.ok(optionImgs.length > 0, 'dropdown options render face avatar thumbnails');
+  assert.match(optionImgs[0].getAttribute('src'), /^data:image\/jpeg;base64,/);
+});

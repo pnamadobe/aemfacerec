@@ -14,6 +14,7 @@ const MAX_GROUP_PAGE_SIZE = 100;
 const GROUP_FACES_PAGE_SIZE = 60;
 const MAX_GROUP_FACES_PAGE_SIZE = 100;
 const MAX_GROUP_OPTIONS = 2000;
+const MAX_GROUP_OPTIONS_WITH_AVATARS = 180; // keeps response < 750 KB with ~3 KB cover avatars
 const {
   AVATAR_SIZE,
   getImageDimensions,
@@ -909,9 +910,11 @@ async function createFaceService({
     },
 
     /**
-     * Lightweight list (no images) used by the "combine into..." pickers.
+     * Option list used by the "combine into..." pickers. Includes cover avatars for the first
+     * `MAX_GROUP_OPTIONS_WITH_AVATARS` groups so dropdown items can render a face thumbnail
+     * while keeping the response well under the 1 MB Runtime payload limit.
      */
-    async listGroupOptions({ query = '', limit = MAX_GROUP_OPTIONS } = {}) {
+    async listGroupOptions({ query = '', limit = MAX_GROUP_OPTIONS, includeAvatars = true } = {}) {
       const db = await storage.getDatabase();
       const optionLimit = clampInt(limit, { min: 1, max: MAX_GROUP_OPTIONS, fallback: MAX_GROUP_OPTIONS });
       const normalizedQuery = String(query || '').trim().toLowerCase().slice(0, 200);
@@ -922,12 +925,19 @@ async function createFaceService({
         .sort(compareGroupSummaries);
 
       return {
-        options: matched.slice(0, optionLimit).map((g) => ({
-          groupId: g.groupId,
-          displayName: g.displayName,
-          isNamed: g.isNamed,
-          faceCount: g.faceCount
-        })),
+        options: matched.slice(0, optionLimit).map((g, idx) => {
+          const item = {
+            groupId: g.groupId,
+            displayName: g.displayName,
+            isNamed: g.isNamed,
+            faceCount: g.faceCount
+          };
+          if (includeAvatars && idx < MAX_GROUP_OPTIONS_WITH_AVATARS) {
+            const coverFace = g.coverFaceId ? db.faces[g.coverFaceId] : null;
+            item.coverAvatarDataUrl = coverFace?.avatarDataUrl || null;
+          }
+          return item;
+        }),
         total: matched.length,
         truncated: matched.length > optionLimit
       };

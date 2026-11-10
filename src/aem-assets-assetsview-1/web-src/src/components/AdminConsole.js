@@ -30,6 +30,49 @@ import { extensionId, STORAGE_KEY_CTX } from './Constants';
 const GROUP_PAGE_SIZE = 60;
 const GROUP_FACES_PAGE_SIZE = 60;
 
+/**
+ * Renders a group option inside a Spectrum <Picker> with a circular face avatar thumbnail.
+ */
+function renderGroupPickerItem(g, { includeFaceCount = true } = {}) {
+  const label = includeFaceCount ? `${g.displayName} (${g.faceCount} faces)` : g.displayName;
+  return (
+    <Item key={g.groupId} textValue={label}>
+      <Text>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          {g.coverAvatarDataUrl ? (
+            <img
+              src={g.coverAvatarDataUrl}
+              alt=""
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: '50%',
+                objectFit: 'cover',
+                border: '1px solid #cbd5e1',
+                flexShrink: 0,
+                verticalAlign: 'middle'
+              }}
+            />
+          ) : (
+            <span
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: '50%',
+                background: '#e2e8f0',
+                display: 'inline-block',
+                flexShrink: 0,
+                verticalAlign: 'middle'
+              }}
+            />
+          )}
+          <span>{label}</span>
+        </span>
+      </Text>
+    </Item>
+  );
+}
+
 export default function AdminConsole() {
   const navigate = useNavigate();
 
@@ -513,7 +556,18 @@ export default function AdminConsole() {
   return (
     <View padding="size-300" maxWidth="1280px" marginX="auto">
       <Flex direction="column" gap="size-250">
-        {/* Top Navigation Header */}
+        {/* Sticky Top Navigation Header (stays visible when scrolling) */}
+        <div
+          style={{
+            position: 'sticky',
+            top: 0,
+            zIndex: 50,
+            background: '#ffffff',
+            paddingTop: 8,
+            paddingBottom: 12,
+            borderBottom: '1px solid #e2e8f0'
+          }}
+        >
         <Flex justifyContent="space-between" alignItems="center" wrap gap="size-150">
           <View>
             <Heading level={1} margin={0}>
@@ -572,6 +626,7 @@ export default function AdminConsole() {
             )}
           </Flex>
         </Flex>
+        </div>
 
         {banner && (
           <View
@@ -679,9 +734,9 @@ export default function AdminConsole() {
                             >
                               {groupOptions
                                 .filter((g) => selectedGroupIdsForMerge.includes(g.groupId))
-                                .map((g) => (
-                                  <Item key={g.groupId}>{g.displayName}</Item>
-                                ))}
+                                .map((g) =>
+                                  renderGroupPickerItem(g, { includeFaceCount: false })
+                                )}
                             </Picker>
                             <Button
                               variant="cta"
@@ -905,11 +960,7 @@ export default function AdminConsole() {
                             >
                               {groupOptions
                                 .filter((g) => g.groupId !== activeGroup.groupId)
-                                .map((g) => (
-                                  <Item key={g.groupId}>
-                                    {`${g.displayName} (${g.faceCount} faces)`}
-                                  </Item>
-                                ))}
+                                .map((g) => renderGroupPickerItem(g))}
                             </Picker>
                           </Flex>
                         )}
@@ -1043,11 +1094,7 @@ export default function AdminConsole() {
                                   >
                                     {groupOptions
                                       .filter((g) => g.groupId !== activeGroup.groupId)
-                                      .map((g) => (
-                                        <Item key={g.groupId}>
-                                          {`${g.displayName} (${g.faceCount} faces)`}
-                                        </Item>
-                                      ))}
+                                      .map((g) => renderGroupPickerItem(g))}
                                   </Picker>
                                   <Button
                                     variant="secondary"

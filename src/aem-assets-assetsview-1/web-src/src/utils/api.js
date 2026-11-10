@@ -387,11 +387,12 @@ async function invokeLocalPreviewFallback(actionName, payload) {
       });
       if (op === 'listGroupOptions') {
         return {
-          options: matched.map(({ groupId, displayName, isNamed, faceCount }) => ({
+          options: matched.map(({ groupId, displayName, isNamed, faceCount, coverAvatarDataUrl }) => ({
             groupId,
             displayName,
             isNamed,
-            faceCount
+            faceCount,
+            coverAvatarDataUrl: coverAvatarDataUrl || null
           })),
           total: matched.length,
           truncated: false
