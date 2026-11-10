@@ -159,6 +159,7 @@ export default function AdminConsole() {
   const [browsingFolder, setBrowsingFolder] = useState(false);
   const [scanResult, setScanResult] = useState(null);
   const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState(null);
   const [scanningAssetPath, setScanningAssetPath] = useState(null);
 
   const [banner, setBanner] = useState(null);
@@ -319,9 +320,12 @@ export default function AdminConsole() {
 
   const handleRunFolderScan = async () => {
     setScanning(true);
+    setScanProgress(null);
     setScanResult(null);
     try {
-      const res = await api.scanFolder(currentFolderPath, hostContext);
+      const res = await api.scanFolder(currentFolderPath, hostContext, (prog) => {
+        setScanProgress(prog);
+      });
       setScanResult(res);
       await loadAll();
       setBanner({
@@ -332,6 +336,7 @@ export default function AdminConsole() {
       setBanner({ type: 'negative', text: err.message });
     } finally {
       setScanning(false);
+      setScanProgress(null);
     }
   };
 
@@ -378,7 +383,11 @@ export default function AdminConsole() {
               onPress={handleRunFolderScan}
               isDisabled={scanning}
             >
-              {scanning ? 'Scanning Current Folder...' : 'Scan Current Folder'}
+              {scanning
+                ? scanProgress
+                  ? `Scanning Folder (${scanProgress.completed}/${scanProgress.total})...`
+                  : 'Scanning Current Folder...'
+                : 'Scan Current Folder'}
             </Button>
             <DialogTrigger>
               <ActionButton isDisabled={stats.totalGroups === 0 && stats.totalFaces === 0}>

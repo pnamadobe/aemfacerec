@@ -518,8 +518,69 @@ export const api = {
     invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx),
   browseFolder: (folderPath, ctx) =>
     invokeAction('ingest', { operation: 'browseFolder', folderPath }, ctx),
-  scanFolder: (folderPath, ctx) =>
-    invokeAction('ingest', { operation: 'scanFolder', folderPath, force: true }, ctx),
+  scanFolder: async (folderPath, ctx, onProgress) => {
+    if (!getActionUrl('ingest')) {
+      return invokeLocalPreviewFallback('ingest', { operation: 'scanFolder', folderPath });
+    }
+    const browsed = await invokeAction(
+      'ingest',
+      { operation: 'browseFolder', folderPath },
+      ctx
+    );
+    const allAssets = browsed.assets || [];
+    const resolvedFolderPath = browsed.folderPath || folderPath;
+    if (allAssets.length === 0) {
+      return {
+        folderPath: resolvedFolderPath,
+        totalAssets: 0,
+        results: []
+      };
+    }
+
+    const BATCH_SIZE = 5;
+    const allResults = [];
+    let idx = 0;
+
+    while (idx < allAssets.length) {
+      const batch = allAssets.slice(idx, idx + BATCH_SIZE).map((a) => ({
+        assetPath: a.assetPath,
+        assetId: a.assetId,
+        assetTitle: a.assetTitle
+      }));
+      const batchRes = await invokeAction(
+        'ingest',
+        {
+          operation: 'scanFolder',
+          folderPath: resolvedFolderPath,
+          assets: batch,
+          force: true
+        },
+        ctx
+      );
+      const batchResults = batchRes.results || [];
+      allResults.push(...batchResults);
+      const step = Math.max(1, batchResults.length || batch.length);
+      idx += step;
+
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress({
+            completed: Math.min(idx, allAssets.length),
+            total: allAssets.length,
+            results: allResults
+          });
+        } catch (e) {
+          // ignore progress callback error
+        }
+      }
+    }
+
+    return {
+      folderPath: resolvedFolderPath,
+      totalAssets: allAssets.length,
+      results: allResults
+    };
+  },
   getSettings: (ctx) => invokeAction('settings', { operation: 'getSettings' }, ctx),
   saveSettings: (settings, ctx) =>
     invokeAction('settings', { operation: 'saveSettings', settings }, ctx),

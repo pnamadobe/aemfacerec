@@ -338,3 +338,36 @@ test('6. Runtime Action entry points (ingest, groups, settings) handle requests 
     fs.rmSync(localStoreDir, { recursive: true, force: true });
   }
 });
+
+test('7. scanFolder processes asset batches in-memory with a single ensureCollection call and single DB save', async () => {
+  const harness = await createTestHarness();
+  try {
+    let faceSeq = 1;
+    harness.setNextMockFaces([{ faceId: `face-batch-${faceSeq++}`, confidence: 99.2 }]);
+
+    const batchAssets = [
+      { assetId: 'id:1', assetPath: '/content/dam/shoot/img1.jpg', assetTitle: 'img1.jpg' },
+      { assetId: 'id:2', assetPath: '/content/dam/shoot/img2.jpg', assetTitle: 'img2.jpg' },
+      { assetId: 'id:3', assetPath: '/content/dam/shoot/img3.jpg', assetTitle: 'img3.jpg' }
+    ];
+
+    const res = await harness.faceService.scanFolder({
+      folderPath: '/content/dam/shoot',
+      assets: batchAssets,
+      force: true
+    });
+
+    assert.equal(res.totalAssets, 3);
+    assert.equal(res.processedCount, 3);
+    assert.equal(res.hasMore, false);
+    assert.equal(res.results.length, 3);
+
+    // DescribeCollectionCommand should only be called ONCE for the entire batch of 3 assets
+    const describeCalls = harness.rekognitionCalls.filter(
+      (c) => c.cmdName === 'DescribeCollectionCommand'
+    );
+    assert.equal(describeCalls.length, 1);
+  } finally {
+    harness.cleanup();
+  }
+});

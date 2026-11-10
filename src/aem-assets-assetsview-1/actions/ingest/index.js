@@ -88,6 +88,10 @@ async function main(params = {}) {
       }
       const result = await faceService.scanFolder({
         folderPath: params.folderPath,
+        assets: Array.isArray(params.assets) ? params.assets : null,
+        offset: params.offset,
+        limit: params.limit,
+        timeBudgetMs: params.timeBudgetMs,
         force: params.force !== undefined ? Boolean(params.force) : true
       });
       return { statusCode: 200, headers: corsHeaders, body: result };

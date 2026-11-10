@@ -128,9 +128,11 @@ function createRekognitionService(settings, customClient = null) {
      * Indexes all faces detected in an image buffer into the Rekognition Collection.
      * Returns an array of detected face records with FaceId and normalized BoundingBox.
      */
-    async indexAssetFaces(imageBuffer, assetId) {
+    async indexAssetFaces(imageBuffer, assetId, { skipEnsureCollection = false } = {}) {
       const client = getClient();
-      await this.ensureCollection();
+      if (!skipEnsureCollection) {
+        await this.ensureCollection();
+      }
 
       const response = await client.send(
         new IndexFacesCommand({

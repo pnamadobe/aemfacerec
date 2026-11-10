@@ -193,131 +193,189 @@ async function createFaceService({
     existingAsset.faceIds = [];
   }
 
-  return {
-    /**
-     * Ingests a single AEM asset: checks folder processing profile eligibility,
-     * downloads web rendition, indexes faces in AWS Rekognition, crops 160x160 avatars,
-     * auto-matches or creates face groups, and writes `xdm:faceNames` back to AEM.
-     */
-    async ingestAsset({ assetPath, assetId, assetTitle, imageBuffer, force = false }) {
-      const { settings, rekognition } = await getRekognition();
-      let cleanPath = normalizeDamPath(assetPath);
-      if (!cleanPath && assetId) {
-        const resolvedFromUuid = await aemClient.resolvePathByAssetUuid(assetId);
-        if (resolvedFromUuid) {
-          cleanPath = normalizeDamPath(resolvedFromUuid);
-        }
+  /**
+   * Core single-asset ingestion routine that operates on an already-loaded `db`, `settings`,
+   * and `rekognition` instance so batch/folder operations only read and write storage once.
+   */
+  async function ingestSingleAssetInMemory({
+    assetPath,
+    assetId,
+    assetTitle,
+    imageBuffer,
+    force = false,
+    db,
+    settings,
+    rekognition,
+    collectionEnsured = false
+  }) {
+    let cleanPath = normalizeDamPath(assetPath);
+    if (!cleanPath && assetId) {
+      const resolvedFromUuid = await aemClient.resolvePathByAssetUuid(assetId);
+      if (resolvedFromUuid) {
+        cleanPath = normalizeDamPath(resolvedFromUuid);
       }
+    }
 
-      if (!force && cleanPath) {
-        const eligibility = await aemClient.checkFolderEligibility(cleanPath, settings);
-        if (!eligibility.eligible) {
-          return {
-            skipped: true,
-            assetPath: cleanPath,
-            reason: eligibility.reason
-          };
-        }
-      }
-
-      const info =
-        assetId && cleanPath
-          ? { assetId, assetPath: cleanPath, assetTitle: assetTitle || cleanPath.split('/').pop() }
-          : await aemClient.getAssetInfo(cleanPath);
-
-      const resolvedAssetId = info.assetId;
-      const resolvedPath = info.assetPath;
-      const resolvedTitle = info.assetTitle;
-
-      const buffer =
-        imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
-
-      const db = await storage.getDatabase();
-
-      // Clean up previous faces for this asset if re-scanning
-      await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
-
-      // Detect and index all faces in the image via AWS Rekognition
-      const detectedFaces = await rekognition.indexAssetFaces(buffer, resolvedAssetId);
-      const now = new Date().toISOString();
-      const newFaceIds = [];
-
-      let decodedImage = buffer;
-      if (detectedFaces.length > 0) {
-        try {
-          decodedImage = decodeImageBuffer(buffer);
-        } catch (e) {
-          decodedImage = buffer;
-        }
-      }
-
-      for (const detected of detectedFaces) {
-        const { faceId, confidence, boundingBox } = detected;
-
-        // 1. Crop 160x160 padded avatar from the in-memory rendition buffer
-        const avatar = await cropFaceAvatar(decodedImage, boundingBox);
-        const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
-
-        // 2. Search Rekognition Collection for a matching Face Group
-        const match = await rekognition.findMatchingGroup(faceId, db.faces, db.groups);
-        let assignedGroupId = null;
-        let matchConfidence = null;
-
-        if (match && db.groups[match.groupId]) {
-          assignedGroupId = match.groupId;
-          matchConfidence = match.matchConfidence;
-          await rekognition.associateFaces(assignedGroupId, [faceId]);
-          if (!db.groups[assignedGroupId].faceIds.includes(faceId)) {
-            db.groups[assignedGroupId].faceIds.push(faceId);
-          }
-          db.groups[assignedGroupId].updatedAt = now;
-        } else {
-          assignedGroupId = generateGroupId();
-          const personNumber = db.counters.nextPersonNumber || 1;
-          db.counters.nextPersonNumber = personNumber + 1;
-
-          await rekognition.createGroup(assignedGroupId, [faceId]);
-          db.groups[assignedGroupId] = {
-            groupId: assignedGroupId,
-            name: null,
-            autoLabel: `Person #${personNumber}`,
-            coverFaceId: faceId,
-            faceIds: [faceId],
-            createdAt: now,
-            updatedAt: now
-          };
-        }
-
-        db.faces[faceId] = {
-          faceId,
-          groupId: assignedGroupId,
-          assetId: resolvedAssetId,
-          assetPath: resolvedPath,
-          assetTitle: resolvedTitle,
-          boundingBox,
-          confidence,
-          matchConfidence,
-          avatarFile,
-          avatarDataUrl: avatar.dataUrl,
-          createdAt: now
+    if (!force && cleanPath) {
+      const eligibility = await aemClient.checkFolderEligibility(cleanPath, settings);
+      if (!eligibility.eligible) {
+        return {
+          skipped: true,
+          assetPath: cleanPath,
+          reason: eligibility.reason
         };
+      }
+    }
 
-        newFaceIds.push(faceId);
+    const info =
+      assetId && cleanPath
+        ? {
+            assetId,
+            assetPath: cleanPath,
+            assetTitle: assetTitle || cleanPath.split('/').pop()
+          }
+        : await aemClient.getAssetInfo(cleanPath);
+
+    const resolvedAssetId = info.assetId;
+    const resolvedPath = info.assetPath;
+    const resolvedTitle = info.assetTitle;
+
+    const buffer =
+      imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
+
+    // Clean up previous faces for this asset if re-scanning
+    await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
+
+    // Detect and index all faces in the image via AWS Rekognition
+    const detectedFaces = await rekognition.indexAssetFaces(buffer, resolvedAssetId, {
+      skipEnsureCollection: collectionEnsured
+    });
+    const now = new Date().toISOString();
+    const newFaceIds = [];
+
+    let decodedImage = buffer;
+    if (detectedFaces.length > 0) {
+      try {
+        decodedImage = decodeImageBuffer(buffer);
+      } catch (e) {
+        decodedImage = buffer;
+      }
+    }
+
+    for (const detected of detectedFaces) {
+      const { faceId, confidence, boundingBox } = detected;
+
+      // 1. Crop padded avatar from the in-memory rendition buffer
+      const avatar = await cropFaceAvatar(decodedImage, boundingBox);
+
+      // 2. Save avatar and search Rekognition Collection for a matching Face Group concurrently
+      const [avatarFile, match] = await Promise.all([
+        storage.saveAvatar(faceId, avatar.buffer),
+        rekognition.findMatchingGroup(faceId, db.faces, db.groups)
+      ]);
+      let assignedGroupId = null;
+      let matchConfidence = null;
+
+      if (match && db.groups[match.groupId]) {
+        assignedGroupId = match.groupId;
+        matchConfidence = match.matchConfidence;
+        await rekognition.associateFaces(assignedGroupId, [faceId]);
+        if (!db.groups[assignedGroupId].faceIds.includes(faceId)) {
+          db.groups[assignedGroupId].faceIds.push(faceId);
+        }
+        db.groups[assignedGroupId].updatedAt = now;
+      } else {
+        assignedGroupId = generateGroupId();
+        const personNumber = db.counters.nextPersonNumber || 1;
+        db.counters.nextPersonNumber = personNumber + 1;
+
+        await rekognition.createGroup(assignedGroupId, [faceId]);
+        db.groups[assignedGroupId] = {
+          groupId: assignedGroupId,
+          name: null,
+          autoLabel: `Person #${personNumber}`,
+          coverFaceId: faceId,
+          faceIds: [faceId],
+          createdAt: now,
+          updatedAt: now
+        };
       }
 
-      db.assets[resolvedAssetId] = {
+      db.faces[faceId] = {
+        faceId,
+        groupId: assignedGroupId,
         assetId: resolvedAssetId,
         assetPath: resolvedPath,
         assetTitle: resolvedTitle,
-        faceIds: newFaceIds,
-        scannedAt: now,
-        updatedAt: now
+        boundingBox,
+        confidence,
+        matchConfidence,
+        avatarFile,
+        avatarDataUrl: avatar.dataUrl,
+        createdAt: now
       };
 
-      await syncAssetsToAem([resolvedAssetId], db, settings);
-      await storage.saveDatabase(db);
+      newFaceIds.push(faceId);
+    }
 
-      return this.getAssetFaces({ assetId: resolvedAssetId, assetPath: resolvedPath });
+    const assetRecord = {
+      assetId: resolvedAssetId,
+      assetPath: resolvedPath,
+      assetTitle: resolvedTitle,
+      faceIds: newFaceIds,
+      scannedAt: now,
+      updatedAt: now
+    };
+    db.assets[resolvedAssetId] = assetRecord;
+
+    await syncAssetsToAem([resolvedAssetId], db, settings);
+
+    const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
+    const enrichedFaces = newFaceIds
+      .map((id) => enrichFace(db.faces[id], db.groups))
+      .filter(Boolean);
+
+    return {
+      ...assetRecord,
+      scanned: true,
+      faceCount: computed.faceCount,
+      faceNames: computed.faceNames,
+      faceGroupIds: computed.faceGroupIds,
+      metadataProperty: computed.metadataProperty,
+      includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
+      faces: enrichedFaces
+    };
+  }
+
+  return {
+    /**
+     * Ingests a single AEM asset: checks folder processing profile eligibility,
+     * downloads web rendition, indexes faces in AWS Rekognition, crops avatars,
+     * auto-matches or creates face groups, and writes `xdm:faceNames` back to AEM.
+     */
+    async ingestAsset({ assetPath, assetId, assetTitle, imageBuffer, force = false }) {
+      const [{ settings, rekognition }, db] = await Promise.all([
+        getRekognition(),
+        storage.getDatabase()
+      ]);
+
+      const result = await ingestSingleAssetInMemory({
+        assetPath,
+        assetId,
+        assetTitle,
+        imageBuffer,
+        force,
+        db,
+        settings,
+        rekognition,
+        collectionEnsured: false
+      });
+
+      if (!result.skipped) {
+        await storage.saveDatabase(db);
+      }
+
+      return result;
     },
 
     /**
@@ -351,27 +409,93 @@ async function createFaceService({
     },
 
     /**
-     * Scans all image assets in a DAM folder.
+     * Scans image assets in a DAM folder (or an explicit batch slice of folder assets).
+     * Loads and saves the database once per batch and enforces a time budget (default 20s)
+     * so requests through Adobe I/O Runtime / CloudFront (`*.adobeio-static.net`) never hit
+     * a 30-second HTTP 504 Gateway Timeout.
      */
-    async scanFolder({ folderPath, force = true }) {
-      const assets = await aemClient.listFolderAssets(folderPath);
-      const results = [];
-      for (const item of assets) {
+    async scanFolder({
+      folderPath,
+      assets: explicitAssets = null,
+      offset = 0,
+      limit = 0,
+      force = true,
+      timeBudgetMs = 20000
+    }) {
+      const startTime = Date.now();
+      const [allAssets, { settings, rekognition }, db] = await Promise.all([
+        Array.isArray(explicitAssets)
+          ? Promise.resolve(explicitAssets)
+          : aemClient.listFolderAssets(folderPath),
+        getRekognition(),
+        storage.getDatabase()
+      ]);
+
+      let collectionEnsured = false;
+      if (allAssets.length > 0) {
         try {
-          const res = await this.ingestAsset({
+          await rekognition.ensureCollection();
+          collectionEnsured = true;
+        } catch (e) {
+          collectionEnsured = false;
+        }
+      }
+
+      const startIdx = Math.max(0, Number(offset) || 0);
+      const maxItems = Number(limit) > 0 ? Number(limit) : allAssets.length;
+      const targetSlice = allAssets.slice(startIdx, startIdx + maxItems);
+
+      const results = [];
+      let dirty = false;
+      let stoppedForTimeBudget = false;
+
+      for (let i = 0; i < targetSlice.length; i++) {
+        if (i > 0 && timeBudgetMs > 0 && Date.now() - startTime >= timeBudgetMs) {
+          stoppedForTimeBudget = true;
+          break;
+        }
+        const item = targetSlice[i];
+        try {
+          const res = await ingestSingleAssetInMemory({
             assetPath: item.assetPath,
             assetId: item.assetId,
             assetTitle: item.assetTitle,
-            force
+            force,
+            db,
+            settings,
+            rekognition,
+            collectionEnsured
           });
-          results.push({ assetPath: item.assetPath, status: 'processed', faceCount: res.faces?.length || 0 });
+          if (!res.skipped) {
+            dirty = true;
+          }
+          results.push({
+            assetPath: item.assetPath,
+            status: res.skipped ? 'skipped' : 'processed',
+            faceCount: res.faces?.length || 0
+          });
         } catch (err) {
-          results.push({ assetPath: item.assetPath, status: 'error', error: err.message });
+          results.push({
+            assetPath: item.assetPath,
+            status: 'error',
+            error: err.message
+          });
         }
       }
+
+      if (dirty) {
+        await storage.saveDatabase(db);
+      }
+
+      const nextOffset = startIdx + results.length;
+      const hasMore = stoppedForTimeBudget || nextOffset < allAssets.length;
+
       return {
         folderPath: normalizeDamPath(folderPath),
-        totalAssets: assets.length,
+        totalAssets: allAssets.length,
+        processedCount: results.length,
+        hasMore,
+        nextOffset: hasMore ? nextOffset : null,
         results
       };
     },
