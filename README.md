@@ -1,6 +1,8 @@
 # AEM Assets View — Facial Recognition & Grouping Extension
 
-An **Adobe Developer App Builder** extension for **AEM as a Cloud Service (Assets View)** that integrates with a customer's **AWS Rekognition** account (Bring Your Own Key / BYOK) to automatically detect faces on uploaded images, crop `160×160` portrait avatars, cluster matching faces into Face Groups, provide an administrative UI to name, split, or merge groups, and write multi-value group names to `xdm:faceNames` on AEM assets.
+An **Adobe Developer App Builder** extension for **AEM as a Cloud Service (Assets View)** that integrates with a customer's **AWS Rekognition** account (Bring Your Own Key / BYOK) to automatically detect faces on uploaded images, crop portrait avatars, cluster matching faces into Face Groups, provide an administrative UI to name, split, or merge groups, and write multi-value group names to `xdm:faceNames` on AEM assets.
+
+> 📖 **Looking for step-by-step installation, AWS IAM key setup, AEM Processing Profile setup, and Adobe I/O Events wiring?** See **[SETUP.md](./SETUP.md)**.
 
 ---
 
