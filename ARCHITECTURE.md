@@ -36,22 +36,26 @@ aemfacerec/
 ├── package.json                        # Dependencies & scripts
 ├── .env.example                        # Environment variable template
 ├── ARCHITECTURE.md                     # Technical architecture & data model
+├── SECURITY_AUDIT.md                   # Enterprise security, robustness & scale audit
 └── src/
-    └── aem-assets-details-1/
-        ├── ext.config.yaml             # Extension point manifest (aem/assets/details/1)
+    └── aem-assets-assetsview-1/
+        ├── ext.config.yaml             # Extension point manifest (aem/assets/assetsview/1)
         ├── actions/
         │   ├── lib/
+        │   │   ├── security.js         # Host allowlist, DAM path & metadata validation, safe errors
+        │   │   ├── action-context.js   # Per-invocation auth/host context (no process.env mutation)
+        │   │   ├── retry.js            # Exponential backoff + jitter & bounded concurrency
         │   │   ├── storage.js          # Persistent state & avatar storage (@adobe/aio-lib-files)
         │   │   ├── rekognition.js      # AWS Rekognition SDK v3 client (Collections, Users, Faces)
-        │   │   ├── cropper.js          # Padded 160x160 face avatar cropper (sharp)
-        │   │   ├── aem.js              # AEM Assets HTTP API & Processing Profile inspector
-        │   │   └── face-service.js     # Core domain logic (ingest, split, merge, rename, sync)
+        │   │   ├── cropper.js          # Pure-JS 72x72 face avatar cropper + header dimension sniffer
+        │   │   ├── aem.js              # AEM Assets HTTP API, paged folder browser & profile inspector
+        │   │   └── face-service.js     # Core domain logic (ingest, split, merge, rename, paged queries)
         │   ├── ingest/
-        │   │   └── index.js            # Runtime Action: I/O Event, Asset Compute & manual scan
+        │   │   └── index.js            # Runtime Action: manual scan, folder scan & I/O Events
         │   ├── groups/
-        │   │   └── index.js            # Runtime Action: Face groups CRUD, split, merge & avatars
+        │   │   └── index.js            # Runtime Action: paged face groups CRUD, split, merge
         │   └── settings/
-        │       └── index.js            # Runtime Action: BYOK AWS config, folder rules & re-sync
+        │       └── index.js            # Runtime Action: BYOK AWS config, cost controls & re-sync
         ├── web-src/
         │   ├── index.html              # SPA entry HTML
         │   └── src/
@@ -60,11 +64,18 @@ aemfacerec/
         │       │   └── api.js          # Frontend API client for App Builder Runtime actions
         │       └── components/
         │           ├── App.js                      # HashRouter (Extension Registration, Side Panel, Admin)
-        │           ├── ExtensionRegistration.js    # Registers aem/assets/details/1 side panel
+        │           ├── ExtensionRegistration.js    # Registers aem/assets/assetsview/1 side panel & action bar
         │           ├── AssetDetailsSidePanel.js    # Side Panel UI with face avatars & bounding boxes
-        │           └── AdminConsole.js             # Full-page Face Group Manager & BYOK Settings UI
+        │           └── AdminConsole.js             # Paged Face Group Manager, Folder Scanner & Settings UI
         └── test/
-            └── face-service.test.js    # Automated test suite for grouping, splitting, merging & metadata
+            ├── face-service.test.js         # Core grouping, splitting, merging & metadata tests
+            ├── security.test.js             # Auth, SSRF, path/property validation & storage fail-safes
+            ├── robustness.test.js           # Retries, throttling, ingest failure ordering & image caps
+            ├── paging.test.js               # 1 MB response budget, server paging/search/filter
+            ├── cost.test.js                 # Skip already-scanned, MIME allowlist & min image dimensions
+            ├── folder-and-asset-id.test.js  # DAM folder pagination (>200 items) & canonical asset IDs
+            ├── ui-api.test.js               # Client banner & folder-scan batching tests
+            └── ui-admin-console.test.js     # End-to-end jsdom UI tests against real Runtime actions
 ```
 
 ---

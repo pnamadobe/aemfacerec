@@ -253,26 +253,55 @@ To display the recognized face group names on Asset Details / Properties in AEM:
 
 ## 8. Runtime Action API Reference
 
-### 1. `aem-face-rec/ingest` (`src/aem-assets-details-1/actions/ingest/index.js`)
+### 1. `aem-assets-assetsview-1/ingest` (`src/aem-assets-assetsview-1/actions/ingest/index.js`)
 - **Ingest Single Asset (or Adobe I/O Event Webhook)**:
   ```json
   {
     "operation": "ingestAsset",
     "assetPath": "/content/dam/events/2026-summit/keynote-panel.jpg",
-    "force": true
+    "force": true,
+    "rescan": true
   }
   ```
-- **Scan Entire DAM Folder**:
+- **Browse DAM Folder (paged past 200 items, filtered by `allowedImageTypes`)**:
+  ```json
+  {
+    "operation": "browseFolder",
+    "folderPath": "/content/dam/events/2026-summit"
+  }
+  ```
+- **Scan DAM Folder (skips already-scanned images unless `rescan: true`)**:
   ```json
   {
     "operation": "scanFolder",
     "folderPath": "/content/dam/events/2026-summit",
-    "force": true
+    "force": true,
+    "rescan": false
   }
   ```
 
-### 2. `aem-face-rec/groups` (`src/aem-assets-details-1/actions/groups/index.js`)
-- **List All Face Groups**: `{ "operation": "listGroups" }`
+### 2. `aem-assets-assetsview-1/groups` (`src/aem-assets-assetsview-1/actions/groups/index.js`)
+- **List Face Groups (paged summaries, server-side filter & search)**:
+  ```json
+  {
+    "operation": "listGroups",
+    "offset": 0,
+    "limit": 60,
+    "filter": "all",
+    "query": ""
+  }
+  ```
+- **List Lightweight Group Options (for merge/move pickers, no avatars)**:
+  `{ "operation": "listGroupOptions", "query": "" }`
+- **Get Single Group with Paged Member Faces**:
+  ```json
+  {
+    "operation": "getGroup",
+    "groupId": "grp_sarah01",
+    "faceOffset": 0,
+    "faceLimit": 60
+  }
+  ```
 - **Get Faces & Metadata for an Asset**:
   ```json
   {
@@ -330,7 +359,9 @@ To display the recognized face group names on Asset Details / Properties in AEM:
       "includeUnnamedInMetadata": true,
       "requireProcessingProfile": true,
       "processingProfileName": "Face Recognition",
-      "enabledFolders": ["/content/dam/events"]
+      "enabledFolders": ["/content/dam/events"],
+      "allowedImageTypes": ["image/jpeg", "image/png", "image/tiff", "image/vnd.adobe.photoshop", "image/webp", "image/heic", "image/heif", "image/bmp"],
+      "minImageSize": 200
     }
   }
   ```

@@ -10,13 +10,18 @@ Status legend: ✅ Fixed · 🟡 Partially addressed · ⬜ Open
 
 ## Executive summary
 
-The extension works as a prototype. Before the first round of fixes, three problems made it unsafe for production:
+The extension works as a prototype. Before our remediation rounds, three problems made it unsafe for production:
 
 1. **Every web action could be called anonymously.** This exposed biometric data export, data wipe, and credential replacement.
 2. **The AEM technical-account token could be sent to any host, and was used silently in place of the user's token** (SSRF and privilege escalation).
 3. **All state lives in a few JSON documents.** Each request reads and rewrites the whole document, with no concurrency control, and a single read error could wipe the database.
 
-This round fixes the critical security issues (S1–S7, S9 partially) and the worst data-loss risks (R2, R4, R8, R12). The remaining items are architectural: a real data store, a queue-based ingestion pipeline, and privacy/compliance tooling. They are tracked below with recommended designs.
+Across five rounds of work, we have now fixed:
+- **Critical & high security issues (`S1`–`S7`, `S9` partially, `S12`–`S14`, `S16`, `S17`)**: Adobe auth required on all web actions, AEM host allowlist + no service-token fallback on user requests, mandatory `ENCRYPTION_SECRET`, strict DAM path and metadata property validation, no `process.env` mutation, and sanitized error responses.
+- **Load & failure resilience (`R2`, `R4`, `R5` ingest, `R6`, `R7`, `R8`, `R12`, `P5`)**: corrupt/unreadable storage fails closed instead of wiping the DB, retries with exponential backoff + jitter for AWS Rekognition and AEM, throttling no longer creates duplicate people, failure-safe ingest ordering, non-fatal AEM metadata write reporting, 128-bit group IDs, and 5 MB / 25 MP image limits.
+- **Library growth & AWS cost (`P2`, `P6`, `R9`, `R11`, `C1`–`C4`)**: paged group list + server-side search/filter, names-only picker endpoint, paged per-group faces (keeps every response well under the 1 MB Runtime limit), DAM folder pagination past 200 items, canonical asset IDs with legacy duplicate consolidation, and AWS cost controls (skip already-scanned images, file-type allowlist, minimum image dimension).
+
+The remaining open items are larger architectural changes (per-record database `R1`, background job queue `R14`/`P7`, OAuth Server-to-Server `S9`, cross-account IAM role `S8`, biometric privacy/erasure `S10`, multi-org partitioning `S11`, and dependency cleanup `S15`). They are tracked below with recommended designs.
 
 ---
 
