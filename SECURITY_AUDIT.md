@@ -54,10 +54,10 @@ This round fixes the critical security issues (S1–S7, S9 partially) and the wo
 | R2 | Critical | `readJson` returned `{}` on any read or parse error, and the next save wiped the database. | ✅ | Only "not found" yields defaults. Corrupt documents and storage errors now throw, so nothing is written back. |
 | R3 | High | The four JSON documents are written in parallel, so a failure leaves them out of sync. | 🟡 | The local backend now writes atomically (temp file plus rename). ⬜ Fully solved by R1. |
 | R4 | High | Silent fallback to `aio-lib-state` (1 MB values) and then to the container's ephemeral `/tmp`. | ✅ | In Runtime, the action now fails loudly if no persistent backend is available. ⬜ `aio-lib-state` remains a fallback; its value-size limit will be hit at scale (resolved by R1). |
-| R5 | High | No transactions spanning Rekognition and the database. Re-ingest deletes old faces *before* the new index succeeds. | ⬜ | Index first, then swap. Record pending operations, add a reconciliation job (collection vs. data store), and make Rekognition calls idempotent. |
-| R6 | High | `findMatchingGroup` swallows throttling errors, so each face gets a new group. | ⬜ | Treat only "not found / not ready" as no-match. Retry throttling with backoff and fail the item otherwise. |
-| R7 | High | No retry, backoff or concurrency limits for Rekognition and AEM. | ⬜ | Shared retry helper (exponential backoff with jitter on 429/5xx/Throttling) and a concurrency limiter. |
-| R8 | High | The fallback metadata write wasn't checked, so the function returned `updated: true` on failure. | ✅ | Throws when both the Sling POST and the Assets API PUT fail. |
+| R5 | High | No transactions spanning Rekognition and the database. Re-ingest deleted old faces *before* the new index succeeded. | 🟡 | **Ingest fixed:** detect, match and crop first, without touching the database. If anything fails, new faces and avatars are discarded and the database is unchanged. Old faces are then removed (AWS first, database second, idempotent). If applying faces fails partway, the faces applied so far are saved consistently, the rest are discarded, and the asset is flagged `incomplete` (a re-scan repairs it). ⬜ Split, move and merge still interleave AWS and database steps; retries make failures rare, but a reconciliation job is still recommended. |
+| R6 | High | `findMatchingGroup` swallowed every error, including throttling, so each face got a new group. | ✅ | Only "nothing to match yet" errors (`ResourceNotFound`, `InvalidParameter`) count as no match. Throttling is retried, and if it persists the ingest fails cleanly (see R5) instead of creating duplicate people. |
+| R7 | High | No retry, backoff or concurrency limits for Rekognition and AEM. | ✅ | `lib/retry.js`: exponential backoff with full jitter and a total delay budget, so retries can't push a request past its timeout. Rekognition retries throttling, 5xx and network errors (up to 5 attempts; the SDK's own retries are disabled so they don't stack). AEM retries 429, 502, 503, 504 and network errors (up to 4 attempts, honoring `Retry-After`). AEM metadata writes run with a concurrency of 4. |
+| R8 | High | The fallback metadata write wasn't checked, so the function returned `updated: true` on failure. | ✅ | Failures are detected, but no longer abort the operation. Rename, split, move, merge, re-sync and ingest always save, and return `failedAssetCount` / `failedAssets` (and `metadataSynced: false` for ingest). The asset record keeps `metadataSyncError`, and the UI shows a warning banner. Fixes a regression where one failed AEM write discarded a rename after AWS had already been updated. |
 | R9 | Medium | Inconsistent asset IDs (`urn:aaid`, `jcr:uuid`, path, hex-of-path), causing duplicates and orphaned faces. | ⬜ | Canonicalize to the AEM asset UUID, with a secondary index by path. |
 | R10 | Medium | Event processing isn't idempotent; retries reprocess. | ⬜ | Dedupe on the event id plus asset version. |
 | R11 | Medium | Folder listing stops at 200 entries. | ⬜ | Page through results with `offset`/`limit`. |
@@ -73,10 +73,10 @@ This round fixes the critical security issues (S1–S7, S9 partially) and the wo
 | ID | Finding | Status | Remediation |
 |---|---|---|---|
 | P1 | Every request loads and rewrites the full database. Base64 avatars are stored inline (around 2–4 KB per face), so 100k faces is over 300 MB of JSON, more than the 512 MB action memory once parsed. | 🟡 | Pretty-printing removed (about 30% smaller). ⬜ Per-record store (R1). Store avatars only as files and drop `avatarDataUrl` from the records. |
-| P2 | `listGroups` returns every group with every face and avatar, which breaks the 1 MB Runtime response limit at a few thousand faces. | ⬜ | Paged, summarized group listing. Load faces per group on demand. Serve avatars by URL (short-lived signed URL or a dedicated action) instead of inline data. |
+| P2 | `listGroups` returns every group with every face and avatar. **Measured in production on 2026-11-10: 972 KB for 163 faces, just under the 1 MB Runtime response limit.** It will fail after roughly 5–10 more faces. | ⬜ **Next** | Paged, summarized group listing. Load faces per group on demand. Serve avatars by URL (short-lived signed URL or a dedicated action) instead of inline data. |
 | P3 | Full linear scans for asset lookups; quadratic `includes` in merges. | ⬜ | Indexed lookups (R1); use `Set`s in merge, split and move. |
 | P4 | Everything is sequential: Rekognition per face, AEM per asset, and an uncached ancestor-folder walk on every event. | ⬜ | Bounded parallelism (for example 4–8). Cache folder eligibility per ancestor with a TTL. |
-| P5 | Pure-JS JPEG decode with `maxMemoryUsageInMB: 512` in a 512 MB container. The `original` rendition fallback can be up to 100 MP, risking out-of-memory. | ⬜ | Cap the download size and resolution. Don't fall back to `original`; require the web rendition. |
+| P5 | Pure-JS JPEG decode with `maxMemoryUsageInMB: 512` in a 512 MB container. The `original` rendition fallback could be up to 100 MP. | ✅ | Downloads are capped at 5 MB (Rekognition's own limit), checked by `Content-Length` and while streaming. The original is used only if it's under the cap. Decoding is capped at 25 MP / 192 MB, and PNG dimensions are checked from the header before decoding. |
 | P6 | Every non-OK AEM response was re-requested (doubling traffic for rendition probes). | ✅ | Removed along with the S3 fix. |
 | P7 | The browser drives folder scans; closing the tab aborts the job. | ⬜ | Server-side job (see R14). |
 
@@ -114,6 +114,15 @@ Against the original code, 11 of these tests fail. With the fixes, the full suit
 - Corrupt-database handling (no wipe); no silent `/tmp` fallback.
 - Settings validation; export without credentials; import can't overwrite settings.
 - Encryption-secret enforcement and key separation.
+
+`test/robustness.test.js` (39 tests) and `test/ui-api.test.js` (4 tests), added in the second round (R5–R8, P5). Against the previous code, 24 of the 39 robustness tests fail. Covered:
+
+- Retry primitives: backoff bounds, delay budget, `Retry-After`, error classification, bounded concurrency.
+- Rekognition: throttled calls retried; persistent throttling surfaces instead of creating a new person; "not ready" errors fall back to `SearchFaces`; unsupported images get readable errors.
+- Ingest failure handling: the database is unchanged when matching or old-face removal fails, and orphaned faces and avatars are cleaned up; a failure partway through applying faces saves a consistent partial result and a re-scan recovers.
+- AEM metadata failures don't lose renames, merges, splits, moves or scans, are reported per asset, and can be retried via re-sync.
+- AEM retries on 429/503/network errors, no retries on 4xx/500, image size caps (header and streaming), the original rendition as last resort, decode limits.
+- UI warning banners for partial failures.
 - Avatar path safety; 128-bit group IDs; group name limits.
 
 ## 6. Deployment checklist for this change

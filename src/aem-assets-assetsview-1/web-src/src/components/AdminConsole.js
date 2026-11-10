@@ -23,7 +23,7 @@ import {
   DialogTrigger,
   AlertDialog
 } from '@adobe/react-spectrum';
-import { api } from '../utils/api';
+import { api, resultBanner } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 export default function AdminConsole() {
@@ -233,10 +233,7 @@ export default function AdminConsole() {
     try {
       const res = await api.renameGroup(activeGroup.groupId, groupNameInput, hostContext);
       await loadAll();
-      setBanner({
-        type: 'positive',
-        text: `Saved name "${res.group.displayName}" and updated ${settings.metadataProperty} across ${res.syncedAssetCount} asset(s).`
-      });
+      setBanner(resultBanner(`Saved name "${res.group.displayName}" and updated ${settings.metadataProperty} across ${res.syncedAssetCount} asset(s).`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     }
@@ -251,10 +248,7 @@ export default function AdminConsole() {
       await loadAll();
       setSelectedGroupId(res.newGroup.groupId);
       setGroupNameInput(res.newGroup.name || '');
-      setBanner({
-        type: 'positive',
-        text: `Split ${res.newGroup.faceCount} face(s) into new group "${res.newGroup.displayName}" and updated AEM metadata.`
-      });
+      setBanner(resultBanner(`Split ${res.newGroup.faceCount} face(s) into new group "${res.newGroup.displayName}" and updated AEM metadata.`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     }
@@ -267,10 +261,7 @@ export default function AdminConsole() {
       setSelectedFaceIds([]);
       setMoveTargetGroupId('');
       await loadAll();
-      setBanner({
-        type: 'positive',
-        text: `Moved face(s) into "${res.targetGroup.displayName}" and recomputed AEM metadata.`
-      });
+      setBanner(resultBanner(`Moved face(s) into "${res.targetGroup.displayName}" and recomputed AEM metadata.`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     }
@@ -284,10 +275,7 @@ export default function AdminConsole() {
       setMergeTargetGroupId('');
       setSelectedGroupId(targetId);
       await loadAll();
-      setBanner({
-        type: 'positive',
-        text: `Combined ${res.movedFaceCount} face(s) into "${res.targetGroup.displayName}" and synced ${res.syncedAssetCount} asset(s).`
-      });
+      setBanner(resultBanner(`Combined ${res.movedFaceCount} face(s) into "${res.targetGroup.displayName}" and synced ${res.syncedAssetCount} asset(s).`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     }
@@ -339,10 +327,7 @@ export default function AdminConsole() {
       });
       setScanResult(res);
       await loadAll();
-      setBanner({
-        type: 'positive',
-        text: `Folder scan complete for ${res.folderPath} (${res.totalAssets} assets processed).`
-      });
+      setBanner(resultBanner(`Folder scan complete for ${res.folderPath} (${res.totalAssets} assets processed).`, res));
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
     } finally {

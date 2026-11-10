@@ -3,6 +3,9 @@ const { createStorage } = require('./storage');
 const { createRekognitionService } = require('./rekognition');
 const { createAemClient, normalizeDamPath } = require('./aem');
 const { PublicError, assertDamPath } = require('./security');
+const { mapWithConcurrency } = require('./retry');
+
+const AEM_WRITE_CONCURRENCY = 4;
 const {
   AVATAR_SIZE,
   cropFaceAvatar,
@@ -71,7 +74,8 @@ async function createFaceService({
   encryptionSecret,
   storage: customStorage,
   rekognitionClient: customRekognitionClient,
-  aemClient: customAemClient
+  aemClient: customAemClient,
+  retryOptions = {}
 } = {}) {
   const storage = customStorage || (await createStorage({ encryptionSecret }));
   const aemClient =
@@ -81,7 +85,7 @@ async function createFaceService({
     const settings = await storage.getSettings({ includeDecryptedSecret: true });
     return {
       settings,
-      rekognition: createRekognitionService(settings, customRekognitionClient)
+      rekognition: createRekognitionService(settings, customRekognitionClient, retryOptions)
     };
   }
 
@@ -125,41 +129,73 @@ async function createFaceService({
 
   /**
    * Recomputes and writes AEM metadata for a set of assetIds.
+   *
+   * Writes run with bounded concurrency, and a failure on one asset never aborts the batch:
+   * callers always persist their database changes and report failures to the user.
+   * Returns { synced, failed }.
    */
   async function syncAssetsToAem(assetIds, db, settings) {
     const uniqueAssetIds = Array.from(new Set(assetIds.filter(Boolean)));
-    const results = [];
+    const synced = [];
+    const failed = [];
 
-    for (const assetId of uniqueAssetIds) {
+    await mapWithConcurrency(uniqueAssetIds, AEM_WRITE_CONCURRENCY, async (assetId) => {
       const assetRecord = db.assets[assetId];
-      if (!assetRecord) continue;
+      if (!assetRecord) return;
 
-      const computed = computeAssetFaceMetadata(
-        assetRecord,
-        db.faces,
-        db.groups,
-        settings
-      );
+      const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
 
       assetRecord.faceNames = computed.faceNames;
       assetRecord.faceGroupIds = computed.faceGroupIds;
       assetRecord.faceCount = computed.faceCount;
       assetRecord.updatedAt = new Date().toISOString();
 
-      if (assetRecord.assetPath) {
-        const syncRes = await aemClient.updateAssetFaceMetadata(
-          assetRecord.assetPath,
-          computed
-        );
-        results.push(syncRes);
+      if (!assetRecord.assetPath) return;
+      try {
+        const syncRes = await aemClient.updateAssetFaceMetadata(assetRecord.assetPath, computed);
+        assetRecord.metadataSyncError = null;
+        synced.push(syncRes);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[facerec] metadata sync failed for ${assetRecord.assetPath}:`, err.message);
+        const message = err.expose ? err.message : 'AEM metadata update failed.';
+        assetRecord.metadataSyncError = message;
+        failed.push({ assetPath: assetRecord.assetPath, error: message });
       }
-    }
+    });
 
-    return results;
+    return { synced, failed };
+  }
+
+  function syncSummary({ synced, failed }) {
+    return {
+      syncedAssetCount: synced.length,
+      syncedAssets: synced,
+      failedAssetCount: failed.length,
+      failedAssets: failed
+    };
   }
 
   /**
-   * Removes faces previously indexed for an asset (used before re-scanning or on asset deletion).
+   * Best-effort removal of faces that were indexed in Rekognition but never recorded,
+   * so failed ingests don't leave orphaned biometric data behind.
+   */
+  async function discardIndexedFaces(faceIds, rekognition) {
+    if (!faceIds.length) return;
+    try {
+      await rekognition.deleteFaces(faceIds);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('[facerec] failed to discard orphaned faces:', e.message);
+    }
+    await Promise.all(faceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
+  }
+
+  /**
+   * Removes faces previously indexed for an asset (used before re-scanning).
+   *
+   * All Rekognition calls run first and are idempotent; the in-memory db is only changed
+   * once they have all succeeded, so a failure leaves the db untouched and safe to retry.
    */
   async function removeExistingAssetFaces(assetId, db, rekognition) {
     const existingAsset = db.assets[assetId];
@@ -169,38 +205,59 @@ async function createFaceService({
 
     const oldFaceIds = [...existingAsset.faceIds];
     const byGroup = {};
-
     for (const fId of oldFaceIds) {
       const face = db.faces[fId];
       if (face && face.groupId) {
         byGroup[face.groupId] = byGroup[face.groupId] || [];
         byGroup[face.groupId].push(fId);
       }
-      delete db.faces[fId];
-      await storage.deleteAvatar(fId);
     }
 
+    // 1. Rekognition (no db changes yet)
+    const emptiedGroupIds = [];
     for (const [groupId, fIds] of Object.entries(byGroup)) {
       await rekognition.disassociateFaces(groupId, fIds);
       const grp = db.groups[groupId];
-      if (grp) {
-        grp.faceIds = (grp.faceIds || []).filter((id) => !fIds.includes(id));
-        if (grp.faceIds.length === 0) {
-          delete db.groups[groupId];
-          await rekognition.deleteGroup(groupId);
-        } else if (fIds.includes(grp.coverFaceId)) {
-          grp.coverFaceId = grp.faceIds[0];
-        }
+      if (grp && (grp.faceIds || []).every((id) => fIds.includes(id))) {
+        await rekognition.deleteGroup(groupId);
+        emptiedGroupIds.push(groupId);
       }
     }
-
     await rekognition.deleteFaces(oldFaceIds);
+
+    // 2. Db
+    for (const [groupId, fIds] of Object.entries(byGroup)) {
+      const grp = db.groups[groupId];
+      if (!grp) continue;
+      if (emptiedGroupIds.includes(groupId)) {
+        delete db.groups[groupId];
+        continue;
+      }
+      const removed = new Set(fIds);
+      grp.faceIds = (grp.faceIds || []).filter((id) => !removed.has(id));
+      if (removed.has(grp.coverFaceId)) {
+        grp.coverFaceId = grp.faceIds[0];
+      }
+    }
+    for (const fId of oldFaceIds) {
+      delete db.faces[fId];
+    }
     existingAsset.faceIds = [];
+
+    // 3. Avatars (best effort)
+    await Promise.all(oldFaceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
   }
 
   /**
    * Core single-asset ingestion routine that operates on an already-loaded `db`, `settings`,
    * and `rekognition` instance so batch/folder operations only read and write storage once.
+   *
+   * Failure handling:
+   * - Before the old faces are removed, any failure discards the newly indexed faces and
+   *   leaves `db` untouched.
+   * - After that point the error is thrown with `dbMutated = true`; `db` is kept consistent
+   *   with Rekognition (faces applied so far are recorded) and the caller must save it.
+   * - AEM metadata write failures do not fail the ingest; they are reported on the result.
    */
   async function ingestSingleAssetInMemory({
     assetPath,
@@ -245,82 +302,93 @@ async function createFaceService({
     const resolvedPath = info.assetPath;
     const resolvedTitle = info.assetTitle;
 
-    const buffer =
-      imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
+    const buffer = imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
 
-    // Clean up previous faces for this asset if re-scanning
-    await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
-
-    // Detect and index all faces in the image via AWS Rekognition
+    // Phase 1: detect, match and crop. Nothing in `db` changes in this phase.
     const detectedFaces = await rekognition.indexAssetFaces(buffer, resolvedAssetId, {
       skipEnsureCollection: collectionEnsured
     });
-    const now = new Date().toISOString();
-    const newFaceIds = [];
+    const indexedFaceIds = detectedFaces.map((f) => f.faceId);
 
-    let decodedImage = buffer;
-    if (detectedFaces.length > 0) {
-      try {
-        decodedImage = decodeImageBuffer(buffer);
-      } catch (e) {
-        decodedImage = buffer;
+    const prepared = [];
+    try {
+      let decodedImage = buffer;
+      if (detectedFaces.length > 0) {
+        try {
+          decodedImage = decodeImageBuffer(buffer);
+        } catch (e) {
+          decodedImage = buffer;
+        }
       }
+
+      for (const detected of detectedFaces) {
+        const avatar = await cropFaceAvatar(decodedImage, detected.boundingBox);
+        const [avatarFile, match] = await Promise.all([
+          storage.saveAvatar(detected.faceId, avatar.buffer),
+          rekognition.findMatchingGroup(detected.faceId, db.faces, db.groups)
+        ]);
+        prepared.push({ ...detected, avatar, avatarFile, match });
+      }
+
+      // Re-scan: drop this asset's previous faces (Rekognition first, then db)
+      await removeExistingAssetFaces(resolvedAssetId, db, rekognition);
+    } catch (err) {
+      await discardIndexedFaces(indexedFaceIds, rekognition);
+      throw err;
     }
 
-    for (const detected of detectedFaces) {
-      const { faceId, confidence, boundingBox } = detected;
+    // Phase 2: apply. From here on `db` is modified, so errors carry dbMutated = true.
+    const now = new Date().toISOString();
+    const newFaceIds = [];
+    let applyError = null;
 
-      // 1. Crop padded avatar from the in-memory rendition buffer
-      const avatar = await cropFaceAvatar(decodedImage, boundingBox);
+    for (const face of prepared) {
+      const { faceId, confidence, boundingBox, avatar, avatarFile, match } = face;
+      try {
+        let assignedGroupId;
+        let matchConfidence = null;
 
-      // 2. Save avatar and search Rekognition Collection for a matching Face Group concurrently
-      const [avatarFile, match] = await Promise.all([
-        storage.saveAvatar(faceId, avatar.buffer),
-        rekognition.findMatchingGroup(faceId, db.faces, db.groups)
-      ]);
-      let assignedGroupId = null;
-      let matchConfidence = null;
-
-      if (match && db.groups[match.groupId]) {
-        assignedGroupId = match.groupId;
-        matchConfidence = match.matchConfidence;
-        await rekognition.associateFaces(assignedGroupId, [faceId]);
-        if (!db.groups[assignedGroupId].faceIds.includes(faceId)) {
-          db.groups[assignedGroupId].faceIds.push(faceId);
+        if (match && db.groups[match.groupId]) {
+          assignedGroupId = match.groupId;
+          matchConfidence = match.matchConfidence;
+          await rekognition.associateFaces(assignedGroupId, [faceId]);
+          const grp = db.groups[assignedGroupId];
+          if (!grp.faceIds.includes(faceId)) grp.faceIds.push(faceId);
+          grp.updatedAt = now;
+        } else {
+          assignedGroupId = generateGroupId();
+          await rekognition.createGroup(assignedGroupId, [faceId]);
+          const personNumber = db.counters.nextPersonNumber || 1;
+          db.counters.nextPersonNumber = personNumber + 1;
+          db.groups[assignedGroupId] = {
+            groupId: assignedGroupId,
+            name: null,
+            autoLabel: `Person #${personNumber}`,
+            coverFaceId: faceId,
+            faceIds: [faceId],
+            createdAt: now,
+            updatedAt: now
+          };
         }
-        db.groups[assignedGroupId].updatedAt = now;
-      } else {
-        assignedGroupId = generateGroupId();
-        const personNumber = db.counters.nextPersonNumber || 1;
-        db.counters.nextPersonNumber = personNumber + 1;
 
-        await rekognition.createGroup(assignedGroupId, [faceId]);
-        db.groups[assignedGroupId] = {
+        db.faces[faceId] = {
+          faceId,
           groupId: assignedGroupId,
-          name: null,
-          autoLabel: `Person #${personNumber}`,
-          coverFaceId: faceId,
-          faceIds: [faceId],
-          createdAt: now,
-          updatedAt: now
+          assetId: resolvedAssetId,
+          assetPath: resolvedPath,
+          assetTitle: resolvedTitle,
+          boundingBox,
+          confidence,
+          matchConfidence,
+          avatarFile,
+          avatarDataUrl: avatar.dataUrl,
+          createdAt: now
         };
+        newFaceIds.push(faceId);
+      } catch (err) {
+        applyError = err;
+        break;
       }
-
-      db.faces[faceId] = {
-        faceId,
-        groupId: assignedGroupId,
-        assetId: resolvedAssetId,
-        assetPath: resolvedPath,
-        assetTitle: resolvedTitle,
-        boundingBox,
-        confidence,
-        matchConfidence,
-        avatarFile,
-        avatarDataUrl: avatar.dataUrl,
-        createdAt: now
-      };
-
-      newFaceIds.push(faceId);
     }
 
     const assetRecord = {
@@ -331,14 +399,21 @@ async function createFaceService({
       scannedAt: now,
       updatedAt: now
     };
+    if (applyError) assetRecord.incomplete = true;
     db.assets[resolvedAssetId] = assetRecord;
 
-    await syncAssetsToAem([resolvedAssetId], db, settings);
+    if (applyError) {
+      const unapplied = indexedFaceIds.filter((id) => !newFaceIds.includes(id));
+      await discardIndexedFaces(unapplied, rekognition);
+      await syncAssetsToAem([resolvedAssetId], db, settings);
+      applyError.dbMutated = true;
+      throw applyError;
+    }
+
+    const sync = await syncAssetsToAem([resolvedAssetId], db, settings);
 
     const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
-    const enrichedFaces = newFaceIds
-      .map((id) => enrichFace(db.faces[id], db.groups))
-      .filter(Boolean);
+    const enrichedFaces = newFaceIds.map((id) => enrichFace(db.faces[id], db.groups)).filter(Boolean);
 
     return {
       ...assetRecord,
@@ -348,6 +423,8 @@ async function createFaceService({
       faceGroupIds: computed.faceGroupIds,
       metadataProperty: computed.metadataProperty,
       includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
+      metadataSynced: sync.failed.length === 0,
+      metadataSyncError: sync.failed[0]?.error || null,
       faces: enrichedFaces
     };
   }
@@ -364,17 +441,24 @@ async function createFaceService({
         storage.getDatabase()
       ]);
 
-      const result = await ingestSingleAssetInMemory({
-        assetPath,
-        assetId,
-        assetTitle,
-        imageBuffer,
-        force,
-        db,
-        settings,
-        rekognition,
-        collectionEnsured: false
-      });
+      let result;
+      try {
+        result = await ingestSingleAssetInMemory({
+          assetPath,
+          assetId,
+          assetTitle,
+          imageBuffer,
+          force,
+          db,
+          settings,
+          rekognition,
+          collectionEnsured: false
+        });
+      } catch (err) {
+        // Partial progress is already reflected in Rekognition; persist it so they stay in sync
+        if (err.dbMutated) await storage.saveDatabase(db);
+        throw err;
+      }
 
       if (!result.skipped) {
         await storage.saveDatabase(db);
@@ -484,13 +568,17 @@ async function createFaceService({
           results.push({
             assetPath: item.assetPath,
             status: res.skipped ? 'skipped' : 'processed',
-            faceCount: res.faces?.length || 0
+            faceCount: res.faces?.length || 0,
+            ...(res.metadataSyncError ? { warning: res.metadataSyncError } : {})
           });
         } catch (err) {
+          if (err.dbMutated) dirty = true;
+          // eslint-disable-next-line no-console
+          console.error(`[facerec] scan failed for ${item.assetPath}:`, err.message);
           results.push({
             assetPath: item.assetPath,
             status: 'error',
-            error: err.message
+            error: err.expose ? err.message : 'Face analysis failed for this asset.'
           });
         }
       }
@@ -656,13 +744,12 @@ async function createFaceService({
         .map((fId) => db.faces[fId]?.assetId)
         .filter(Boolean);
 
-      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
       await storage.saveDatabase(db);
 
       return {
         group: enrichGroup(group, db.faces),
-        syncedAssetCount: syncedAssets.length,
-        syncedAssets
+        ...syncSummary(sync)
       };
     },
 
@@ -737,13 +824,12 @@ async function createFaceService({
         db.faces[fId].groupId = newGroupId;
       }
 
-      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
       await storage.saveDatabase(db);
 
       return {
         newGroup: enrichGroup(db.groups[newGroupId], db.faces),
-        syncedAssetCount: syncedAssets.length,
-        syncedAssets
+        ...syncSummary(sync)
       };
     },
 
@@ -772,8 +858,7 @@ async function createFaceService({
       if (facesToMove.length === 0) {
         return {
           targetGroup: enrichGroup(targetGroup, db.faces),
-          syncedAssetCount: 0,
-          syncedAssets: []
+          ...syncSummary({ synced: [], failed: [] })
         };
       }
 
@@ -814,13 +899,12 @@ async function createFaceService({
       }
       targetGroup.updatedAt = now;
 
-      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
       await storage.saveDatabase(db);
 
       return {
         targetGroup: enrichGroup(targetGroup, db.faces),
-        syncedAssetCount: syncedAssets.length,
-        syncedAssets
+        ...syncSummary(sync)
       };
     },
 
@@ -893,15 +977,14 @@ async function createFaceService({
         }
       }
 
-      const syncedAssets = await syncAssetsToAem(affectedAssetIds, db, settings);
+      const sync = await syncAssetsToAem(affectedAssetIds, db, settings);
       await storage.saveDatabase(db);
 
       return {
         targetGroup: enrichGroup(targetGroup, db.faces),
         mergedGroupIds: sources,
         movedFaceCount: allMovedFaceIds.length,
-        syncedAssetCount: syncedAssets.length,
-        syncedAssets
+        ...syncSummary(sync)
       };
     },
 
@@ -916,12 +999,11 @@ async function createFaceService({
       ]);
 
       const allAssetIds = Object.keys(db.assets);
-      const syncedAssets = await syncAssetsToAem(allAssetIds, db, settings);
+      const sync = await syncAssetsToAem(allAssetIds, db, settings);
       await storage.saveDatabase(db);
 
       return {
-        syncedAssetCount: syncedAssets.length,
-        syncedAssets
+        ...syncSummary(sync)
       };
     },
 

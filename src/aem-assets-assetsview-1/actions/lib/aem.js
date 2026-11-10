@@ -17,6 +17,62 @@ const {
   isValidDamPath,
   isValidMetadataProperty
 } = require('./security');
+const { withRetry, isNetworkError, RETRYABLE_HTTP_STATUSES } = require('./retry');
+
+// AWS Rekognition accepts at most 5 MB of image bytes, so anything larger is useless and
+// only risks exhausting action memory.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+class RetryableHttpStatus extends Error {
+  constructor(response) {
+    super(`Retryable HTTP ${response.status}`);
+    this.response = response;
+  }
+}
+
+/**
+ * Parses an HTTP Retry-After header (seconds or HTTP date) into milliseconds.
+ */
+function parseRetryAfterMs(value, now = Date.now()) {
+  if (value === null || value === undefined || value === '') return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - now);
+}
+
+/**
+ * Reads a response body into a Buffer, aborting once it exceeds maxBytes.
+ * Returns null when the body is too large.
+ */
+async function readBodyWithLimit(res, maxBytes) {
+  const declared = Number(res.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) return null;
+
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch (e) {
+          // ignore
+        }
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  return buf.length > maxBytes ? null : buf;
+}
 
 function normalizeAemHost(aemHost) {
   if (!aemHost) return '';
@@ -148,7 +204,13 @@ function isHtmlPayload(textOrBuf) {
  *   and callers must only pass them for trusted, non-web invocations (I/O Events) against
  *   the deployment-configured AEM host.
  */
-function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCredentials = null } = {}) {
+function createAemClient({
+  aemHost,
+  token,
+  fetchImpl = global.fetch,
+  serviceCredentials = null,
+  retryOptions = {}
+} = {}) {
   const baseUrl = normalizeAemHost(aemHost);
 
   function buildAuthHeaders(bearerToken, extra = {}) {
@@ -179,11 +241,38 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCred
       throw new Error('Refusing to send AEM credentials to a different origin.');
     }
     const activeToken = await resolveToken();
-    return fetchImpl(url, {
-      ...options,
-      redirect: 'manual',
-      headers: buildAuthHeaders(activeToken, options.headers)
-    });
+    const doFetch = async () => {
+      const res = await fetchImpl(url, {
+        ...options,
+        redirect: 'manual',
+        headers: buildAuthHeaders(activeToken, options.headers)
+      });
+      if (RETRYABLE_HTTP_STATUSES.has(res.status)) {
+        throw new RetryableHttpStatus(res);
+      }
+      return res;
+    };
+
+    // All requests made by this client are idempotent (GETs and Sling property sets),
+    // so they are safe to retry on throttling, gateway errors and network failures.
+    try {
+      return await withRetry(doFetch, {
+        maxAttempts: 4,
+        baseDelayMs: 250,
+        maxDelayMs: 4000,
+        maxTotalDelayMs: 8000,
+        isRetryable: (err) => err instanceof RetryableHttpStatus || isNetworkError(err),
+        getRetryAfterMs: (err) =>
+          err instanceof RetryableHttpStatus
+            ? parseRetryAfterMs(err.response.headers?.get?.('retry-after'))
+            : null,
+        ...retryOptions
+      });
+    } catch (err) {
+      // Out of retries on a retryable status: hand the response back so callers see it
+      if (err instanceof RetryableHttpStatus) return err.response;
+      throw err;
+    }
   }
 
   /**
@@ -373,9 +462,11 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCred
         `${baseUrl}${encodedPath}/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg`,
         `${baseUrl}${encodedPath}/jcr:content/renditions/cq5dam.web.1280.1280.jpeg`,
         `${baseUrl}${encodedPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`,
+        // Last resort; skipped automatically when larger than MAX_IMAGE_BYTES
         `${baseUrl}${encodedPath}/_jcr_content/renditions/original`
       ];
 
+      let sawOversized = false;
       for (const url of candidateUrls) {
         try {
           const res = await fetchAemWithFallback(url);
@@ -384,8 +475,11 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCred
             if (contentType.includes('text/html')) {
               continue;
             }
-            const arrayBuf = await res.arrayBuffer();
-            const buf = Buffer.from(arrayBuf);
+            const buf = await readBodyWithLimit(res, MAX_IMAGE_BYTES);
+            if (!buf) {
+              sawOversized = true;
+              continue;
+            }
             if (!isHtmlPayload(buf) && buf.length > 0) {
               return buf;
             }
@@ -395,7 +489,15 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCred
         }
       }
 
-      throw new Error(`Unable to fetch image rendition from AEM for ${cleanPath}`);
+      if (sawOversized) {
+        throw new PublicError(
+          `No rendition of ${cleanPath} is small enough to analyze (limit ${MAX_IMAGE_BYTES / 1024 / 1024} MB). Make sure AEM has generated its web rendition.`
+        );
+      }
+      throw new PublicError(
+        `Could not download an image rendition for ${cleanPath} from AEM. Check that the asset has finished processing and that you have access to it.`,
+        502
+      );
     },
 
     /**
@@ -570,5 +672,8 @@ module.exports = {
   normalizeAemHost,
   normalizeDamPath,
   isPathWithin,
-  toApiAssetsRelativePath
+  toApiAssetsRelativePath,
+  parseRetryAfterMs,
+  readBodyWithLimit,
+  MAX_IMAGE_BYTES
 };

@@ -15,6 +15,34 @@ const { PNG } = require('pngjs');
 const AVATAR_SIZE = 72;
 const PADDING_RATIO = 0.35; // 35% padding around face box so hair/chin/shoulders fit naturally
 
+// Decoding limits that keep a single image well inside the 512 MB action memory.
+// A 25 MP RGBA image is ~100 MB decoded; AEM web renditions are ~1.6 MP.
+const MAX_DECODE_MEGAPIXELS = 25;
+const MAX_DECODE_MEMORY_MB = 192;
+const JPEG_DECODE_OPTIONS = {
+  useTArray: true,
+  maxMemoryUsageInMB: MAX_DECODE_MEMORY_MB,
+  maxResolutionInMP: MAX_DECODE_MEGAPIXELS
+};
+
+/**
+ * Reads PNG dimensions from the IHDR chunk and rejects oversized images before decoding.
+ */
+function assertPngWithinLimits(imageBuffer) {
+  if (imageBuffer.length < 24) throw new Error('Invalid PNG header');
+  const width = imageBuffer.readUInt32BE(16);
+  const height = imageBuffer.readUInt32BE(20);
+  if (!width || !height || (width * height) / 1e6 > MAX_DECODE_MEGAPIXELS) {
+    throw new Error(`PNG dimensions ${width}x${height} exceed the ${MAX_DECODE_MEGAPIXELS} MP decode limit`);
+  }
+}
+
+function decodePng(imageBuffer) {
+  assertPngWithinLimits(imageBuffer);
+  const png = PNG.sync.read(imageBuffer);
+  return { width: png.width, height: png.height, data: png.data };
+}
+
 /**
  * Calculates clamped pixel crop coordinates from normalized bounding box and image dimensions.
  *
@@ -77,31 +105,21 @@ function decodeImageBuffer(imageBuffer) {
     imageBuffer[2] === 0x4e &&
     imageBuffer[3] === 0x47
   ) {
-    const png = PNG.sync.read(imageBuffer);
-    return { width: png.width, height: png.height, data: png.data };
+    return decodePng(imageBuffer);
   }
 
   // Check JPEG signature: FF D8
   if (imageBuffer[0] === 0xff && imageBuffer[1] === 0xd8) {
-    const decoded = jpeg.decode(imageBuffer, {
-      useTArray: true,
-      maxMemoryUsageInMB: 512,
-      maxResolutionInMP: 100
-    });
+    const decoded = jpeg.decode(imageBuffer, JPEG_DECODE_OPTIONS);
     return { width: decoded.width, height: decoded.height, data: decoded.data };
   }
 
   // Try JPEG then PNG as fallback
   try {
-    const decoded = jpeg.decode(imageBuffer, {
-      useTArray: true,
-      maxMemoryUsageInMB: 512,
-      maxResolutionInMP: 100
-    });
+    const decoded = jpeg.decode(imageBuffer, JPEG_DECODE_OPTIONS);
     return { width: decoded.width, height: decoded.height, data: decoded.data };
   } catch (e) {
-    const png = PNG.sync.read(imageBuffer);
-    return { width: png.width, height: png.height, data: png.data };
+    return decodePng(imageBuffer);
   }
 }
 
@@ -213,6 +231,7 @@ async function cropFaceAvatar(imageBufferOrDecoded, boundingBox) {
 module.exports = {
   AVATAR_SIZE,
   PADDING_RATIO,
+  MAX_DECODE_MEGAPIXELS,
   calculateSquareCropRegion,
   decodeImageBuffer,
   cropAndResizeRgbaToJpeg,

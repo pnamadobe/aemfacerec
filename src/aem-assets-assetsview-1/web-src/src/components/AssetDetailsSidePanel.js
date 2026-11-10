@@ -17,7 +17,7 @@ import {
   Badge,
   Well
 } from '@adobe/react-spectrum';
-import { api } from '../utils/api';
+import { api, resultBanner } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 export default function AssetDetailsSidePanel() {
@@ -212,10 +212,7 @@ export default function AssetDetailsSidePanel() {
       setAssetData(res);
       const groupsRes = await api.listGroups(hostContext);
       setAllGroups(groupsRes.groups || []);
-      setStatusBanner({
-        type: 'positive',
-        text: `Scanned ${res.faceCount || 0} face(s) and synced ${res.metadataProperty || 'xdm:faceNames'}.`
-      });
+      setStatusBanner(resultBanner(`Scanned ${res.faceCount || 0} face(s) and synced ${res.metadataProperty || 'xdm:faceNames'}.`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
     } finally {
@@ -229,10 +226,7 @@ export default function AssetDetailsSidePanel() {
       setEditingGroupId(null);
       setEditingNameValue('');
       await loadData();
-      setStatusBanner({
-        type: 'positive',
-        text: `Updated group name to "${res.group.displayName}" across ${res.syncedAssetCount} asset(s).`
-      });
+      setStatusBanner(resultBanner(`Updated group name to "${res.group.displayName}" across ${res.syncedAssetCount} asset(s).`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
     }
@@ -242,10 +236,7 @@ export default function AssetDetailsSidePanel() {
     try {
       const res = await api.splitFaces([face.faceId], null, hostContext);
       await loadData();
-      setStatusBanner({
-        type: 'positive',
-        text: `Removed face from "${face.groupDisplayName}" into new group "${res.newGroup.displayName}". Updated asset metadata.`
-      });
+      setStatusBanner(resultBanner(`Removed face from "${face.groupDisplayName}" into new group "${res.newGroup.displayName}". Updated asset metadata.`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
     }
@@ -257,10 +248,7 @@ export default function AssetDetailsSidePanel() {
       const res = await api.moveFaces([faceId], targetGroupId, hostContext);
       setMovingFaceId(null);
       await loadData();
-      setStatusBanner({
-        type: 'positive',
-        text: `Combined face into "${res.targetGroup.displayName}" and updated asset metadata.`
-      });
+      setStatusBanner(resultBanner(`Combined face into "${res.targetGroup.displayName}" and updated asset metadata.`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
     }

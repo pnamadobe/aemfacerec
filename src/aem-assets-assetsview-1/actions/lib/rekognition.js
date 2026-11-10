@@ -1,4 +1,10 @@
 const { PublicError } = require('./security');
+const { withRetry, isRetryableAwsError } = require('./retry');
+
+// Errors that mean "nothing to match against yet" (empty collection, face or user vectors
+// not ready). Anything else, notably throttling, must NOT be treated as "no match", or every
+// face would end up in a new group.
+const NO_MATCH_ERRORS = new Set(['ResourceNotFoundException', 'InvalidParameterException']);
 
 function makeCommandClass(name) {
   return {
@@ -72,7 +78,7 @@ function chunkArray(items, chunkSize = 100) {
 /**
  * Creates a Rekognition service wrapper using the customer's BYOK AWS credentials.
  */
-function createRekognitionService(settings, customClient = null) {
+function createRekognitionService(settings, customClient = null, retryOptions = {}) {
   const collectionId = settings.collectionId || 'aem-assets-faces';
   const similarityThreshold = Number(settings.similarityThreshold ?? 85);
 
@@ -89,6 +95,8 @@ function createRekognitionService(settings, customClient = null) {
       );
     }
     return new RekognitionClient({
+      // Retries are handled by withRetry below so they are not multiplied by SDK retries
+      maxAttempts: 1,
       region: settings.awsRegion || 'us-east-1',
       credentials: {
         accessKeyId: settings.awsAccessKeyId,
@@ -97,14 +105,25 @@ function createRekognitionService(settings, customClient = null) {
     });
   }
 
+  let cachedClient = null;
+  /**
+   * Sends a Rekognition command, retrying throttling / transient errors with backoff.
+   */
+  function send(command) {
+    if (!cachedClient) cachedClient = getClient();
+    return withRetry(() => cachedClient.send(command), {
+      isRetryable: isRetryableAwsError,
+      ...retryOptions
+    });
+  }
+
   return {
     /**
      * Verifies AWS credentials and ensures the configured Rekognition Collection exists.
      */
     async ensureCollection() {
-      const client = getClient();
       try {
-        const desc = await client.send(
+        const desc = await send(
           new DescribeCollectionCommand({ CollectionId: collectionId })
         );
         return {
@@ -116,7 +135,7 @@ function createRekognitionService(settings, customClient = null) {
         };
       } catch (err) {
         if (err.name === 'ResourceNotFoundException') {
-          const created = await client.send(
+          const created = await send(
             new CreateCollectionCommand({ CollectionId: collectionId })
           );
           return {
@@ -136,20 +155,30 @@ function createRekognitionService(settings, customClient = null) {
      * Returns an array of detected face records with FaceId and normalized BoundingBox.
      */
     async indexAssetFaces(imageBuffer, assetId, { skipEnsureCollection = false } = {}) {
-      const client = getClient();
       if (!skipEnsureCollection) {
         await this.ensureCollection();
       }
 
-      const response = await client.send(
-        new IndexFacesCommand({
-          CollectionId: collectionId,
-          Image: { Bytes: imageBuffer },
-          ExternalImageId: sanitizeExternalImageId(assetId),
-          DetectionAttributes: ['DEFAULT'],
-          QualityFilter: 'AUTO'
-        })
-      );
+      let response;
+      try {
+        response = await send(
+          new IndexFacesCommand({
+            CollectionId: collectionId,
+            Image: { Bytes: imageBuffer },
+            ExternalImageId: sanitizeExternalImageId(assetId),
+            DetectionAttributes: ['DEFAULT'],
+            QualityFilter: 'AUTO'
+          })
+        );
+      } catch (err) {
+        if (err.name === 'InvalidImageFormatException') {
+          throw new PublicError('This image format is not supported for face analysis (use JPEG or PNG).');
+        }
+        if (err.name === 'ImageTooLargeException') {
+          throw new PublicError('This image is too large for face analysis.');
+        }
+        throw err;
+      }
 
       const faceRecords = response.FaceRecords || [];
       return faceRecords.map((record) => ({
@@ -170,11 +199,9 @@ function createRekognitionService(settings, customClient = null) {
      * vector is still converging in Rekognition.
      */
     async findMatchingGroup(faceId, facesDb = {}, groupsDb = {}) {
-      const client = getClient();
-
       // 1. Primary search against aggregated Rekognition Users (Face Groups)
       try {
-        const userSearch = await client.send(
+        const userSearch = await send(
           new SearchUsersCommand({
             CollectionId: collectionId,
             FaceId: faceId,
@@ -193,12 +220,13 @@ function createRekognitionService(settings, customClient = null) {
           }
         }
       } catch (err) {
-        // Fallback to SearchFaces if SearchUsers is not ready for this FaceId
+        // Fall back to SearchFaces only when SearchUsers has nothing to search yet
+        if (!NO_MATCH_ERRORS.has(err.name)) throw err;
       }
 
       // 2. Fallback search against individual indexed FaceIds
       try {
-        const faceSearch = await client.send(
+        const faceSearch = await send(
           new SearchFacesCommand({
             CollectionId: collectionId,
             FaceId: faceId,
@@ -219,7 +247,7 @@ function createRekognitionService(settings, customClient = null) {
           }
         }
       } catch (err) {
-        // Ignore if face search fails
+        if (!NO_MATCH_ERRORS.has(err.name)) throw err;
       }
 
       return null;
@@ -229,9 +257,8 @@ function createRekognitionService(settings, customClient = null) {
      * Creates a new Rekognition User (Face Group) and associates initial FaceIds with it.
      */
     async createGroup(groupId, faceIds = []) {
-      const client = getClient();
       try {
-        await client.send(
+        await send(
           new CreateUserCommand({
             CollectionId: collectionId,
             UserId: groupId
@@ -253,9 +280,8 @@ function createRekognitionService(settings, customClient = null) {
      */
     async associateFaces(groupId, faceIds = []) {
       if (!faceIds.length) return;
-      const client = getClient();
       for (const batch of chunkArray(faceIds, 100)) {
-        await client.send(
+        await send(
           new AssociateFacesCommand({
             CollectionId: collectionId,
             UserId: groupId,
@@ -271,10 +297,9 @@ function createRekognitionService(settings, customClient = null) {
      */
     async disassociateFaces(groupId, faceIds = []) {
       if (!faceIds.length) return;
-      const client = getClient();
       for (const batch of chunkArray(faceIds, 100)) {
         try {
-          await client.send(
+          await send(
             new DisassociateFacesCommand({
               CollectionId: collectionId,
               UserId: groupId,
@@ -293,9 +318,8 @@ function createRekognitionService(settings, customClient = null) {
      * Deletes a Rekognition User (Face Group) when it has been merged or emptied.
      */
     async deleteGroup(groupId) {
-      const client = getClient();
       try {
-        await client.send(
+        await send(
           new DeleteUserCommand({
             CollectionId: collectionId,
             UserId: groupId
@@ -313,9 +337,8 @@ function createRekognitionService(settings, customClient = null) {
      */
     async deleteFaces(faceIds = []) {
       if (!faceIds.length) return;
-      const client = getClient();
       for (const batch of chunkArray(faceIds, 1000)) {
-        await client.send(
+        await send(
           new DeleteFacesCommand({
             CollectionId: collectionId,
             FaceIds: batch

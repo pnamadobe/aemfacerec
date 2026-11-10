@@ -500,6 +500,33 @@ async function invokeLocalPreviewFallback(actionName, payload) {
   return {};
 }
 
+/**
+ * Builds a status banner for an operation result, downgrading it to a warning when some
+ * AEM metadata writes (or individual folder-scan items) failed.
+ */
+export function resultBanner(successText, res = {}) {
+  const issues = [];
+  if (res.failedAssetCount > 0) {
+    const first = (res.failedAssets || [])[0];
+    issues.push(
+      `AEM metadata could not be updated on ${res.failedAssetCount} asset(s)${
+        first ? ` (e.g. ${first.assetPath}: ${first.error})` : ''
+      }. Re-run "Re-sync all assets" or re-scan to retry.`
+    );
+  }
+  if (res.metadataSynced === false) {
+    issues.push(`AEM metadata could not be updated: ${res.metadataSyncError || 'unknown error'}.`);
+  }
+  const failedItems = (res.results || []).filter((r) => r.status === 'error');
+  if (failedItems.length > 0) {
+    issues.push(
+      `${failedItems.length} asset(s) failed (e.g. ${failedItems[0].assetPath}: ${failedItems[0].error}).`
+    );
+  }
+  if (issues.length === 0) return { type: 'positive', text: successText };
+  return { type: 'negative', text: `${successText} Warning: ${issues.join(' ')}` };
+}
+
 export const api = {
   listGroups: (ctx) => invokeAction('groups', { operation: 'listGroups' }, ctx),
   getAssetFaces: (params, ctx) =>
