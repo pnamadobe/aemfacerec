@@ -100,12 +100,18 @@ So that recognized people appear on Asset Details / Properties and are searchabl
    npm install --legacy-peer-deps
    cp .env.example .env
    ```
-2. Ensure `.env` includes your target AEM Author URL and fallback service credentials:
+2. Ensure `.env` includes your target AEM Author URL, a strong encryption secret and (optionally) the technical-account credentials used by the I/O Events ingestion action:
    ```dotenv
    AEM_HOST=https://author-p<program>-e<env>.adobeaemcloud.com
    AEM_AUTHOR_URL=https://author-p<program>-e<env>.adobeaemcloud.com
+   # REQUIRED – generate with: openssl rand -base64 32
+   ENCRYPTION_SECRET=<random-secret>
+   # Used ONLY by the non-web ingest-event action
    AEM_SC_JSON=<base64-encoded-aem-service-credentials-json>
+   # Keep false in production (enables seed/clear/export/import operations)
+   ENABLE_MAINTENANCE_OPS=false
    ```
+   > **Security notes:** all web actions use `require-adobe-auth: true`, so they only accept requests carrying a valid IMS token, which the Assets View host provides automatically. Web actions call AEM with the **signed-in user's** token and never with the technical account. As a result, users can only scan and tag assets they are allowed to modify in AEM. See [`SECURITY_AUDIT.md`](./SECURITY_AUDIT.md).
 3. Select your Adobe Developer Console project & workspace (`Stage` or `Production`), download the workspace config, and deploy:
    ```bash
    aio login

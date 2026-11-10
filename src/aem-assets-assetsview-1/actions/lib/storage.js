@@ -2,6 +2,35 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const {
+  PublicError,
+  assertDamPath,
+  isValidMetadataProperty,
+  requireEncryptionSecret
+} = require('./security');
+
+const AWS_REGION_PATTERN = /^[a-z]{2}(-gov)?-[a-z]+-\d$/;
+const COLLECTION_ID_PATTERN = /^[a-zA-Z0-9_.\-]{1,255}$/;
+const FACE_ID_PATTERN = /^[a-zA-Z0-9_.\-:]{1,128}$/;
+
+function isNotFoundError(err) {
+  if (!err) return false;
+  const code = String(err.code || err.name || '');
+  return (
+    code === 'ENOENT' ||
+    code === 'ERROR_FILE_NOT_EXISTS' ||
+    code === 'NotFound' ||
+    err.statusCode === 404 ||
+    /not\s*exist|not\s*found/i.test(String(err.message || ''))
+  );
+}
+
+function assertSafeFaceId(faceId) {
+  if (!FACE_ID_PATTERN.test(String(faceId || ''))) {
+    throw new Error('Invalid faceId.');
+  }
+  return String(faceId);
+}
 
 const DEFAULT_SETTINGS = {
   awsRegion: 'us-east-1',
@@ -19,7 +48,8 @@ const DEFAULT_SETTINGS = {
 /**
  * Encrypts a plaintext string using AES-256-GCM with a key derived from secret.
  */
-function encryptSecret(plaintext, secret = 'default-aem-facerec-secret-key') {
+function encryptSecret(plaintext, secret) {
+  if (!secret) throw new Error('An encryption secret is required.');
   if (!plaintext) return '';
   const key = crypto.createHash('sha256').update(String(secret)).digest();
   const iv = crypto.randomBytes(12);
@@ -32,7 +62,8 @@ function encryptSecret(plaintext, secret = 'default-aem-facerec-secret-key') {
 /**
  * Decrypts a string encrypted by encryptSecret.
  */
-function decryptSecret(payload, secret = 'default-aem-facerec-secret-key') {
+function decryptSecret(payload, secret) {
+  if (!secret) throw new Error('An encryption secret is required.');
   if (!payload) return '';
   const parts = payload.split(':');
   if (parts.length !== 3) return '';
@@ -58,10 +89,9 @@ function maskSecret(secretStr) {
  * or local filesystem / in-memory store for local development and testing.
  */
 async function createStorage(options = {}) {
-  const encryptionKey =
-    options.encryptionSecret ||
-    process.env.ENCRYPTION_SECRET ||
-    'default-aem-facerec-secret-key';
+  const encryptionKey = requireEncryptionSecret(
+    options.encryptionSecret || process.env.ENCRYPTION_SECRET
+  );
 
   let backend = options.backend || null;
 
@@ -83,7 +113,8 @@ async function createStorage(options = {}) {
               const buf = await files.read(filePath);
               return buf.toString('utf8');
             } catch (e) {
-              return null;
+              if (isNotFoundError(e)) return null;
+              throw e;
             }
           },
           async writeText(filePath, content) {
@@ -93,7 +124,8 @@ async function createStorage(options = {}) {
             try {
               return await files.read(filePath);
             } catch (e) {
-              return null;
+              if (isNotFoundError(e)) return null;
+              throw e;
             }
           },
           async writeBuffer(filePath, buffer) {
@@ -139,8 +171,13 @@ async function createStorage(options = {}) {
             }
           };
         } catch (stateErr) {
-          // Fallback to /tmp on container
+          // No persistent backend available: refuse to silently fall back to ephemeral /tmp
         }
+      }
+      if (!backend) {
+        throw new Error(
+          'No persistent storage backend (aio-lib-files / aio-lib-state) is available in this Runtime namespace.'
+        );
       }
     }
   }
@@ -159,7 +196,9 @@ async function createStorage(options = {}) {
       async writeText(filePath, content) {
         const full = path.join(baseDir, filePath);
         fs.mkdirSync(path.dirname(full), { recursive: true });
-        fs.writeFileSync(full, content, 'utf8');
+        const tmp = `${full}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tmp, content, 'utf8');
+        fs.renameSync(tmp, full);
       },
       async readBuffer(filePath) {
         const full = path.join(baseDir, filePath);
@@ -180,18 +219,22 @@ async function createStorage(options = {}) {
     };
   }
 
+  /**
+   * Reads a JSON document. A missing document yields `defaultValue`; an unreadable or corrupt
+   * document THROWS, so a transient storage error can never be persisted back as an empty DB.
+   */
   async function readJson(filePath, defaultValue) {
     const raw = await backend.readText(filePath);
-    if (!raw) return structuredClone(defaultValue);
+    if (raw === null || raw === undefined || raw === '') return structuredClone(defaultValue);
     try {
       return JSON.parse(raw);
     } catch (e) {
-      return structuredClone(defaultValue);
+      throw new Error(`Stored document ${filePath} is corrupt and could not be parsed.`);
     }
   }
 
   async function writeJson(filePath, data) {
-    await backend.writeText(filePath, JSON.stringify(data, null, 2));
+    await backend.writeText(filePath, JSON.stringify(data));
   }
 
   return {
@@ -213,16 +256,27 @@ async function createStorage(options = {}) {
         readJson('db/counters.json', { nextPersonNumber: 1 }),
         readJson('db/settings.json', {})
       ]);
-      return { groups, faces, assets, counters, settingsRaw };
+      // Never export credentials, even encrypted
+      const { awsSecretAccessKeyEncrypted, awsAccessKeyId, ...settingsRawSafe } = settingsRaw;
+      return { groups, faces, assets, counters, settingsRaw: settingsRawSafe };
     },
 
-    async importRawSnapshot({ groups, faces, assets, counters, settingsRaw }) {
+    /**
+     * Restores face data from a snapshot. Settings (and credentials) are intentionally NOT
+     * imported; use saveSettings so they go through validation.
+     */
+    async importRawSnapshot({ groups, faces, assets, counters }) {
+      const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
+      for (const [name, value] of Object.entries({ groups, faces, assets, counters })) {
+        if (value !== undefined && !isPlainObject(value)) {
+          throw new PublicError(`Snapshot field '${name}' must be an object.`);
+        }
+      }
       const ops = [];
       if (groups) ops.push(writeJson('db/groups.json', groups));
       if (faces) ops.push(writeJson('db/faces.json', faces));
       if (assets) ops.push(writeJson('db/assets.json', assets));
       if (counters) ops.push(writeJson('db/counters.json', counters));
-      if (settingsRaw) ops.push(writeJson('db/settings.json', settingsRaw));
       await Promise.all(ops);
     },
 
@@ -276,8 +330,12 @@ async function createStorage(options = {}) {
       const currentRaw = await readJson('db/settings.json', {});
       const updated = { ...DEFAULT_SETTINGS, ...currentRaw };
 
-      if (typeof newSettings.awsRegion === 'string') {
-        updated.awsRegion = newSettings.awsRegion.trim();
+      if (typeof newSettings.awsRegion === 'string' && newSettings.awsRegion.trim()) {
+        const region = newSettings.awsRegion.trim();
+        if (!AWS_REGION_PATTERN.test(region)) {
+          throw new PublicError(`Invalid AWS region: ${region}`);
+        }
+        updated.awsRegion = region;
       }
       if (typeof newSettings.awsAccessKeyId === 'string') {
         updated.awsAccessKeyId = newSettings.awsAccessKeyId.trim();
@@ -293,7 +351,11 @@ async function createStorage(options = {}) {
         );
       }
       if (typeof newSettings.collectionId === 'string' && newSettings.collectionId.trim()) {
-        updated.collectionId = newSettings.collectionId.trim();
+        const collectionId = newSettings.collectionId.trim();
+        if (!COLLECTION_ID_PATTERN.test(collectionId)) {
+          throw new PublicError('Collection ID may only contain letters, digits, _ . and -.');
+        }
+        updated.collectionId = collectionId;
       }
       if (newSettings.similarityThreshold !== undefined) {
         updated.similarityThreshold = Math.min(
@@ -302,7 +364,13 @@ async function createStorage(options = {}) {
         );
       }
       if (typeof newSettings.metadataProperty === 'string' && newSettings.metadataProperty.trim()) {
-        updated.metadataProperty = newSettings.metadataProperty.trim();
+        const prop = newSettings.metadataProperty.trim();
+        if (!isValidMetadataProperty(prop)) {
+          throw new PublicError(
+            `Invalid metadata property '${prop}'. Use a namespaced name such as 'xdm:faceNames'.`
+          );
+        }
+        updated.metadataProperty = prop;
       }
       if (typeof newSettings.includeUnnamedInMetadata === 'boolean') {
         updated.includeUnnamedInMetadata = newSettings.includeUnnamedInMetadata;
@@ -316,7 +384,8 @@ async function createStorage(options = {}) {
       if (Array.isArray(newSettings.enabledFolders)) {
         updated.enabledFolders = newSettings.enabledFolders
           .map((f) => String(f).trim())
-          .filter(Boolean);
+          .filter(Boolean)
+          .map((f) => assertDamPath(f, 'enabled folder'));
       }
 
       await writeJson('db/settings.json', updated);
@@ -324,17 +393,17 @@ async function createStorage(options = {}) {
     },
 
     async saveAvatar(faceId, buffer) {
-      const filePath = `avatars/${faceId}.jpg`;
+      const filePath = `avatars/${assertSafeFaceId(faceId)}.jpg`;
       await backend.writeBuffer(filePath, buffer);
       return filePath;
     },
 
     async getAvatar(faceId) {
-      return backend.readBuffer(`avatars/${faceId}.jpg`);
+      return backend.readBuffer(`avatars/${assertSafeFaceId(faceId)}.jpg`);
     },
 
     async deleteAvatar(faceId) {
-      await backend.deleteFile(`avatars/${faceId}.jpg`);
+      await backend.deleteFile(`avatars/${assertSafeFaceId(faceId)}.jpg`);
     }
   };
 }

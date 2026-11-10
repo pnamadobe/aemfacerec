@@ -1,10 +1,8 @@
 const { createFaceService } = require('../lib/face-service');
+const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
+const { errorResponse } = require('../lib/security');
 
-function extractBearerToken(params) {
-  const headers = params.__ow_headers || {};
-  const auth = headers.authorization || headers.Authorization || params.token || '';
-  return auth.replace(/^Bearer\s+/i, '');
-}
+const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
  * Extracts assetPath and assetId from an Adobe I/O Events payload
@@ -33,19 +31,14 @@ function extractAssetFromIoEvent(params) {
 }
 
 async function main(params = {}) {
-  const corsHeaders = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-gw-ims-org-id',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-  };
+  const corsHeaders = buildCors('GET, POST, OPTIONS');
 
   if (params.__ow_method === 'options') {
     return { statusCode: 200, headers: corsHeaders, body: {} };
   }
 
   // Adobe I/O Events Webhook Challenge verification
-  if (params.challenge) {
+  if (params.challenge && CHALLENGE_PATTERN.test(String(params.challenge))) {
     return {
       statusCode: 200,
       headers: corsHeaders,
@@ -54,20 +47,13 @@ async function main(params = {}) {
   }
 
   try {
-    if (params.AEM_SC_JSON) process.env.AEM_SC_JSON = params.AEM_SC_JSON;
-    if (params.AEM_DEV_TOKEN) process.env.AEM_DEV_TOKEN = params.AEM_DEV_TOKEN;
-    if (params.AEM_AUTHOR_URL) process.env.AEM_AUTHOR_URL = params.AEM_AUTHOR_URL;
-    if (params.AEM_HOST) process.env.AEM_HOST = params.AEM_HOST;
-
-    const token = extractBearerToken(params);
-    const aemHost =
-      params.aemHost ||
-      params.aemAuthorUrl ||
-      params.AEM_AUTHOR_URL ||
-      params.AEM_HOST ||
-      process.env.AEM_AUTHOR_URL ||
-      process.env.AEM_HOST;
-    const faceService = await createFaceService({ aemHost, token });
+    const ctx = buildActionContext(params);
+    const faceService = await createFaceService({
+      aemHost: ctx.aemHost,
+      token: ctx.token,
+      serviceCredentials: ctx.serviceCredentials,
+      encryptionSecret: ctx.encryptionSecret
+    });
 
     const operation = params.operation || 'ingestAsset';
 
@@ -91,7 +77,7 @@ async function main(params = {}) {
         assets: Array.isArray(params.assets) ? params.assets : null,
         offset: params.offset,
         limit: params.limit,
-        timeBudgetMs: params.timeBudgetMs,
+        timeBudgetMs: Math.min(Math.max(Number(params.timeBudgetMs) || 20000, 1000), 25000),
         force: params.force !== undefined ? Boolean(params.force) : true
       });
       return { statusCode: 200, headers: corsHeaders, body: result };
@@ -121,13 +107,7 @@ async function main(params = {}) {
       body: result
     };
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers: corsHeaders,
-      body: {
-        error: err.message || 'Failed to ingest asset for facial recognition.'
-      }
-    };
+    return errorResponse(err, corsHeaders, 'Failed to ingest asset for facial recognition.');
   }
 }
 

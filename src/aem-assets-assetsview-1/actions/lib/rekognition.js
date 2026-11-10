@@ -1,3 +1,5 @@
+const { PublicError } = require('./security');
+
 function makeCommandClass(name) {
   return {
     [name]: class {
@@ -77,7 +79,7 @@ function createRekognitionService(settings, customClient = null) {
   function getClient() {
     if (customClient) return customClient;
     if (!settings.awsAccessKeyId || !settings.awsSecretAccessKey) {
-      throw new Error(
+      throw new PublicError(
         'AWS Rekognition credentials are not configured. Please provide your AWS Access Key ID and Secret Access Key in the Face Recognition Settings tab.'
       );
     }

@@ -1,40 +1,37 @@
 const { createFaceService } = require('../lib/face-service');
+const { createStorage } = require('../lib/storage');
+const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
+const { PublicError, errorResponse } = require('../lib/security');
 
-function extractBearerToken(params) {
-  const headers = params.__ow_headers || {};
-  const auth = headers.authorization || headers.Authorization || params.token || '';
-  return auth.replace(/^Bearer\s+/i, '');
-}
+const MAINTENANCE_OPERATIONS = new Set([
+  'seedDemoData',
+  'clearAllData',
+  'exportSnapshot',
+  'importSnapshot'
+]);
 
 async function main(params = {}) {
-  const corsHeaders = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-gw-ims-org-id',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
-  };
+  const corsHeaders = buildCors('GET, POST, OPTIONS');
 
   if (params.__ow_method === 'options') {
     return { statusCode: 200, headers: corsHeaders, body: {} };
   }
 
   try {
-    if (params.AEM_SC_JSON) process.env.AEM_SC_JSON = params.AEM_SC_JSON;
-    if (params.AEM_DEV_TOKEN) process.env.AEM_DEV_TOKEN = params.AEM_DEV_TOKEN;
-    if (params.AEM_AUTHOR_URL) process.env.AEM_AUTHOR_URL = params.AEM_AUTHOR_URL;
-    if (params.AEM_HOST) process.env.AEM_HOST = params.AEM_HOST;
-
-    const token = extractBearerToken(params);
-    const aemHost =
-      params.aemHost ||
-      params.aemAuthorUrl ||
-      params.AEM_AUTHOR_URL ||
-      params.AEM_HOST ||
-      process.env.AEM_AUTHOR_URL ||
-      process.env.AEM_HOST;
-    const faceService = await createFaceService({ aemHost, token });
-
+    const ctx = buildActionContext(params);
     const operation = params.operation || 'listGroups';
+
+    if (MAINTENANCE_OPERATIONS.has(operation) && !ctx.maintenanceOpsEnabled) {
+      throw new PublicError(`Operation '${operation}' is disabled in this deployment.`, 403);
+    }
+
+    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
+    const faceService = await createFaceService({
+      aemHost: ctx.aemHost,
+      token: ctx.token,
+      serviceCredentials: ctx.serviceCredentials,
+      storage
+    });
 
     switch (operation) {
       case 'listGroups': {
@@ -111,13 +108,11 @@ async function main(params = {}) {
       }
 
       case 'exportSnapshot': {
-        const storage = await require('../lib/storage').createStorage();
         const snapshot = await storage.exportRawSnapshot();
         return { statusCode: 200, headers: corsHeaders, body: snapshot };
       }
 
       case 'importSnapshot': {
-        const storage = await require('../lib/storage').createStorage();
         await storage.importRawSnapshot(params.snapshot || {});
         const result = await faceService.listGroups();
         return { statusCode: 200, headers: corsHeaders, body: result };
@@ -131,13 +126,7 @@ async function main(params = {}) {
         };
     }
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers: corsHeaders,
-      body: {
-        error: err.message || 'Error processing face groups operation.'
-      }
-    };
+    return errorResponse(err, corsHeaders, 'Error processing face groups operation.');
   }
 }
 

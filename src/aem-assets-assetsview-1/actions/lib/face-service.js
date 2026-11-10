@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { createStorage } = require('./storage');
 const { createRekognitionService } = require('./rekognition');
 const { createAemClient, normalizeDamPath } = require('./aem');
+const { PublicError, assertDamPath } = require('./security');
 const {
   AVATAR_SIZE,
   cropFaceAvatar,
@@ -10,7 +11,8 @@ const {
 } = require('./cropper');
 
 function generateGroupId() {
-  return `grp_${crypto.randomBytes(4).toString('hex')}`;
+  // 128 bits: collisions would silently merge two people's groups
+  return `grp_${crypto.randomBytes(16).toString('hex')}`;
 }
 
 /**
@@ -65,12 +67,15 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
 async function createFaceService({
   aemHost,
   token,
+  serviceCredentials = null,
+  encryptionSecret,
   storage: customStorage,
   rekognitionClient: customRekognitionClient,
   aemClient: customAemClient
 } = {}) {
-  const storage = customStorage || (await createStorage());
-  const aemClient = customAemClient || createAemClient({ aemHost, token });
+  const storage = customStorage || (await createStorage({ encryptionSecret }));
+  const aemClient =
+    customAemClient || createAemClient({ aemHost, token, serviceCredentials });
 
   async function getRekognition() {
     const settings = await storage.getSettings({ includeDecryptedSecret: true });
@@ -208,7 +213,7 @@ async function createFaceService({
     rekognition,
     collectionEnsured = false
   }) {
-    let cleanPath = normalizeDamPath(assetPath);
+    let cleanPath = assetPath ? assertDamPath(assetPath, 'asset path') : '';
     if (!cleanPath && assetId) {
       const resolvedFromUuid = await aemClient.resolvePathByAssetUuid(assetId);
       if (resolvedFromUuid) {
@@ -423,6 +428,13 @@ async function createFaceService({
       timeBudgetMs = 20000
     }) {
       const startTime = Date.now();
+      folderPath = assertDamPath(folderPath, 'folder path');
+      if (Array.isArray(explicitAssets)) {
+        if (explicitAssets.length > 50) {
+          throw new PublicError('A scan batch may contain at most 50 assets.');
+        }
+        explicitAssets.forEach((a) => assertDamPath(a && a.assetPath, 'asset path'));
+      }
       const [allAssets, { settings, rekognition }, db] = await Promise.all([
         Array.isArray(explicitAssets)
           ? Promise.resolve(explicitAssets)
@@ -630,10 +642,13 @@ async function createFaceService({
 
       const group = db.groups[groupId];
       if (!group) {
-        throw new Error(`Face Group '${groupId}' not found.`);
+        throw new PublicError(`Face Group '${groupId}' not found.`, 404);
       }
 
       const cleanName = typeof name === 'string' && name.trim() !== '' ? name.trim() : null;
+      if (cleanName && cleanName.length > 200) {
+        throw new PublicError('Group names must be 200 characters or fewer.');
+      }
       group.name = cleanName;
       group.updatedAt = new Date().toISOString();
 
@@ -657,7 +672,7 @@ async function createFaceService({
      */
     async splitFacesToNewGroup({ faceIds = [], newGroupName = null }) {
       if (!Array.isArray(faceIds) || faceIds.length === 0) {
-        throw new Error('At least one faceId must be provided to split into a new group.');
+        throw new PublicError('At least one faceId must be provided to split into a new group.');
       }
 
       const { settings, rekognition } = await getRekognition();
@@ -666,7 +681,7 @@ async function createFaceService({
 
       const validFaceIds = faceIds.filter((fId) => Boolean(db.faces[fId]));
       if (validFaceIds.length === 0) {
-        throw new Error('None of the specified faceIds exist.');
+        throw new PublicError('None of the specified faceIds exist.', 404);
       }
 
       // Group faces by their current groupId so we can disassociate them cleanly
@@ -738,7 +753,7 @@ async function createFaceService({
      */
     async moveFacesToGroup({ faceIds = [], targetGroupId }) {
       if (!Array.isArray(faceIds) || faceIds.length === 0) {
-        throw new Error('At least one faceId is required.');
+        throw new PublicError('At least one faceId is required.');
       }
 
       const { settings, rekognition } = await getRekognition();
@@ -747,7 +762,7 @@ async function createFaceService({
 
       const targetGroup = db.groups[targetGroupId];
       if (!targetGroup) {
-        throw new Error(`Target Face Group '${targetGroupId}' not found.`);
+        throw new PublicError(`Target Face Group '${targetGroupId}' not found.`, 404);
       }
 
       const facesToMove = faceIds.filter(
@@ -820,7 +835,7 @@ async function createFaceService({
       );
 
       if (!targetGroupId || sources.length === 0) {
-        throw new Error('A targetGroupId and at least one distinct sourceGroupId are required.');
+        throw new PublicError('A targetGroupId and at least one distinct sourceGroupId are required.');
       }
 
       const { settings, rekognition } = await getRekognition();
@@ -829,7 +844,7 @@ async function createFaceService({
 
       const targetGroup = db.groups[targetGroupId];
       if (!targetGroup) {
-        throw new Error(`Target Face Group '${targetGroupId}' not found.`);
+        throw new PublicError(`Target Face Group '${targetGroupId}' not found.`, 404);
       }
 
       const allMovedFaceIds = [];

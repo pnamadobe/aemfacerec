@@ -1,33 +1,19 @@
 const { createStorage } = require('../lib/storage');
 const { createRekognitionService } = require('../lib/rekognition');
 const { createFaceService } = require('../lib/face-service');
-
-function extractBearerToken(params) {
-  const headers = params.__ow_headers || {};
-  const auth = headers.authorization || headers.Authorization || params.token || '';
-  return auth.replace(/^Bearer\s+/i, '');
-}
+const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
+const { PublicError, errorResponse } = require('../lib/security');
 
 async function main(params = {}) {
-  const corsHeaders = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-gw-ims-org-id',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS'
-  };
+  const corsHeaders = buildCors('GET, POST, OPTIONS');
 
   if (params.__ow_method === 'options') {
     return { statusCode: 200, headers: corsHeaders, body: {} };
   }
 
   try {
-    if (params.AEM_SC_JSON) process.env.AEM_SC_JSON = params.AEM_SC_JSON;
-    if (params.AEM_DEV_TOKEN) process.env.AEM_DEV_TOKEN = params.AEM_DEV_TOKEN;
-    if (params.AEM_AUTHOR_URL) process.env.AEM_AUTHOR_URL = params.AEM_AUTHOR_URL;
-    if (params.AEM_HOST) process.env.AEM_HOST = params.AEM_HOST;
-
-    const encryptionSecret = params.ENCRYPTION_SECRET || process.env.ENCRYPTION_SECRET;
-    const storage = await createStorage({ encryptionSecret });
+    const ctx = buildActionContext(params);
+    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
     const operation = params.operation || 'getSettings';
 
     if (operation === 'getSettings') {
@@ -41,7 +27,10 @@ async function main(params = {}) {
 
     if (operation === 'saveSettings') {
       const previousSettings = await storage.getSettings({ includeDecryptedSecret: false });
-      const updatedSettings = await storage.saveSettings(params.settings || params);
+      if (!params.settings || typeof params.settings !== 'object') {
+        throw new PublicError('A settings object is required.');
+      }
+      const updatedSettings = await storage.saveSettings(params.settings);
 
       // If includeUnnamedInMetadata or metadataProperty changed, re-sync all AEM assets automatically
       let resyncResult = null;
@@ -49,9 +38,12 @@ async function main(params = {}) {
         previousSettings.includeUnnamedInMetadata !== updatedSettings.includeUnnamedInMetadata ||
         previousSettings.metadataProperty !== updatedSettings.metadataProperty
       ) {
-        const token = extractBearerToken(params);
-        const aemHost = params.aemHost || params.AEM_HOST || process.env.AEM_HOST;
-        const faceService = await createFaceService({ aemHost, token, storage });
+        const faceService = await createFaceService({
+          aemHost: ctx.aemHost,
+          token: ctx.token,
+          serviceCredentials: ctx.serviceCredentials,
+          storage
+        });
         resyncResult = await faceService.resyncAllAssetsMetadata();
       }
 
@@ -86,7 +78,16 @@ async function main(params = {}) {
       };
 
       const rekognition = createRekognitionService(testConfig);
-      const collectionStatus = await rekognition.ensureCollection();
+      let collectionStatus;
+      try {
+        collectionStatus = await rekognition.ensureCollection();
+      } catch (awsErr) {
+        if (awsErr.expose) throw awsErr;
+        throw new PublicError(
+          `Could not connect to AWS Rekognition (${awsErr.name || 'Error'}). Check the region and credentials.`,
+          502
+        );
+      }
 
       return {
         statusCode: 200,
@@ -104,13 +105,7 @@ async function main(params = {}) {
       body: { error: `Unknown settings operation: ${operation}` }
     };
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers: corsHeaders,
-      body: {
-        error: err.message || 'Settings operation failed.'
-      }
-    };
+    return errorResponse(err, corsHeaders, 'Settings operation failed.');
   }
 }
 

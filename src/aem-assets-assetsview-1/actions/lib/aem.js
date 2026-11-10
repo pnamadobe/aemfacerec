@@ -11,6 +11,12 @@
  */
 
 const crypto = require('crypto');
+const {
+  PublicError,
+  assertDamPath,
+  isValidDamPath,
+  isValidMetadataProperty
+} = require('./security');
 
 function normalizeAemHost(aemHost) {
   if (!aemHost) return '';
@@ -26,6 +32,16 @@ function normalizeDamPath(assetPath) {
   let clean = String(assetPath).trim();
   if (!clean.startsWith('/')) clean = `/${clean}`;
   return clean;
+}
+
+/**
+ * Segment-aware prefix match: '/content/dam/events' matches '/content/dam/events/x.jpg'
+ * but not '/content/dam/events-private/x.jpg'.
+ */
+function isPathWithin(childPath, parentPath) {
+  const parent = normalizeDamPath(parentPath).replace(/\/+$/, '');
+  const child = normalizeDamPath(childPath);
+  return child === parent || child.startsWith(`${parent}/`);
 }
 
 function encodeDamPath(damPath) {
@@ -52,19 +68,22 @@ const b64url = (x) =>
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 
-let cachedServiceToken = null;
-let cachedServiceTokenExp = 0;
+const serviceTokenCache = new Map();
 
 /**
- * Exchanges base64-encoded AEM Service Credentials JSON (AEM_SC_JSON) for an IMS access token.
+ * Exchanges base64-encoded AEM Service Credentials JSON (scJson) for an IMS access token,
+ * falling back to a static devToken. Credentials are passed explicitly (never read from
+ * process.env) so warm containers cannot leak them between invocations.
  */
-async function getFallbackServiceToken(fetchImpl = global.fetch) {
+async function getServiceToken(fetchImpl, { scJson, devToken } = {}) {
   const now = Math.floor(Date.now() / 1000);
-  if (cachedServiceToken && cachedServiceTokenExp > now + 60) {
-    return cachedServiceToken;
+  const scB64 = scJson || '';
+  const cacheKey = scB64 ? crypto.createHash('sha256').update(scB64).digest('hex') : '';
+  const cached = cacheKey && serviceTokenCache.get(cacheKey);
+  if (cached && cached.exp > now + 60) {
+    return cached.token;
   }
 
-  const scB64 = process.env.AEM_SC_JSON;
   if (scB64 && fetchImpl) {
     try {
       const raw = JSON.parse(Buffer.from(scB64, 'base64').toString('utf8'));
@@ -95,18 +114,17 @@ async function getFallbackServiceToken(fetchImpl = global.fetch) {
       if (r.ok) {
         const data = await r.json();
         if (data.access_token) {
-          cachedServiceToken = data.access_token;
-          cachedServiceTokenExp = now + 240;
-          return cachedServiceToken;
+          serviceTokenCache.set(cacheKey, { token: data.access_token, exp: now + 240 });
+          return data.access_token;
         }
       }
     } catch (e) {
-      // Fall through to AEM_DEV_TOKEN
+      // Fall through to devToken
     }
   }
 
-  if (process.env.AEM_DEV_TOKEN) {
-    return String(process.env.AEM_DEV_TOKEN).trim();
+  if (devToken) {
+    return String(devToken).trim();
   }
 
   return '';
@@ -122,11 +140,16 @@ function isHtmlPayload(textOrBuf) {
 
 /**
  * Creates an AEM client bound to an author host and IMS bearer token.
+ *
+ * Authentication is deliberately strict:
+ * - If a user token is supplied, ONLY that token is used (no silent escalation to the
+ *   technical account when AEM rejects the user).
+ * - `serviceCredentials` ({ scJson, devToken }) are only used when no user token is present,
+ *   and callers must only pass them for trusted, non-web invocations (I/O Events) against
+ *   the deployment-configured AEM host.
  */
-function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
-  const baseUrl = normalizeAemHost(
-    aemHost || process.env.AEM_AUTHOR_URL || process.env.AEM_HOST
-  );
+function createAemClient({ aemHost, token, fetchImpl = global.fetch, serviceCredentials = null } = {}) {
+  const baseUrl = normalizeAemHost(aemHost);
 
   function buildAuthHeaders(bearerToken, extra = {}) {
     const headers = { ...extra };
@@ -138,31 +161,29 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     return headers;
   }
 
+  let resolvedTokenPromise = null;
+  function resolveToken() {
+    if (token) return Promise.resolve(token);
+    if (!serviceCredentials) return Promise.resolve('');
+    if (!resolvedTokenPromise) {
+      resolvedTokenPromise = getServiceToken(fetchImpl, serviceCredentials);
+    }
+    return resolvedTokenPromise;
+  }
+
   /**
-   * Executes a fetch against AEM with automatic fallback to AEM_SC_JSON / AEM_DEV_TOKEN
-   * if the caller token is missing or if AEM returns an HTML login redirect (`<!DOCTYPE html>`).
+   * Executes an authenticated fetch against the bound AEM host.
    */
   async function fetchAemWithFallback(url, options = {}) {
-    let activeToken = token || (await getFallbackServiceToken(fetchImpl));
-    let res = await fetchImpl(url, {
+    if (!String(url).startsWith(`${baseUrl}/`)) {
+      throw new Error('Refusing to send AEM credentials to a different origin.');
+    }
+    const activeToken = await resolveToken();
+    return fetchImpl(url, {
       ...options,
+      redirect: 'manual',
       headers: buildAuthHeaders(activeToken, options.headers)
     });
-
-    const contentType = String(res.headers?.get?.('content-type') || '').toLowerCase();
-    const needsRetry = !res.ok || contentType.includes('text/html');
-
-    if (needsRetry && token) {
-      const fallbackToken = await getFallbackServiceToken(fetchImpl);
-      if (fallbackToken && fallbackToken !== activeToken) {
-        res = await fetchImpl(url, {
-          ...options,
-          headers: buildAuthHeaders(fallbackToken, options.headers)
-        });
-      }
-    }
-
-    return res;
   }
 
   /**
@@ -192,13 +213,13 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
      * Checks whether an asset's folder is eligible for Face Recognition.
      */
     async checkFolderEligibility(assetPath, settings) {
-      const cleanPath = normalizeDamPath(assetPath);
+      const cleanPath = assertDamPath(assetPath, 'asset path');
       const enabledFolders = Array.isArray(settings.enabledFolders)
         ? settings.enabledFolders
         : ['/content/dam'];
 
       const matchesFolderPrefix = enabledFolders.some((prefix) =>
-        cleanPath.startsWith(normalizeDamPath(prefix))
+        isPathWithin(cleanPath, prefix)
       );
 
       if (!settings.requireProcessingProfile) {
@@ -254,7 +275,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
       const specificFolderConfigured = enabledFolders.some(
         (prefix) =>
           normalizeDamPath(prefix) !== '/content/dam' &&
-          cleanPath.startsWith(normalizeDamPath(prefix))
+          isPathWithin(cleanPath, prefix)
       );
 
       if (specificFolderConfigured) {
@@ -277,7 +298,9 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
     async resolvePathByAssetUuid(assetId) {
       if (!assetId || !baseUrl || !fetchImpl) return null;
       const rawUuid = String(assetId).replace(/^urn:aaid:aem:/i, '').trim();
-      if (!rawUuid || rawUuid.startsWith('/content/dam')) return rawUuid;
+      if (!rawUuid) return null;
+      if (rawUuid.startsWith('/')) return isValidDamPath(rawUuid) ? rawUuid : null;
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(rawUuid)) return null;
 
       try {
         const qbUrl = `${baseUrl}/bin/querybuilder.json?property=jcr:uuid&property.value=${encodeURIComponent(
@@ -285,7 +308,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
         )}&p.limit=1`;
         const data = await fetchAemJson(qbUrl);
         const hitPath = data.hits?.[0]?.path;
-        if (hitPath && hitPath.startsWith('/content/dam')) {
+        if (hitPath && isValidDamPath(hitPath)) {
           return hitPath;
         }
       } catch (e) {
@@ -298,7 +321,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
      * Fetches basic asset info (assetId / jcr:uuid, title, mimeType) from AEM.
      */
     async getAssetInfo(assetPath) {
-      const cleanPath = normalizeDamPath(assetPath);
+      const cleanPath = assertDamPath(assetPath, 'asset path');
       const fallbackTitle = cleanPath.split('/').pop() || 'asset.jpg';
 
       if (!baseUrl || !fetchImpl) {
@@ -340,7 +363,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
      * Downloads the 1280x1280 JPEG web rendition (or fallback rendition) of an AEM asset as a Buffer.
      */
     async fetchAssetRenditionBuffer(assetPath) {
-      const cleanPath = normalizeDamPath(assetPath);
+      const cleanPath = assertDamPath(assetPath, 'asset path');
       if (!baseUrl || !fetchImpl) {
         throw new Error('AEM host URL is required to download asset renditions.');
       }
@@ -379,7 +402,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
      * Lists both child folders and image assets inside a DAM folder via the AEM Assets HTTP API.
      */
     async browseDamFolder(folderPath = '/content/dam') {
-      const cleanFolder = normalizeDamPath(folderPath) || '/content/dam';
+      const cleanFolder = assertDamPath(folderPath || '/content/dam', 'folder path');
       if (!baseUrl || !fetchImpl) {
         return {
           folderPath: cleanFolder,
@@ -456,7 +479,10 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
       assetPath,
       { faceNames = [], faceGroupIds = [], faceCount = 0, metadataProperty = 'xdm:faceNames' }
     ) {
-      const cleanPath = normalizeDamPath(assetPath);
+      const cleanPath = assertDamPath(assetPath, 'asset path');
+      if (!isValidMetadataProperty(metadataProperty)) {
+        throw new PublicError(`Invalid metadata property name: ${metadataProperty}`);
+      }
       if (!baseUrl || !fetchImpl) {
         return {
           updated: false,
@@ -503,7 +529,7 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
 
       if (!slingRes.ok) {
         const relPath = toApiAssetsRelativePath(cleanPath);
-        await fetchAemWithFallback(`${baseUrl}/api/assets/${relPath}`, {
+        const apiRes = await fetchAemWithFallback(`${baseUrl}/api/assets/${relPath}`, {
           method: 'PUT',
           headers: {
             'Content-Type': 'application/json'
@@ -519,6 +545,11 @@ function createAemClient({ aemHost, token, fetchImpl = global.fetch } = {}) {
             }
           })
         });
+        if (!apiRes.ok) {
+          throw new Error(
+            `Failed to write face metadata to AEM (HTTP ${slingRes.status} / ${apiRes.status}) for ${cleanPath}`
+          );
+        }
       }
 
       return {
@@ -538,5 +569,6 @@ module.exports = {
   createAemClient,
   normalizeAemHost,
   normalizeDamPath,
+  isPathWithin,
   toApiAssetsRelativePath
 };

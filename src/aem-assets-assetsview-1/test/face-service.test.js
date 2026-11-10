@@ -304,7 +304,8 @@ test('6. Runtime Action entry points (ingest, groups, settings) handle requests 
   assert.equal(challengeRes.body.challenge, 'verify-token-123');
 
   // 2. Seed demo data & list groups through groups Runtime Action
-  const seedRes = await groupsAction.main({ operation: 'seedDemoData' });
+  // (maintenance operations must be explicitly enabled by the deployment input)
+  const seedRes = await groupsAction.main({ operation: 'seedDemoData', ENABLE_MAINTENANCE_OPS: 'true' });
   assert.equal(seedRes.statusCode, 200);
   assert.equal(seedRes.body.totalGroups, 4);
   assert.equal(seedRes.body.totalFaces, 7);
