@@ -43,7 +43,16 @@ function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') 
   const repoId = normalizedHost.replace(/^https?:\/\//i, '');
   const expOrigin = hostContext.experienceOrigin || 'https://experience.adobe.com';
   const tenantPart = hostContext.imsTenant ? `/@${hostContext.imsTenant}` : '';
-  return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#${tenantPart}/assets/detail${cleanPath}`;
+  const queryParams = new URLSearchParams({ repoId });
+  try {
+    const extHost = window.location?.origin || '';
+    if (/\.adobeio-static\.net$/i.test(extHost)) {
+      queryParams.set('ext', extHost);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return `${expOrigin}/?${queryParams.toString()}#${tenantPart}/assets/detail${cleanPath}`;
 }
 
 /**
