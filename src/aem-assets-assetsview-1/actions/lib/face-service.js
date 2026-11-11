@@ -349,6 +349,7 @@ async function createFaceService({
       );
     }
 
+    const nextOffset = startIdx + processedCount;
     const hasMore = stoppedForTimeBudget || nextOffset < dedupedRecords.length;
     const remainingAssetCount = Math.max(0, dedupedRecords.length - nextOffset);
     // When onlyIfChanged filters out already-synced records on the next call, the remaining
