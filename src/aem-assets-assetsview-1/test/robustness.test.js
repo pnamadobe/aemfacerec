@@ -610,11 +610,12 @@ test('R8: rename is saved even when some AEM metadata writes fail, and failures 
     const db = await h.reloadDb();
     assert.equal(db.groups[groupId].name, 'Alice');
 
-    // Retrying via resync succeeds once AEM recovers
+    // Retrying via resync succeeds once AEM recovers (only the 1 failed asset needs an AEM write; the already-synced asset is skipped)
     h.aem.failPaths.clear();
     const resync = await h.svc.resyncAllAssetsMetadata();
     assert.equal(resync.failedAssetCount, 0);
-    assert.equal(resync.syncedAssetCount, 2);
+    assert.equal(resync.syncedAssetCount, 1);
+    assert.equal(resync.skippedUnchangedCount, 1);
     assert.equal((await h.reloadDb()).assets.A2.metadataSyncError, null);
   } finally {
     restore();
@@ -660,7 +661,7 @@ test('R7: AEM metadata writes run in parallel with a bounded concurrency of 4', 
       await h.svc.ingestAsset({ assetPath: `/content/dam/p/${i}.jpg`, assetId: `A${i}`, force: true });
     }
     h.aem.setWriteDelay(15);
-    const res = await h.svc.resyncAllAssetsMetadata();
+    const res = await h.svc.resyncAllAssetsMetadata({ onlyIfChanged: false });
     assert.equal(res.syncedAssetCount, 10);
     assert.ok(h.aem.maxInFlight > 1 && h.aem.maxInFlight <= 4, `max in flight: ${h.aem.maxInFlight}`);
   } finally {

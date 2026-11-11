@@ -330,10 +330,9 @@ test('R14: resyncAllAssetsMetadata stops cleanly when its time budget expires an
     const firstChunk = await svc.resyncAllAssetsMetadata({ offset: 0, timeBudgetMs: 15 });
     assert.equal(firstChunk.hasMoreToSync, true);
     assert.ok(firstChunk.syncedAssetCount >= 4 && firstChunk.syncedAssetCount < 12);
-    assert.equal(firstChunk.nextSyncOffset, firstChunk.syncedAssetCount);
     assert.equal(firstChunk.remainingAssetCount, 12 - firstChunk.syncedAssetCount);
 
-    // Resume from nextSyncOffset with generous budget to finish the rest
+    // Resume from nextSyncOffset with generous budget to finish the remaining unsynced assets
     const rest = await svc.resyncAllAssetsMetadata({
       offset: firstChunk.nextSyncOffset,
       timeBudgetMs: 5000

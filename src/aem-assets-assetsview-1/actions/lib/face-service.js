@@ -349,9 +349,11 @@ async function createFaceService({
       );
     }
 
-    const nextOffset = startIdx + processedCount;
     const hasMore = stoppedForTimeBudget || nextOffset < dedupedRecords.length;
     const remainingAssetCount = Math.max(0, dedupedRecords.length - nextOffset);
+    // When onlyIfChanged filters out already-synced records on the next call, the remaining
+    // unsynced records shift to index 0, so nextOffset for onlyIfChanged is always 0.
+    const nextCallOffset = hasMore ? (onlyIfChanged ? 0 : nextOffset) : null;
 
     return {
       synced,
@@ -360,7 +362,7 @@ async function createFaceService({
       totalAssets: dedupedRecords.length,
       processedCount,
       hasMore,
-      nextOffset: hasMore ? nextOffset : null,
+      nextOffset: nextCallOffset,
       remainingAssetCount
     };
   }
