@@ -70,7 +70,7 @@ The remaining open items (`S8` cross-account IAM role and `S11` multi-org shared
 | R12 | Medium | 32-bit group IDs; a collision overwrites a group. | ✅ | 128-bit IDs. |
 | R13 | Medium | `getAssetFaces` (a read) rewrote the whole database when resolving a UUID. | ✅ | Removed `saveDatabase` from `getAssetFaces`; read paths never mutate storage. |
 | R14 | High | Renaming a group, re-syncing and settings toggles did one AEM write per asset in a single request and saved only at the end. | ✅ | `renameGroup`, `splitFacesToNewGroup`, `moveFacesToGroup` and `mergeGroups` now persist the database **before** starting the AEM metadata fan-out. `syncAssetsToAem` and `resyncAllAssetsMetadata` enforce an 18s time budget (`offset`/`limit`/`timeBudgetMs`) and return `hasMoreToSync`, `nextSyncOffset`, and `remainingAssetCount`; the UI loops through `api.resyncAllAssets` until all chunks complete. |
-| R15 | Medium | Thin test coverage. | ✅ | 145 automated tests across 10 suites (`face-service`, `security`, `robustness`, `paging`, `cost`, `folder-and-asset-id`, `concurrency-and-jobs`, `privacy-and-oauth`, `ui-api`, `ui-admin-console`). |
+| R15 | Medium | Thin test coverage. | ✅ | 147 automated tests across 10 suites (`face-service`, `security`, `robustness`, `paging`, `cost`, `folder-and-asset-id`, `concurrency-and-jobs`, `privacy-and-oauth`, `ui-api`, `ui-admin-console`). |
 
 ---
 

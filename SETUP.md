@@ -83,15 +83,19 @@ To opt specific DAM folders into automatic facial recognition on asset upload:
 5. In the **Processing Profiles** list, check the box next to **`Face Recognition`**, click **Apply Profile to Folder(s)** in the top bar, and select the DAM folder(s) where you want automatic facial recognition enabled.
    - *Under the hood*: AEM writes `jcr:content/dam:processingProfile = /conf/global/settings/dam/processing/Face Recognition` on that folder node, which the `ingest` action inspects when an upload event fires.
 
-### 2B. Add `xdm:faceNames` to the AEM Metadata Form
-So that recognized people appear on Asset Details / Properties and are searchable in AEM:
+### 2B. Add `xdm:faceNames` & `iptc4xmpExt:PersonInImage` to AEM Metadata & Search Filter Forms
+So that recognized people appear on Asset Details / Properties and in the left Search Filter rail:
 
-1. In AEM Author, go to **Tools > Assets > Metadata Forms** (or **Assets View > Administration > Metadata Forms**).
-2. Edit the Metadata Form applied to your images.
-3. Drag a **Multi-value Text** field onto the form:
-   - **Field Label**: `Recognized Faces` (or `People`)
-   - **Map to Property**: `./jcr:content/metadata/xdm:faceNames`
-4. Click **Save**.
+1. **Metadata Form (Asset Details / Properties)**:
+   - In AEM Author, go to **Tools > Assets > Metadata Forms** (or **Assets View > Administration > Metadata Forms**).
+   - Edit the Metadata Form applied to your images and drag a **Multi-value Text** field onto the form:
+     - **Field Label**: `Recognized Faces` (or `People`)
+     - **Map to Property**: `./jcr:content/metadata/xdm:faceNames` (and/or `./jcr:content/metadata/iptc4xmpExt:PersonInImage`, which the extension dual-writes by default).
+   - Click **Save**.
+2. **Search Filter Rail (Left-Rail Facets)**:
+   - **Full-Text Search (Top Search Bar)**: Works automatically out-of-the-box for any name in `xdm:faceNames` or `iptc4xmpExt:PersonInImage`.
+   - **AEM Admin UI Left Search Rail**: Go to **Tools > General > Search Forms > Assets Admin Search Rail > Edit**, drag a **Multi Value Property Predicate** (or **Property Predicate**) onto the form, set **Field Label** to `Recognized Faces`, and set **Property Name** to `./jcr:content/metadata/xdm:faceNames` (or `./jcr:content/metadata/iptc4xmpExt:PersonInImage`).
+   - **AEM Assets View Left Filter Rail**: Go to **Settings (⚙️) > General Settings > Search > Files > Add new form / Customize**. Because Assets View's filter builder reads from `/adobe/repository?resource=searchableproperties`, you can either map the filter to one of AEM's pre-indexed properties (by setting **Secondary AEM Asset Metadata Property** in the extension's Settings tab to `iptc4xmpExt:PersonInImage`, `xdm:persona`, or `dc:subject` and clicking **Backfill / Re-sync All Existing Assets Now**), or add `jcr:content/metadata/xdm:faceNames` (`propertyIndex = true`) to your custom `damAssetLucene-*-custom-*` Oak index overlay.
 
 ---
 

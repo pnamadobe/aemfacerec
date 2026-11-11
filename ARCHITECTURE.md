@@ -92,6 +92,7 @@ aemfacerec/
 | Property | JCR Type | Description |
 | :--- | :--- | :--- |
 | `xdm:faceNames` | `String[]` | Multi-value array of face group names on the asset (e.g., `["Sarah Jenkins", "Marcus Vance", "Person #12"]`). If `includeUnnamedInMetadata` is turned off in Settings, unnamed placeholder labels (`Person #12`) are omitted until named. |
+| `iptc4xmpExt:PersonInImage` | `String[]` | Optional secondary multi-value property (enabled by default via `enableSecondaryMetadataProperty`, configurable in Settings) that receives the exact same array of face names for standard IPTC Person Shown & AEM Search Filter Rail compatibility. |
 | `xdm:faceGroupIds` | `String[]` | Multi-value array of internal group IDs on the asset (e.g., `["grp_a1b2c3d4", "grp_e5f6g7h8"]`). |
 | `xdm:faceCount` | `Long` | Total number of faces detected on the asset. |
 
