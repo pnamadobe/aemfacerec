@@ -265,13 +265,6 @@ export default function AssetDetailsSidePanel() {
   const faceNames = assetData?.faceNames || [];
   const metadataProp = assetData?.metadataProperty || 'xdm:faceNames';
   const canManageGroups = assetData?.canManageGroups !== false;
-  const resolvedAemHost = (hostContext.aemHost || assetData?.aemHost || '').replace(/\/+$/, '');
-  const resolvedAssetPath = assetData?.assetPath || hostContext.assetPath || '';
-  const fallbackThumbUrl =
-    resolvedAemHost && resolvedAssetPath.startsWith('/content/dam')
-      ? `${resolvedAemHost.startsWith('http') ? resolvedAemHost : `https://${resolvedAemHost}`}${resolvedAssetPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`
-      : null;
-  const previewBgUrl = assetData?.previewDataUrl || fallbackThumbUrl;
 
   return (
     <View
@@ -347,39 +340,20 @@ export default function AssetDetailsSidePanel() {
               style={{
                 position: 'relative',
                 width: '100%',
-                height: 165,
+                height: 150,
                 borderRadius: 8,
                 background: 'linear-gradient(135deg, #1e293b 0%, #334155 100%)',
                 overflow: 'hidden',
                 border: '1px solid #cbd5e1'
               }}
             >
-              {previewBgUrl && (
-                <img
-                  src={previewBgUrl}
-                  alt=""
-                  onError={(e) => {
-                    e.currentTarget.style.display = 'none';
-                  }}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'fill',
-                    opacity: 0.72,
-                    pointerEvents: 'none'
-                  }}
-                />
-              )}
               <div
                 style={{
                   position: 'absolute',
                   bottom: 6,
                   left: 10,
                   fontSize: 11,
-                  color: '#f1f5f9',
-                  textShadow: '0 1px 2px rgba(0,0,0,0.85)'
+                  color: '#94a3b8'
                 }}
               >
                 {assetData?.assetTitle || hostContext.assetPath?.split('/').pop()}
