@@ -170,6 +170,7 @@ Whenever faces on an asset are indexed, named, split, or merged, `computeAssetFa
 
 ### Surface 1: Assets View Details Side Panel (`aem/assets/assetsview/1`)
 Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AssetDetailsSidePanel.js` (`/#face-recognition-panel`):
+- **Fast-Path Asset Lookup (`t = 0ms` pre-warmed token & `getAssetsMap`)**: Reuses the pre-warmed IMS token cached by `ExtensionRegistration.js` (`tokenSavedAt`, 5-minute TTL) + `BroadcastChannel` sync so `getAssetFaces` fires immediately on mount without waiting on unimplemented `@adobe/uix-guest` Proxy RPCs (`getCurrentResource` / `getAemHost`). On the backend, `getAssetFaces` checks `db/assets.json` first and skips reading `db/faces.json`, `db/groups.json`, or calling AEM QueryBuilder when `assetPath` is already known.
 - **Interactive Bounding-Box Locator**: Renders the asset's detected face positions on a clean dark-slate canvas; hovering over a face card or bounding box highlights which avatar corresponds to which person in the image.
 - **Live `xdm:faceNames` Metadata Preview**: Displays the exact multi-value pills written to `jcr:content/metadata/xdm:faceNames` on the asset.
 - **Face Avatar Cards**:
@@ -179,7 +180,7 @@ Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AssetDetailsS
 
 ### Surface 2: Face Management & BYOK Settings Console (`/#modal-face-management`)
 Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AdminConsole.js`:
-- **Sticky Top Action Bar & Compact Summary Strip**: Keeps **Scan Current Folder**, **Include already-scanned images**, and **Close** pinned at the top of the modal while scrolling, with a compact single-line summary bar (`Groups • Faces • Assets • Placeholder visibility`).
+- **Sticky Top Action Bar, `Esc` Shortcut & Compact Summary Strip**: Keeps **Scan Current Folder**, **Include already-scanned images**, and **Close** (also triggered by pressing **`Esc`** when no inner confirmation dialog or dropdown is open) pinned at the top of the modal while scrolling, with a compact single-line summary bar (`Groups • Faces • Assets • Placeholder visibility`).
 - **Tab 1 — Face Groups & Split / Merge Manager**:
   - Server-paged groups grid (`60` per page) with server-side search and `All Groups` / `Named People` / `Unnamed Placeholders` filtering.
   - Opt-in **Bulk Merge Mode** switch in the filter bar when merging multiple cards at once.

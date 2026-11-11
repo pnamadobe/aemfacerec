@@ -176,8 +176,11 @@ export default function AdminConsole() {
         try {
           const sharedContext = gc.sharedContext;
           if (sharedContext && typeof sharedContext.get === 'function') {
+            const auth = sharedContext.get('auth') || {};
+            imsToken = imsToken || auth.imsToken || auth.accessToken || null;
+            imsOrg = imsOrg || auth.imsOrg || null;
             const dump = JSON.stringify({
-              auth: sharedContext.get('auth'),
+              auth,
               org: sharedContext.get('org'),
               tenant: sharedContext.get('tenant')
             });
@@ -188,14 +191,18 @@ export default function AdminConsole() {
           // ignore
         }
 
-        if (!aemHost && gc.host?.discovery?.getAemHost) {
+        if (imsToken) {
           try {
-            const discovered = await gc.host.discovery.getAemHost();
-            if (discovered) {
-              aemHost = String(discovered).startsWith('http')
-                ? discovered
-                : `https://${discovered}`;
-            }
+            const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+            localStorage.setItem(
+              STORAGE_KEY_CTX,
+              JSON.stringify({
+                ...prev,
+                imsToken,
+                imsOrg: imsOrg || prev.imsOrg || null,
+                tokenSavedAt: Date.now()
+              })
+            );
           } catch (e) {
             // ignore
           }
@@ -225,6 +232,23 @@ export default function AdminConsole() {
       mounted = false;
     };
   }, []);
+
+  // Keyboard shortcut: press Esc to close the Face Management modal (unless an inner dialog/menu is open)
+  useEffect(() => {
+    if (!guestConnection) return undefined;
+    const onKeyDown = (e) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (
+        typeof document !== 'undefined' &&
+        document.querySelector('[role="alertdialog"], [role="dialog"], [role="listbox"]')
+      ) {
+        return;
+      }
+      guestConnection.host?.modal?.closeDialog?.();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [guestConnection]);
 
   // Current page of group summaries (filtered/searched server-side)
   const [groups, setGroups] = useState([]);

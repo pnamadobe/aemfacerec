@@ -116,7 +116,7 @@ function extractAssetContext(resourceOrWrapper, context) {
         resource.repositoryMetadata?.id)) ||
     '';
 
-  const aemAuthorUrl = findAemAuthorUrl(resource, resourceOrWrapper, ctxObj);
+  let aemAuthorUrl = findAemAuthorUrl(resource, resourceOrWrapper, ctxObj);
   let imsTenant = '';
   let experienceOrigin = '';
   try {
@@ -125,6 +125,15 @@ function extractAssetContext(resourceOrWrapper, context) {
     if (m) experienceOrigin = m[1];
     const tenantFromRef = ref.match(/\/@([a-zA-Z0-9_-]+)\//);
     if (tenantFromRef) imsTenant = tenantFromRef[1];
+    if (!aemAuthorUrl) {
+      const repoMatch = ref.match(/[?&]repoId=([^&#]+)/i);
+      if (repoMatch) {
+        const repoHost = decodeURIComponent(repoMatch[1]).trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+        if (/^author-[a-z0-9-]+\.adobeaemcloud\.com$/i.test(repoHost)) {
+          aemAuthorUrl = `https://${repoHost}`;
+        }
+      }
+    }
   } catch (e) {
     // ignore
   }
@@ -139,6 +148,22 @@ function extractAssetContext(resourceOrWrapper, context) {
   return { folderPath, assetPath, assetName, assetId, aemAuthorUrl, imsTenant, experienceOrigin };
 }
 
+function readSharedAuth(gc) {
+  try {
+    const auth = gc?.sharedContext?.get?.('auth') || {};
+    const imsToken =
+      auth.imsToken ||
+      auth.accessToken ||
+      auth.token ||
+      auth.authInfo?.accessToken ||
+      null;
+    const imsOrg = auth.imsOrg || auth.imsOrgId || null;
+    return { imsToken, imsOrg };
+  } catch (e) {
+    return { imsToken: null, imsOrg: null };
+  }
+}
+
 export default function ExtensionRegistration() {
   const navigate = useNavigate();
   const [registered, setRegistered] = useState(false);
@@ -146,6 +171,7 @@ export default function ExtensionRegistration() {
   useEffect(() => {
     const init = async () => {
       try {
+        let activeConnection = null;
         const guestConnection = await register({
           id: extensionId,
           methods: {
@@ -168,32 +194,22 @@ export default function ExtensionRegistration() {
                     icon: 'UserGroup',
                     label: 'Recognize Faces',
                     onClick: async () => {
-                      let imsToken = null;
-                      let imsOrg = null;
-                      try {
-                        const imsInfo = await guestConnection.host?.auth?.getIMSInfo?.();
-                        if (imsInfo) {
-                          imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
-                          imsOrg = imsInfo.imsOrg || null;
-                        }
-                      } catch (e) {
-                        // ignore
-                      }
-
-                      let aemAuthorUrl = findAemAuthorUrl(resources, context);
-                      if (!aemAuthorUrl && guestConnection.host?.discovery?.getAemHost) {
+                      const shared = readSharedAuth(activeConnection);
+                      let imsToken = shared.imsToken;
+                      let imsOrg = shared.imsOrg;
+                      if (!imsToken) {
                         try {
-                          const discovered = await guestConnection.host.discovery.getAemHost();
-                          if (discovered) {
-                            aemAuthorUrl = String(discovered).startsWith('http')
-                              ? discovered
-                              : `https://${discovered}`;
+                          const imsInfo = await guestConnection.host?.auth?.getIMSInfo?.();
+                          if (imsInfo) {
+                            imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
+                            imsOrg = imsInfo.imsOrg || imsOrg || null;
                           }
                         } catch (e) {
                           // ignore
                         }
                       }
 
+                      const aemAuthorUrl = findAemAuthorUrl(resources, context);
                       const authContext = { imsToken, imsOrg, aemHost: aemAuthorUrl };
 
                       try {
@@ -270,9 +286,23 @@ export default function ExtensionRegistration() {
             detailSidePanel: {
               getPanels(resource) {
                 const extracted = extractAssetContext(resource);
+                const shared = readSharedAuth(activeConnection);
                 try {
-                  if (extracted.assetPath || extracted.assetId) {
-                    localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(extracted));
+                  const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+                  const mergedCtx = {
+                    ...prev,
+                    ...extracted,
+                    aemAuthorUrl: extracted.aemAuthorUrl || prev.aemAuthorUrl || '',
+                    imsToken: shared.imsToken || prev.imsToken || null,
+                    imsOrg: shared.imsOrg || prev.imsOrg || null
+                  };
+                  if (mergedCtx.assetPath || mergedCtx.assetId) {
+                    localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(mergedCtx));
+                    if (typeof BroadcastChannel !== 'undefined') {
+                      const bc = new BroadcastChannel(STORAGE_KEY_CTX);
+                      bc.postMessage(mergedCtx);
+                      bc.close();
+                    }
                   }
                 } catch (e) {
                   // ignore
@@ -305,20 +335,19 @@ export default function ExtensionRegistration() {
                     label: 'Face Groups',
                     onClick: async () => {
                       const extracted = extractAssetContext(resource, context);
-                      if (!extracted.aemAuthorUrl && guestConnection.host?.discovery?.getAemHost) {
-                        try {
-                          const discovered = await guestConnection.host.discovery.getAemHost();
-                          if (discovered) {
-                            extracted.aemAuthorUrl = String(discovered).startsWith('http')
-                              ? discovered
-                              : `https://${discovered}`;
-                          }
-                        } catch (e) {
-                          // ignore
-                        }
-                      }
+                      const shared = readSharedAuth(activeConnection);
                       try {
-                        localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(extracted));
+                        const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+                        localStorage.setItem(
+                          STORAGE_KEY_CTX,
+                          JSON.stringify({
+                            ...prev,
+                            ...extracted,
+                            aemAuthorUrl: extracted.aemAuthorUrl || prev.aemAuthorUrl || '',
+                            imsToken: shared.imsToken || prev.imsToken || null,
+                            imsOrg: shared.imsOrg || prev.imsOrg || null
+                          })
+                        );
                       } catch (e) {
                         // ignore
                       }
@@ -345,7 +374,38 @@ export default function ExtensionRegistration() {
         });
 
         if (guestConnection) {
+          activeConnection = guestConnection;
           setRegistered(true);
+          try {
+            const shared = readSharedAuth(guestConnection);
+            let imsToken = shared.imsToken;
+            let imsOrg = shared.imsOrg;
+            if (!imsToken) {
+              try {
+                const imsInfo = await guestConnection.host?.auth?.getIMSInfo?.();
+                if (imsInfo) {
+                  imsToken = imsInfo.accessToken || imsInfo.imsToken || null;
+                  imsOrg = imsInfo.imsOrg || imsOrg || null;
+                }
+              } catch (e) {
+                // ignore
+              }
+            }
+            if (imsToken) {
+              const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+              localStorage.setItem(
+                STORAGE_KEY_CTX,
+                JSON.stringify({
+                  ...prev,
+                  imsToken,
+                  imsOrg: imsOrg || prev.imsOrg || null,
+                  tokenSavedAt: Date.now()
+                })
+              );
+            }
+          } catch (e) {
+            // ignore
+          }
         }
       } catch (e) {
         // Standalone browser preview mode outside AEM Assets View iframe

@@ -748,10 +748,13 @@ async function createFaceService({
      */
     async browseFolder({ folderPath = '/content/dam' }) {
       const settings = await storage.getSettings();
-      const [browsed, db] = await Promise.all([
+      const [browsed, assetsMap] = await Promise.all([
         aemClient.browseDamFolder(folderPath, { allowedImageTypes: settings.allowedImageTypes }),
-        storage.getDatabase()
+        typeof storage.getAssetsMap === 'function'
+          ? storage.getAssetsMap()
+          : storage.getDatabase({ readOnly: true }).then((d) => d.assets)
       ]);
+      const db = { assets: assetsMap };
 
       const enrichedAssets = (browsed.assets || []).map((a) => {
         const indexed = findAssetRecord(db, a.assetId, a.assetPath);
@@ -868,10 +871,12 @@ async function createFaceService({
     /**
      * Retrieves all detected faces and metadata for a specific AEM asset (by assetId, assetPath, or assetName).
      */
-    async getAssetFaces({ assetId, assetPath, assetName }) {
-      const [db, settings] = await Promise.all([
-        storage.getDatabase(),
-        storage.getSettings()
+    async getAssetFaces({ assetId, assetPath, assetName, settingsPromise = null }) {
+      const [assetsMap, settings] = await Promise.all([
+        typeof storage.getAssetsMap === 'function'
+          ? storage.getAssetsMap()
+          : storage.getDatabase({ readOnly: true }).then((d) => d.assets),
+        settingsPromise || storage.getSettings()
       ]);
 
       const rawUuid = assetId ? String(assetId).replace(/^urn:aaid:aem:/i, '').trim() : '';
@@ -884,10 +889,10 @@ async function createFaceService({
         }
       }
 
-      const allAssets = Object.values(db.assets || {});
+      const allAssets = Object.values(assetsMap || {});
       let assetRecord =
-        (assetId && db.assets[assetId]) ||
-        (rawUuid && db.assets[rawUuid]) ||
+        (assetId && assetsMap[assetId]) ||
+        (rawUuid && assetsMap[rawUuid]) ||
         (rawUuid && allAssets.find((a) => a.uuid === rawUuid || a.assetId === rawUuid || a.assetId === `urn:aaid:aem:${rawUuid}`)) ||
         null;
 
@@ -910,8 +915,9 @@ async function createFaceService({
           ) || null;
       }
 
-      // If AEM Assets View only passed `urn:aaid:aem:<uuid>`, resolve the DAM path via AEM QueryBuilder
-      if (!assetRecord && rawUuid) {
+      // Only query AEM QueryBuilder when the caller did NOT pass `assetPath` (so `decodedPath`
+      // is unknown) and there are indexed assets in the DB that might be keyed by path only.
+      if (!assetRecord && rawUuid && !decodedPath && allAssets.length > 0) {
         const resolvedPath = await aemClient.resolvePathByAssetUuid(rawUuid);
         if (resolvedPath) {
           decodedPath = normalizeDamPath(resolvedPath);
@@ -938,6 +944,21 @@ async function createFaceService({
         };
       }
 
+      if (!Array.isArray(assetRecord.faceIds) || assetRecord.faceIds.length === 0) {
+        return {
+          ...assetRecord,
+          aemHost: aemHost || null,
+          scanned: true,
+          faceCount: 0,
+          faceNames: [],
+          faceGroupIds: [],
+          metadataProperty: settings.metadataProperty,
+          includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
+          faces: []
+        };
+      }
+
+      const db = await storage.getDatabase({ readOnly: true });
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
       const enrichedFaces = (assetRecord.faceIds || [])
         .map((id) => enrichFace(db.faces[id], db.groups))
@@ -963,10 +984,10 @@ async function createFaceService({
      * Lists Face Groups one page at a time (filtered and searched server-side) so the
      * response stays well under the 1 MB Runtime limit however many groups exist.
      */
-    async listGroups({ offset = 0, limit = GROUP_PAGE_SIZE, filter = 'all', query = '' } = {}) {
+    async listGroups({ offset = 0, limit = GROUP_PAGE_SIZE, filter = 'all', query = '', settingsPromise = null } = {}) {
       const [db, settings] = await Promise.all([
-        storage.getDatabase(),
-        storage.getSettings()
+        storage.getDatabase({ readOnly: true }),
+        settingsPromise || storage.getSettings()
       ]);
 
       const pageOffset = clampInt(offset, { min: 0, max: Number.MAX_SAFE_INTEGER, fallback: 0 });
@@ -1014,7 +1035,7 @@ async function createFaceService({
      * while keeping the response well under the 1 MB Runtime payload limit.
      */
     async listGroupOptions({ query = '', limit = MAX_GROUP_OPTIONS, includeAvatars = true } = {}) {
-      const db = await storage.getDatabase();
+      const db = await storage.getDatabase({ readOnly: true });
       const optionLimit = clampInt(limit, { min: 1, max: MAX_GROUP_OPTIONS, fallback: MAX_GROUP_OPTIONS });
       const normalizedQuery = String(query || '').trim().toLowerCase().slice(0, 200);
 
@@ -1046,7 +1067,7 @@ async function createFaceService({
      * Returns one group with a page of its member faces (including avatars).
      */
     async getGroup({ groupId, faceOffset = 0, faceLimit = GROUP_FACES_PAGE_SIZE } = {}) {
-      const db = await storage.getDatabase();
+      const db = await storage.getDatabase({ readOnly: true });
       const group = db.groups[groupId];
       if (!group) {
         throw new PublicError(`Face Group '${groupId}' not found.`, 404);

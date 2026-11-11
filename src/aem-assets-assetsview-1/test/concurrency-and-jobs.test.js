@@ -410,3 +410,42 @@ test('R14 Delta Sync: resyncAllAssetsMetadata skips assets whose metadata signat
     h.cleanup();
   }
 });
+
+test('Right-rail fast path: getAssetFaces skips QueryBuilder when assetPath is already known and skips reading faces/groups for unscanned assets', async () => {
+  const h = await createConcurrentHarness();
+  try {
+    const svc = await h.newServiceInstance();
+    await svc.ingestAsset({ assetPath: '/content/dam/fast/indexed.jpg', force: true });
+
+    let fullDbReads = 0;
+    const origGetDb = h.storage.getDatabase.bind(h.storage);
+    h.storage.getDatabase = async (opts) => {
+      fullDbReads++;
+      return origGetDb(opts);
+    };
+    const fastSvc = await require('../actions/lib/face-service').createFaceService({
+      storage: h.storage,
+      rekognitionClient: h.rekognitionClient,
+      aemClient: h.aemClient
+    });
+
+    const lookupsBefore = h.resolveLookups;
+    const unscannedRes = await fastSvc.getAssetFaces({
+      assetId: 'urn:aaid:aem:uuid-unscanned-123',
+      assetPath: '/content/dam/fast/unscanned.jpg'
+    });
+    assert.equal(unscannedRes.scanned, false);
+    assert.equal(
+      h.resolveLookups,
+      lookupsBefore,
+      'must not call AEM QueryBuilder when assetPath is already provided'
+    );
+    assert.equal(
+      fullDbReads,
+      0,
+      'must not read faces.json/groups.json when asset is not in assets.json'
+    );
+  } finally {
+    h.cleanup();
+  }
+});

@@ -20,20 +20,41 @@ import {
 import { api, resultBanner } from '../utils/api';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
+function readInitialHostContext() {
+  const hash = window.location.hash || '';
+  const qIdx = hash.indexOf('?');
+  const sp = new URLSearchParams(qIdx >= 0 ? hash.slice(qIdx + 1) : window.location.search);
+  let storedCtx = {};
+  try {
+    storedCtx = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+  } catch (e) {
+    storedCtx = {};
+  }
+  const tokenFresh =
+    Boolean(storedCtx.imsToken) &&
+    Number(storedCtx.tokenSavedAt) > 0 &&
+    Date.now() - Number(storedCtx.tokenSavedAt) < 5 * 60 * 1000;
+  const cachedToken = tokenFresh ? storedCtx.imsToken : null;
+  const assetId = sp.get('assetId') || storedCtx.assetId || '';
+  const assetPath = sp.get('assetPath') || storedCtx.assetPath || '';
+  const assetName = sp.get('assetName') || storedCtx.assetName || '';
+  return {
+    inAemHost: Boolean(cachedToken),
+    hostResolved: Boolean(cachedToken && (assetId || assetPath || assetName)),
+    imsToken: cachedToken,
+    imsOrg: tokenFresh ? storedCtx.imsOrg || null : null,
+    aemHost: sp.get('aemAuthorUrl') || storedCtx.aemAuthorUrl || null,
+    assetId,
+    assetPath,
+    assetName
+  };
+}
+
 export default function AssetDetailsSidePanel() {
   const navigate = useNavigate();
 
   const [guestConnection, setGuestConnection] = useState(null);
-  const [hostContext, setHostContext] = useState({
-    inAemHost: false,
-    hostResolved: false,
-    imsToken: null,
-    imsOrg: null,
-    aemHost: null,
-    assetId: '',
-    assetPath: '',
-    assetName: ''
-  });
+  const [hostContext, setHostContext] = useState(readInitialHostContext);
 
   const [assetData, setAssetData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -48,43 +69,23 @@ export default function AssetDetailsSidePanel() {
   // Attach to AEM Assets View guest connection if running inside AEM iframe
   useEffect(() => {
     let mounted = true;
+    const initial = readInitialHostContext();
 
-    const hash = window.location.hash || '';
-    const qIdx = hash.indexOf('?');
-    const sp = new URLSearchParams(qIdx >= 0 ? hash.slice(qIdx + 1) : window.location.search);
-    let storedCtx = {};
-    try {
-      storedCtx = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
-    } catch (e) {
-      storedCtx = {};
-    }
-
-    const initialAssetPath = sp.get('assetPath') || storedCtx.assetPath || '';
-    const initialAssetId = sp.get('assetId') || storedCtx.assetId || '';
-    const initialAssetName = sp.get('assetName') || storedCtx.assetName || '';
-    const initialAuthorUrl = sp.get('aemAuthorUrl') || storedCtx.aemAuthorUrl || '';
-
-    if (initialAssetPath || initialAssetId || initialAssetName) {
+    const applyNextCtx = (next) => {
+      if (!next || !mounted) return;
       setHostContext((prev) => ({
         ...prev,
-        assetId: initialAssetId || prev.assetId,
-        assetPath: initialAssetPath || prev.assetPath,
-        assetName: initialAssetName || prev.assetName,
-        aemHost: initialAuthorUrl || prev.aemHost
+        assetId: next.assetId || prev.assetId,
+        assetPath: next.assetPath || prev.assetPath,
+        assetName: next.assetName || prev.assetName,
+        aemHost: next.aemAuthorUrl || prev.aemHost
       }));
-    }
+    };
 
     const onStorageChange = (e) => {
       if (e.key === STORAGE_KEY_CTX && e.newValue) {
         try {
-          const next = JSON.parse(e.newValue);
-          setHostContext((prev) => ({
-            ...prev,
-            assetId: next.assetId || prev.assetId,
-            assetPath: next.assetPath || prev.assetPath,
-            assetName: next.assetName || prev.assetName,
-            aemHost: next.aemAuthorUrl || prev.aemHost
-          }));
+          applyNextCtx(JSON.parse(e.newValue));
         } catch (err) {
           // ignore
         }
@@ -92,20 +93,35 @@ export default function AssetDetailsSidePanel() {
     };
     window.addEventListener('storage', onStorageChange);
 
+    let bc = null;
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        bc = new BroadcastChannel(STORAGE_KEY_CTX);
+        bc.onmessage = (ev) => applyNextCtx(ev?.data);
+      } catch (e) {
+        bc = null;
+      }
+    }
+
     const connectToHost = async () => {
+      let imsToken = null;
+      let imsOrg = null;
+      let aemHost = initial.aemHost;
+      let nextAssetId = initial.assetId;
+      let nextAssetPath = initial.assetPath;
+      let nextAssetName = initial.assetName;
+      let inAemHost = false;
+
       try {
         const gc = await Promise.race([
           attach({ id: extensionId }),
           new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Host connection timed out')), 10000)
+            setTimeout(() => reject(new Error('Host connection timed out')), 3000)
           )
         ]);
         if (!gc || !mounted) return;
+        inAemHost = true;
         setGuestConnection(gc);
-
-        let imsToken = null;
-        let imsOrg = null;
-        let aemHost = initialAuthorUrl;
 
         try {
           const imsInfo = await gc.host?.auth?.getIMSInfo?.();
@@ -117,78 +133,62 @@ export default function AssetDetailsSidePanel() {
           // fallback to sharedContext
         }
 
-        let discoveredResource = null;
-        try {
-          if (gc.host?.details?.getCurrentResource) {
-            discoveredResource = await gc.host.details.getCurrentResource();
-          } else if (gc.host?.context?.getResource) {
-            discoveredResource = await gc.host.context.getResource();
-          }
-        } catch (e) {
-          // ignore
-        }
-
         const sharedContext = gc.sharedContext;
-        if (sharedContext || discoveredResource) {
-          const auth = sharedContext?.get?.('auth') || {};
+        if (sharedContext && typeof sharedContext.get === 'function') {
+          const auth = sharedContext.get('auth') || {};
           const asset =
-            discoveredResource ||
-            sharedContext?.get?.('asset') ||
-            sharedContext?.get?.('resource') ||
+            sharedContext.get('asset') ||
+            sharedContext.get('resource') ||
             {};
-          imsToken = imsToken || auth.imsToken || null;
-          imsOrg = imsOrg || auth.imsOrg || null;
-          aemHost = aemHost || sharedContext?.get?.('aemHost') || auth.aemHost || null;
-          const nextAssetId =
+          imsToken =
+            imsToken ||
+            auth.imsToken ||
+            auth.accessToken ||
+            auth.token ||
+            auth.authInfo?.accessToken ||
+            null;
+          imsOrg = imsOrg || auth.imsOrg || auth.imsOrgId || null;
+          aemHost = aemHost || sharedContext.get('aemHost') || auth.aemHost || null;
+          nextAssetId =
+            nextAssetId ||
             asset.assetId ||
             asset.id ||
             asset['repo:id'] ||
             asset.repositoryMetadata?.['repo:id'] ||
             '';
-          const nextAssetPath =
+          nextAssetPath =
+            nextAssetPath ||
             asset.path ||
             asset.assetPath ||
             asset.repositoryPath ||
             asset['repo:path'] ||
             asset.repositoryMetadata?.['repo:path'] ||
             '';
-          const nextAssetName =
+          nextAssetName =
+            nextAssetName ||
             asset.name ||
             asset['repo:name'] ||
             asset.assetName ||
             asset.repositoryMetadata?.['repo:name'] ||
             '';
-          if (nextAssetId || nextAssetPath || nextAssetName) {
-            setHostContext((prev) => ({
-              ...prev,
-              assetId: nextAssetId || prev.assetId,
-              assetPath: nextAssetPath || prev.assetPath,
-              assetName: nextAssetName || prev.assetName
-            }));
-          }
         }
 
-        if (!aemHost && gc.host?.discovery?.getAemHost) {
+        if (imsToken) {
           try {
-            const discovered = await gc.host.discovery.getAemHost();
-            if (discovered) {
-              aemHost = String(discovered).startsWith('http')
-                ? discovered
-                : `https://${discovered}`;
-            }
+            const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+            localStorage.setItem(
+              STORAGE_KEY_CTX,
+              JSON.stringify({
+                ...prev,
+                imsToken,
+                imsOrg: imsOrg || prev.imsOrg || null,
+                tokenSavedAt: Date.now(),
+                aemAuthorUrl: aemHost || prev.aemAuthorUrl || ''
+              })
+            );
           } catch (e) {
             // ignore
           }
-        }
-
-        if (mounted) {
-          setHostContext((prev) => ({
-            ...prev,
-            inAemHost: true,
-            imsToken: imsToken || prev.imsToken,
-            imsOrg: imsOrg || prev.imsOrg,
-            aemHost: aemHost || prev.aemHost
-          }));
         }
       } catch (e) {
         // Standalone mode outside AEM iframe
@@ -196,7 +196,17 @@ export default function AssetDetailsSidePanel() {
         // Only load data once we know whether an IMS token is available, so the first
         // requests are not sent unauthenticated (they would be rejected with 401).
         if (mounted) {
-          setHostContext((prev) => ({ ...prev, hostResolved: true }));
+          setHostContext((prev) => ({
+            ...prev,
+            inAemHost: inAemHost || prev.inAemHost,
+            hostResolved: true,
+            imsToken: imsToken || prev.imsToken,
+            imsOrg: imsOrg || prev.imsOrg,
+            aemHost: aemHost || prev.aemHost,
+            assetId: nextAssetId || prev.assetId,
+            assetPath: nextAssetPath || prev.assetPath,
+            assetName: nextAssetName || prev.assetName
+          }));
         }
       }
     };
@@ -204,20 +214,37 @@ export default function AssetDetailsSidePanel() {
     return () => {
       mounted = false;
       window.removeEventListener('storage', onStorageChange);
+      if (bc) {
+        try {
+          bc.close();
+        } catch (e) {
+          // ignore
+        }
+      }
     };
   }, []);
 
+  const {
+    hostResolved,
+    assetId,
+    assetPath,
+    assetName,
+    aemHost,
+    imsToken,
+    imsOrg
+  } = hostContext;
+
   const loadData = useCallback(async () => {
-    if (!hostContext.hostResolved) return;
+    if (!hostResolved) return;
     setLoading(true);
     try {
       const facesRes = await api.getAssetFaces(
         {
-          assetId: hostContext.assetId,
-          assetPath: hostContext.assetPath,
-          assetName: hostContext.assetName
+          assetId,
+          assetPath,
+          assetName
         },
-        hostContext
+        { aemHost, imsToken, imsOrg }
       );
       setAssetData(facesRes);
     } catch (err) {
@@ -225,7 +252,7 @@ export default function AssetDetailsSidePanel() {
     } finally {
       setLoading(false);
     }
-  }, [hostContext]);
+  }, [hostResolved, assetId, assetPath, assetName, aemHost, imsToken, imsOrg]);
 
   useEffect(() => {
     loadData();

@@ -75,14 +75,17 @@ async function main(params = {}) {
 
     switch (operation) {
       case 'listGroups': {
-        const result = await faceService.listGroups({
-          offset: params.offset,
-          limit: params.limit,
-          filter: params.filter,
-          query: params.query
-        });
-        const settings = await storage.getSettings({ includeDecryptedSecret: false });
-        const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+        const settingsPromise = storage.getSettings({ includeDecryptedSecret: false });
+        const [result, { canManageGroups }] = await Promise.all([
+          faceService.listGroups({
+            offset: params.offset,
+            limit: params.limit,
+            filter: params.filter,
+            query: params.query,
+            settingsPromise
+          }),
+          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings))
+        ]);
         return {
           statusCode: 200,
           headers: corsHeaders,
@@ -108,13 +111,16 @@ async function main(params = {}) {
       }
 
       case 'getAssetFaces': {
-        const result = await faceService.getAssetFaces({
-          assetId: params.assetId,
-          assetPath: params.assetPath,
-          assetName: params.assetName
-        });
-        const settings = await storage.getSettings({ includeDecryptedSecret: false });
-        const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+        const settingsPromise = storage.getSettings({ includeDecryptedSecret: false });
+        const [result, { canManageGroups }] = await Promise.all([
+          faceService.getAssetFaces({
+            assetId: params.assetId,
+            assetPath: params.assetPath,
+            assetName: params.assetName,
+            settingsPromise
+          }),
+          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings))
+        ]);
         return {
           statusCode: 200,
           headers: corsHeaders,

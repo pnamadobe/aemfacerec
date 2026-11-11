@@ -65,6 +65,7 @@ Module._extensions['.js'] = function (module, filename) {
 
 // Mock the AEM host connection: resolves with an IMS token after a short delay
 const IMS_TOKEN = 'test-ims-token';
+let modalCloseCalls = 0;
 const awsCommands = [];
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
@@ -97,7 +98,14 @@ Module._load = function (request, parent, isMain) {
       attach: async () => {
         await new Promise((r) => setTimeout(r, 20));
         return {
-          host: { auth: { getIMSInfo: async () => ({ accessToken: IMS_TOKEN, imsOrg: 'ORG@AdobeOrg' }) } },
+          host: {
+            auth: { getIMSInfo: async () => ({ accessToken: IMS_TOKEN, imsOrg: 'ORG@AdobeOrg' }) },
+            modal: {
+              closeDialog: () => {
+                modalCloseCalls++;
+              }
+            }
+          },
           sharedContext: null
         };
       }
@@ -299,6 +307,11 @@ test.after(() => {
 
 test.beforeEach((t) => {
   requests.length = 0;
+  try {
+    window.localStorage.clear();
+  } catch (e) {
+    // ignore
+  }
   process.stderr.write(`[ui-test] start: ${t.name}\n`);
 });
 
@@ -778,4 +791,9 @@ test('UI Dual-Write: Settings tab includes secondary metadata property toggle (x
   fireEvent.change(secPropField, { target: { value: 'xdm:persona' } });
   fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
   await screen.findByText(/Settings saved\./);
+
+  // Pressing Escape in the Face Management modal triggers host.modal.closeDialog()
+  const closeBefore = modalCloseCalls;
+  fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' });
+  assert.equal(modalCloseCalls, closeBefore + 1, 'Escape key should close the Face Console modal');
 });

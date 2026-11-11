@@ -5,6 +5,7 @@ operations:
 actions: actions
 web: web-src
 hooks:
+  post-app-build: ./hooks/post-build.js
   post-app-deploy: ./hooks/post-deploy.js
 runtimeManifest:
   packages:

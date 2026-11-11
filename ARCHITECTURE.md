@@ -15,11 +15,12 @@ This Adobe Developer App Builder application extends **AEM as a Cloud Service (A
    - Reuses the downloaded AEM web rendition buffer in memory with pure JavaScript (`jpeg-js` + `pngjs`, zero native C++ binary dependencies) to crop padded `72×72` square portrait avatars for every detected face and stores them in `@adobe/aio-lib-files`.
    - Also sniffs JPEG/PNG header dimensions before calling AWS so small images (`< minImageSize`, default `200px`, e.g. logos/icons) are skipped at zero AWS cost.
 4. **Assets View Details Side Panel (`aem/assets/assetsview/1`)**:
+   - Fast-path load: reuses the pre-warmed IMS token (`tokenSavedAt`, 5-minute TTL) + `BroadcastChannel` asset context from `ExtensionRegistration.js` to fire `getAssetFaces` immediately on mount, while the backend checks `db/assets.json` (`getAssetsMap`) first and avoids reading `db/faces.json`/`db/groups.json` or calling AEM QueryBuilder when `assetPath` is already provided.
    - Displays cropped face avatars for all people detected in the currently open asset.
    - Interactive bounding-box overlay preview showing which avatar corresponds to which person in multi-person photos.
    - Allows naming a person, splitting a mis-grouped face into its own group, or reassigning a face to another group directly from the asset.
 5. **Face Management & Settings Console (Admin UI)**:
-   - Sticky top action bar keeping **Scan Current Folder**, **Include already-scanned images**, and **Close** pinned while scrolling.
+   - Sticky top action bar keeping **Scan Current Folder**, **Include already-scanned images**, and **Close** (also dismissible via the **`Esc`** keyboard shortcut) pinned while scrolling.
    - Server-paged Face Groups grid (60 per page) with server-side search and Named/Unnamed filtering.
    - **Name / Rename** a face group, or permanently **Delete Group** (removes vectors from AWS Rekognition, deletes avatars, and updates AEM metadata).
    - **Remove / Split** one or more faces out of a group into a new standalone group.
@@ -41,6 +42,10 @@ aemfacerec/
 ├── .env.example                        # Environment variable template
 ├── ARCHITECTURE.md                     # Technical architecture & data model
 ├── SECURITY_AUDIT.md                   # Enterprise security, robustness & scale audit
+├── TODO.md                             # Project roadmap (e.g. Adobe Coworker skill)
+├── hooks/
+│   ├── post-build.js                   # Rewrites index.html to /web-src.bundle.js & keeps legacy hash aliases
+│   └── post-deploy.js                  # Prints AEM Assets View developer preview URL
 └── src/
     └── aem-assets-assetsview-1/
         ├── ext.config.yaml             # Extension point manifest (aem/assets/assetsview/1)

@@ -204,39 +204,52 @@ async function createStorage(options = {}) {
         );
       }
 
-      // Cross-container distributed lease + event dedupe via @adobe/aio-lib-state when available
-      try {
-        const stateLib = require('@adobe/aio-lib-state');
-        const state = await stateLib.init();
-        const LOCK_KEY = 'facerec_db_lease_lock_v1';
-        backend.acquireLease = async (ownerId, ttlSeconds = 60) => {
-          const res = await state.put(LOCK_KEY, ownerId, {
-            ttl: Math.max(60, Math.ceil(ttlSeconds)),
-            ifNotExists: true
-          });
-          return Boolean(res);
-        };
-        backend.releaseLease = async (ownerId) => {
-          try {
-            const cur = await state.get(LOCK_KEY);
-            if (!cur || !cur.value || cur.value === ownerId) {
-              await state.delete(LOCK_KEY);
-            }
-          } catch (e) {
-            // lease will expire naturally via TTL
+      // Cross-container distributed lease + event dedupe via @adobe/aio-lib-state when available.
+      // Initialized lazily so read-only calls (e.g. getAssetFaces) never wait on stateLib.init().
+      let stateClientPromise = null;
+      const getStateClient = () => {
+        if (!stateClientPromise) {
+          stateClientPromise = Promise.resolve()
+            .then(() => {
+              const stateLib = require('@adobe/aio-lib-state');
+              return stateLib.init();
+            })
+            .catch(() => null);
+        }
+        return stateClientPromise;
+      };
+      const LOCK_KEY = 'facerec_db_lease_lock_v1';
+      backend.acquireLease = async (ownerId, ttlSeconds = 60) => {
+        const state = await getStateClient();
+        if (!state) return true;
+        const res = await state.put(LOCK_KEY, ownerId, {
+          ttl: Math.max(60, Math.ceil(ttlSeconds)),
+          ifNotExists: true
+        });
+        return Boolean(res);
+      };
+      backend.releaseLease = async (ownerId) => {
+        const state = await getStateClient();
+        if (!state) return;
+        try {
+          const cur = await state.get(LOCK_KEY);
+          if (!cur || !cur.value || cur.value === ownerId) {
+            await state.delete(LOCK_KEY);
           }
-        };
-        backend.claimIdempotencyKey = async (eventKey, ttlSeconds = 86400) => {
-          const safeKey = `facerec_evt_${crypto.createHash('sha256').update(String(eventKey)).digest('hex').slice(0, 40)}`;
-          const res = await state.put(safeKey, new Date().toISOString(), {
-            ttl: Math.max(60, Math.ceil(ttlSeconds)),
-            ifNotExists: true
-          });
-          return Boolean(res);
-        };
-      } catch (e) {
-        // State store unavailable; file/directory lease fallback is used below
-      }
+        } catch (e) {
+          // lease will expire naturally via TTL
+        }
+      };
+      backend.claimIdempotencyKey = async (eventKey, ttlSeconds = 86400) => {
+        const state = await getStateClient();
+        if (!state) return true;
+        const safeKey = `facerec_evt_${crypto.createHash('sha256').update(String(eventKey)).digest('hex').slice(0, 40)}`;
+        const res = await state.put(safeKey, new Date().toISOString(), {
+          ttl: Math.max(60, Math.ceil(ttlSeconds)),
+          ifNotExists: true
+        });
+        return Boolean(res);
+      };
     }
   }
 
@@ -441,7 +454,19 @@ async function createStorage(options = {}) {
   }
 
   return {
-    async getDatabase() {
+    async getAssetsMap() {
+      return readJson('db/assets.json', {});
+    },
+
+    async getDatabase({ readOnly = false } = {}) {
+      if (readOnly) {
+        const [groups, faces, assets] = await Promise.all([
+          readJson('db/groups.json', {}),
+          readJson('db/faces.json', {}),
+          readJson('db/assets.json', {})
+        ]);
+        return { groups, faces, assets, counters: { nextPersonNumber: 1 } };
+      }
       const [groups, faces, assets, counters] = await Promise.all([
         readJson('db/groups.json', {}),
         readJson('db/faces.json', {}),
