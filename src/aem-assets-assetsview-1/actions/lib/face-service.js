@@ -135,9 +135,14 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
   );
 
   const metadataProperty = settings.metadataProperty || 'xdm:faceNames';
+  const secondaryMetadataProperty =
+    settings.enableSecondaryMetadataProperty && settings.secondaryMetadataProperty
+      ? settings.secondaryMetadataProperty
+      : null;
 
   return {
     metadataProperty,
+    secondaryMetadataProperty,
     faceNames,
     faceGroupIds,
     faceCount: faceIds.length

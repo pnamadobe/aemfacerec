@@ -253,6 +253,8 @@ export default function AdminConsole() {
     collectionId: 'aem-assets-faces',
     similarityThreshold: 85,
     metadataProperty: 'xdm:faceNames',
+    enableSecondaryMetadataProperty: true,
+    secondaryMetadataProperty: 'iptc4xmpExt:PersonInImage',
     includeUnnamedInMetadata: true,
     processingProfileName: 'Face Recognition',
     requireProcessingProfile: true,
@@ -315,6 +317,8 @@ export default function AdminConsole() {
   const [scanResult, setScanResult] = useState(null);
   const [rescanExisting, setRescanExisting] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [resyncingAll, setResyncingAll] = useState(false);
+  const [resyncProgress, setResyncProgress] = useState(null);
   const [scanProgress, setScanProgress] = useState(null);
   const [scanningAssetPath, setScanningAssetPath] = useState(null);
 
@@ -637,6 +641,31 @@ export default function AdminConsole() {
       });
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
+    }
+  };
+
+  const handleBackfillAllAssets = async () => {
+    setResyncingAll(true);
+    setResyncProgress(null);
+    try {
+      const res = await api.resyncAllAssets(hostContext, (prog) => {
+        setResyncProgress(prog);
+      });
+      await loadAll();
+      const targetFields = settings.enableSecondaryMetadataProperty
+        ? `${settings.metadataProperty} & ${settings.secondaryMetadataProperty}`
+        : settings.metadataProperty;
+      setBanner(
+        resultBanner(
+          `Backfilled / re-synced ${targetFields} across ${res.syncedAssetCount} asset(s).`,
+          res
+        )
+      );
+    } catch (err) {
+      setBanner({ type: 'negative', text: err.message });
+    } finally {
+      setResyncingAll(false);
+      setResyncProgress(null);
     }
   };
 
@@ -1427,6 +1456,26 @@ export default function AdminConsole() {
                       />
 
                       <Switch
+                        isSelected={Boolean(settings.enableSecondaryMetadataProperty)}
+                        onChange={(val) =>
+                          setSettings((s) => ({ ...s, enableSecondaryMetadataProperty: val }))
+                        }
+                      >
+                        Also dual-write face names to <code>{settings.secondaryMetadataProperty || 'iptc4xmpExt:PersonInImage'}</code> (standard IPTC Person Shown field for AEM Search Filters)
+                      </Switch>
+                      {settings.enableSecondaryMetadataProperty && (
+                        <TextField
+                          label="Secondary AEM Asset Metadata Property (multi-value String[])"
+                          value={settings.secondaryMetadataProperty}
+                          onChange={(v) =>
+                            setSettings((s) => ({ ...s, secondaryMetadataProperty: v }))
+                          }
+                          placeholder="iptc4xmpExt:PersonInImage"
+                          width="100%"
+                        />
+                      )}
+
+                      <Switch
                         isSelected={settings.includeUnnamedInMetadata}
                         onChange={(val) =>
                           setSettings((s) => ({ ...s, includeUnnamedInMetadata: val }))
@@ -1525,7 +1574,18 @@ export default function AdminConsole() {
                   </Well>
                 </Flex>
 
-                <Flex justifyContent="end">
+                <Flex justifyContent="end" gap="size-150" wrap>
+                  <Button
+                    variant="secondary"
+                    onPress={handleBackfillAllAssets}
+                    isDisabled={resyncingAll}
+                  >
+                    {resyncingAll
+                      ? resyncProgress
+                        ? `Backfilling (${resyncProgress.syncedAssetCount}/${resyncProgress.totalAssetsToSync})...`
+                        : 'Backfilling All Assets...'
+                      : 'Backfill / Re-sync All Existing Assets Now'}
+                  </Button>
                   <Button variant="cta" onPress={handleSaveSettings}>
                     Save Settings & Sync Asset Metadata
                   </Button>

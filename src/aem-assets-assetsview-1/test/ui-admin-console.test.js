@@ -754,3 +754,31 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
     'listGroupOptions is fetched lazily when Combine Into... is clicked'
   );
 });
+
+test('UI Dual-Write & Backfill: Settings tab includes secondary metadata property toggle (iptc4xmpExt:PersonInImage) and Backfill button that syncs all existing assets', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+
+  const settingsTab = screen
+    .getAllByText('BYOK AWS Rekognition & Metadata Settings')
+    .find((el) => el.closest('[role="tab"]'));
+  fireEvent.click(settingsTab);
+
+  const secPropField = await screen.findByLabelText(
+    'Secondary AEM Asset Metadata Property (multi-value String[])'
+  );
+  assert.equal(secPropField.value, 'iptc4xmpExt:PersonInImage');
+
+  requests.length = 0;
+  const backfillBtn = screen.getByText('Backfill / Re-sync All Existing Assets Now').closest('button');
+  assert.ok(backfillBtn, 'Backfill button exists in Settings tab');
+  fireEvent.click(backfillBtn);
+
+  await screen.findByText(
+    /Backfilled \/ re-synced xdm:faceNames & iptc4xmpExt:PersonInImage across \d+ asset\(s\)\./
+  );
+  assert.ok(
+    requests.some((r) => r.action === 'groups' && r.body.operation === 'resyncAllAssets'),
+    'resyncAllAssets is invoked when Backfill button is clicked'
+  );
+});

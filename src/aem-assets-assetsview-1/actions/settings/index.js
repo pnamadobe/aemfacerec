@@ -108,7 +108,10 @@ async function main(params = {}) {
       // R14: pass a 15s time budget so settings saves never exceed the 30s gateway timeout
       if (
         previousSettings.includeUnnamedInMetadata !== updatedSettings.includeUnnamedInMetadata ||
-        previousSettings.metadataProperty !== updatedSettings.metadataProperty
+        previousSettings.metadataProperty !== updatedSettings.metadataProperty ||
+        previousSettings.enableSecondaryMetadataProperty !==
+          updatedSettings.enableSecondaryMetadataProperty ||
+        previousSettings.secondaryMetadataProperty !== updatedSettings.secondaryMetadataProperty
       ) {
         const faceService = await createFaceService({
           aemHost: ctx.aemHost,

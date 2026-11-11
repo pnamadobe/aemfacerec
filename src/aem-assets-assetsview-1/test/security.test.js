@@ -414,8 +414,13 @@ test('R8: metadata write failure is reported instead of silently returning updat
   );
 
   const ok = createAemClient({ aemHost: AEM, token: 't', fetchImpl: async () => mockResponse(200) });
-  const res = await ok.updateAssetFaceMetadata('/content/dam/a.jpg', { faceNames: ['Alice'] });
+  const res = await ok.updateAssetFaceMetadata('/content/dam/a.jpg', {
+    faceNames: ['Alice'],
+    secondaryMetadataProperty: 'iptc4xmpExt:PersonInImage'
+  });
   assert.equal(res.updated, true);
+  assert.deepEqual(res.metadata['xdm:faceNames'], ['Alice']);
+  assert.deepEqual(res.metadata['iptc4xmpExt:PersonInImage'], ['Alice']);
 });
 
 test('Folder eligibility uses segment-aware prefix matching', async () => {

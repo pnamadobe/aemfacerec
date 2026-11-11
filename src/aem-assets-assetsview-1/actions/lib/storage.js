@@ -41,6 +41,8 @@ const DEFAULT_SETTINGS = {
   collectionId: 'aem-assets-faces',
   similarityThreshold: 85,
   metadataProperty: 'xdm:faceNames',
+  enableSecondaryMetadataProperty: true,
+  secondaryMetadataProperty: 'iptc4xmpExt:PersonInImage',
   includeUnnamedInMetadata: true,
   processingProfileName: 'Face Recognition',
   requireProcessingProfile: true,
@@ -671,6 +673,11 @@ async function createStorage(options = {}) {
           'aem-assets-faces',
         similarityThreshold: Number(merged.similarityThreshold ?? 85),
         metadataProperty: merged.metadataProperty || 'xdm:faceNames',
+        enableSecondaryMetadataProperty: Boolean(
+          merged.enableSecondaryMetadataProperty ?? DEFAULT_SETTINGS.enableSecondaryMetadataProperty
+        ),
+        secondaryMetadataProperty:
+          merged.secondaryMetadataProperty || DEFAULT_SETTINGS.secondaryMetadataProperty,
         includeUnnamedInMetadata: Boolean(merged.includeUnnamedInMetadata ?? true),
         processingProfileName: merged.processingProfileName ?? 'Face Recognition',
         requireProcessingProfile: Boolean(merged.requireProcessingProfile ?? true),
@@ -743,6 +750,21 @@ async function createStorage(options = {}) {
           );
         }
         updated.metadataProperty = prop;
+      }
+      if (typeof newSettings.enableSecondaryMetadataProperty === 'boolean') {
+        updated.enableSecondaryMetadataProperty = newSettings.enableSecondaryMetadataProperty;
+      }
+      if (
+        typeof newSettings.secondaryMetadataProperty === 'string' &&
+        newSettings.secondaryMetadataProperty.trim()
+      ) {
+        const secProp = newSettings.secondaryMetadataProperty.trim();
+        if (!isValidMetadataProperty(secProp)) {
+          throw new PublicError(
+            `Invalid secondary metadata property '${secProp}'. Use a namespaced name such as 'iptc4xmpExt:PersonInImage'.`
+          );
+        }
+        updated.secondaryMetadataProperty = secProp;
       }
       if (typeof newSettings.includeUnnamedInMetadata === 'boolean') {
         updated.includeUnnamedInMetadata = newSettings.includeUnnamedInMetadata;

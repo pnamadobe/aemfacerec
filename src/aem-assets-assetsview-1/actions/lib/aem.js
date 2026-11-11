@@ -835,27 +835,44 @@ function createAemClient({
     },
 
     /**
-     * Writes multi-value face metadata (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`)
-     * back to `jcr:content/metadata` on the AEM Asset.
+     * Writes multi-value face metadata (`xdm:faceNames`, optional secondary property such as
+     * `iptc4xmpExt:PersonInImage`, `xdm:faceGroupIds`, `xdm:faceCount`) back to
+     * `jcr:content/metadata` on the AEM Asset.
      */
     async updateAssetFaceMetadata(
       assetPath,
-      { faceNames = [], faceGroupIds = [], faceCount = 0, metadataProperty = 'xdm:faceNames' }
+      {
+        faceNames = [],
+        faceGroupIds = [],
+        faceCount = 0,
+        metadataProperty = 'xdm:faceNames',
+        secondaryMetadataProperty = null
+      }
     ) {
       const cleanPath = assertDamPath(assetPath, 'asset path');
       if (!isValidMetadataProperty(metadataProperty)) {
         throw new PublicError(`Invalid metadata property name: ${metadataProperty}`);
       }
+      if (secondaryMetadataProperty && !isValidMetadataProperty(secondaryMetadataProperty)) {
+        throw new PublicError(
+          `Invalid secondary metadata property name: ${secondaryMetadataProperty}`
+        );
+      }
+      const hasDistinctSecondary =
+        Boolean(secondaryMetadataProperty) && secondaryMetadataProperty !== metadataProperty;
+      const metadataOut = {
+        [metadataProperty]: faceNames,
+        ...(hasDistinctSecondary ? { [secondaryMetadataProperty]: faceNames } : {}),
+        'xdm:faceGroupIds': faceGroupIds,
+        'xdm:faceCount': faceCount
+      };
+
       if (!baseUrl || !fetchImpl) {
         return {
           updated: false,
           offline: true,
           assetPath: cleanPath,
-          metadata: {
-            [metadataProperty]: faceNames,
-            'xdm:faceGroupIds': faceGroupIds,
-            'xdm:faceCount': faceCount
-          }
+          metadata: metadataOut
         };
       }
 
@@ -866,6 +883,17 @@ function createAemClient({
       } else {
         for (const name of faceNames) {
           formData.append(metadataProperty, name);
+        }
+      }
+
+      if (hasDistinctSecondary) {
+        formData.append(`${secondaryMetadataProperty}@TypeHint`, 'String[]');
+        if (faceNames.length === 0) {
+          formData.append(`${secondaryMetadataProperty}@Delete`, 'true');
+        } else {
+          for (const name of faceNames) {
+            formData.append(secondaryMetadataProperty, name);
+          }
         }
       }
 
@@ -900,11 +928,7 @@ function createAemClient({
           body: JSON.stringify({
             class: 'asset',
             properties: {
-              metadata: {
-                [metadataProperty]: faceNames,
-                'xdm:faceGroupIds': faceGroupIds,
-                'xdm:faceCount': faceCount
-              }
+              metadata: metadataOut
             }
           })
         });
@@ -918,11 +942,7 @@ function createAemClient({
       return {
         updated: true,
         assetPath: cleanPath,
-        metadata: {
-          [metadataProperty]: faceNames,
-          'xdm:faceGroupIds': faceGroupIds,
-          'xdm:faceCount': faceCount
-        }
+        metadata: metadataOut
       };
     }
   };
