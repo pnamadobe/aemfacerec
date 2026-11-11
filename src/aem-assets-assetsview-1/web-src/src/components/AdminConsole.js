@@ -43,16 +43,21 @@ function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') 
   const repoId = normalizedHost.replace(/^https?:\/\//i, '');
   const expOrigin = hostContext.experienceOrigin || 'https://experience.adobe.com';
   const tenantPart = hostContext.imsTenant ? `/@${hostContext.imsTenant}` : '';
-  const queryParams = new URLSearchParams({ repoId });
+
+  // Extract Runtime namespace from <namespace>.adobeio-static.net so the deep link opens
+  // directly with the `<namespace>_face-recognition-panel` side panel active in Assets View.
+  let panelSegment = '';
   try {
-    const extHost = window.location?.origin || '';
-    if (/\.adobeio-static\.net$/i.test(extHost)) {
-      queryParams.set('ext', extHost);
+    const hostname = window.location?.hostname || '';
+    const nsMatch = hostname.match(/^([a-z0-9-]+)\.adobeio-static\.net$/i);
+    if (nsMatch) {
+      panelSegment = `/${nsMatch[1]}_face-recognition-panel`;
     }
   } catch (e) {
     // ignore
   }
-  return `${expOrigin}/?${queryParams.toString()}#${tenantPart}/assets/detail${cleanPath}`;
+
+  return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#${tenantPart}/assets/detail${panelSegment}${cleanPath}`;
 }
 
 /**

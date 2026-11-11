@@ -268,7 +268,7 @@ export default function ExtensionRegistration() {
               }
             },
             detailSidePanel: {
-              getPanels(resource) {
+              async getPanels(resource) {
                 const extracted = extractAssetContext(resource);
                 try {
                   if (extracted.assetPath || extracted.assetId) {
