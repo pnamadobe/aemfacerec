@@ -523,10 +523,43 @@ async function createStorage(options = {}) {
         const groupsDiff = mergeMapChanges(base.groups, db.groups || {}, latestGroups);
         const assetsDiff = mergeMapChanges(base.assets, db.assets || {}, latestAssets);
 
-        const nextPersonNumber = Math.max(
-          Number(latestCounters?.nextPersonNumber) || 1,
-          Number(db.counters?.nextPersonNumber) || 1
+        // Assign globally unique `Person #N` placeholder labels across concurrent ingests
+        // and auto-repair any existing duplicate `autoLabel` collisions.
+        const usedNumbers = new Set();
+        let maxUsedNumber = Math.max(
+          0,
+          (Number(latestCounters?.nextPersonNumber) || 1) - 1,
+          (Number(db.counters?.nextPersonNumber) || 1) - 1
         );
+
+        // 1. Reserve numbers from groups that already existed before this save
+        const sortedGroups = Object.values(groupsDiff.merged).sort((a, b) =>
+          String(a.createdAt || '').localeCompare(String(b.createdAt || '')) ||
+          String(a.groupId || '').localeCompare(String(b.groupId || ''))
+        );
+        const collidingGroups = [];
+
+        for (const grp of sortedGroups) {
+          if (!grp) continue;
+          const m = String(grp.autoLabel || '').match(/^Person #(\d+)$/);
+          const num = m ? Number(m[1]) : 0;
+          if (num > 0 && !usedNumbers.has(num)) {
+            usedNumbers.add(num);
+            if (num > maxUsedNumber) maxUsedNumber = num;
+          } else {
+            collidingGroups.push(grp);
+          }
+        }
+
+        // 2. Give any colliding or newly-created duplicate group its own sequential Person #N
+        for (const grp of collidingGroups) {
+          maxUsedNumber += 1;
+          usedNumbers.add(maxUsedNumber);
+          grp.autoLabel = `Person #${maxUsedNumber}`;
+          groupsDiff.changed = true;
+        }
+
+        const nextPersonNumber = maxUsedNumber + 1;
         const mergedCounters = { ...latestCounters, ...db.counters, nextPersonNumber };
         const countersChanged = JSON.stringify(mergedCounters) !== JSON.stringify(latestCounters);
 

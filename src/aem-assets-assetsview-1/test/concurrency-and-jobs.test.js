@@ -116,6 +116,13 @@ test('R1: 5 parallel ingests across separate service instances preserve all 5 as
     assert.equal(Object.keys(db.assets).length, 5, 'all 5 assets persisted');
     assert.equal(Object.keys(db.faces).length, 5, 'all 5 faces persisted');
     assert.equal(Object.keys(db.groups).length, 5, 'all 5 groups persisted');
+    const labels = Object.values(db.groups).map((g) => g.autoLabel).sort();
+    assert.deepEqual(
+      labels,
+      ['Person #1', 'Person #2', 'Person #3', 'Person #4', 'Person #5'],
+      'each concurrent group gets a unique Person #N label'
+    );
+    assert.equal(db.counters.nextPersonNumber, 6);
   } finally {
     h.cleanup();
   }
