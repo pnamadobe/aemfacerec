@@ -268,7 +268,7 @@ export default function ExtensionRegistration() {
               }
             },
             detailSidePanel: {
-              async getPanels(resource) {
+              getPanels(resource) {
                 const extracted = extractAssetContext(resource);
                 try {
                   if (extracted.assetPath || extracted.assetId) {
@@ -277,14 +277,13 @@ export default function ExtensionRegistration() {
                 } catch (e) {
                   // ignore
                 }
-                const qs = new URLSearchParams(extracted).toString();
                 return [
                   {
                     id: 'face-recognition-panel',
                     tooltip: 'Recognized Faces & People',
                     icon: 'UserGroup',
                     title: 'Recognized Faces',
-                    contentUrl: `/index.html?cb=${Date.now()}#face-recognition-panel?${qs}`,
+                    contentUrl: '/#face-recognition-panel',
                     reloadOnThemeChange: true
                   }
                 ];
@@ -326,7 +325,7 @@ export default function ExtensionRegistration() {
                       const qs = new URLSearchParams(extracted).toString();
                       guestConnection.host.modal.openDialog({
                         title: 'Facial Recognition & Group Management',
-                        contentUrl: `/index.html?cb=${Date.now()}#modal-face-management?${qs}`,
+                        contentUrl: `/#modal-face-management?${qs}`,
                         type: 'fullscreen',
                         size: 'XL',
                         payload: extracted

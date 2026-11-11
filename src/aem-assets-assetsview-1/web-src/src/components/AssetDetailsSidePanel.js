@@ -117,19 +117,53 @@ export default function AssetDetailsSidePanel() {
           // fallback to sharedContext
         }
 
+        let discoveredResource = null;
+        try {
+          if (gc.host?.details?.getCurrentResource) {
+            discoveredResource = await gc.host.details.getCurrentResource();
+          } else if (gc.host?.context?.getResource) {
+            discoveredResource = await gc.host.context.getResource();
+          }
+        } catch (e) {
+          // ignore
+        }
+
         const sharedContext = gc.sharedContext;
-        if (sharedContext) {
-          const auth = sharedContext.get('auth') || {};
-          const asset = sharedContext.get('asset') || sharedContext.get('resource') || {};
+        if (sharedContext || discoveredResource) {
+          const auth = sharedContext?.get?.('auth') || {};
+          const asset =
+            discoveredResource ||
+            sharedContext?.get?.('asset') ||
+            sharedContext?.get?.('resource') ||
+            {};
           imsToken = imsToken || auth.imsToken || null;
           imsOrg = imsOrg || auth.imsOrg || null;
-          aemHost = aemHost || sharedContext.get('aemHost') || auth.aemHost || null;
-          if (asset.assetId || asset.id || asset.path || asset.name) {
+          aemHost = aemHost || sharedContext?.get?.('aemHost') || auth.aemHost || null;
+          const nextAssetId =
+            asset.assetId ||
+            asset.id ||
+            asset['repo:id'] ||
+            asset.repositoryMetadata?.['repo:id'] ||
+            '';
+          const nextAssetPath =
+            asset.path ||
+            asset.assetPath ||
+            asset.repositoryPath ||
+            asset['repo:path'] ||
+            asset.repositoryMetadata?.['repo:path'] ||
+            '';
+          const nextAssetName =
+            asset.name ||
+            asset['repo:name'] ||
+            asset.assetName ||
+            asset.repositoryMetadata?.['repo:name'] ||
+            '';
+          if (nextAssetId || nextAssetPath || nextAssetName) {
             setHostContext((prev) => ({
               ...prev,
-              assetId: asset.assetId || asset.id || prev.assetId,
-              assetPath: asset.path || asset.assetPath || prev.assetPath,
-              assetName: asset.name || asset['repo:name'] || prev.assetName
+              assetId: nextAssetId || prev.assetId,
+              assetPath: nextAssetPath || prev.assetPath,
+              assetName: nextAssetName || prev.assetName
             }));
           }
         }
