@@ -226,7 +226,11 @@ async function createFaceService({
     if (filter === 'named' && !summary.isNamed) return false;
     if (filter === 'unnamed' && summary.isNamed) return false;
     if (query) {
-      const haystack = `${summary.displayName} ${summary.autoLabel || ''} ${summary.groupId}`.toLowerCase();
+      // Only match internal hex `groupId` when the caller explicitly searches by `grp_...`
+      const includeId = query.startsWith('grp_');
+      const haystack = includeId
+        ? `${summary.displayName} ${summary.autoLabel || ''} ${summary.groupId}`.toLowerCase()
+        : `${summary.displayName} ${summary.autoLabel || ''}`.toLowerCase();
       if (!haystack.includes(query)) return false;
     }
     return true;

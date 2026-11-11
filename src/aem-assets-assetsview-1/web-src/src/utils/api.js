@@ -392,7 +392,11 @@ async function invokeLocalPreviewFallback(actionName, payload) {
       const matched = all.filter((g) => {
         if (filter === 'named' && !g.isNamed) return false;
         if (filter === 'unnamed' && g.isNamed) return false;
-        return !q || `${g.displayName} ${g.autoLabel || ''} ${g.groupId}`.toLowerCase().includes(q);
+        if (!q) return true;
+        const haystack = q.startsWith('grp_')
+          ? `${g.displayName} ${g.autoLabel || ''} ${g.groupId}`.toLowerCase()
+          : `${g.displayName} ${g.autoLabel || ''}`.toLowerCase();
+        return haystack.includes(q);
       });
       if (op === 'listGroupOptions') {
         return {
