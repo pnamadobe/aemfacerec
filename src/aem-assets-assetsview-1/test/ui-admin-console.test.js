@@ -755,7 +755,7 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
   );
 });
 
-test('UI Dual-Write & Backfill: Settings tab includes secondary metadata property toggle (iptc4xmpExt:PersonInImage) and Backfill button that syncs all existing assets', async () => {
+test('UI Dual-Write & Backfill: Settings tab includes secondary metadata property toggle (xdm:persona) and Backfill button that syncs all existing assets', async () => {
   renderConsole();
   await screen.findByText('Alice Example');
 
@@ -767,7 +767,7 @@ test('UI Dual-Write & Backfill: Settings tab includes secondary metadata propert
   const secPropField = await screen.findByLabelText(
     'Secondary AEM Asset Metadata Property (multi-value String[])'
   );
-  assert.equal(secPropField.value, 'iptc4xmpExt:PersonInImage');
+  assert.equal(secPropField.value, 'xdm:persona');
 
   requests.length = 0;
   const backfillBtn = screen.getByText('Backfill / Re-sync All Existing Assets Now').closest('button');
@@ -775,7 +775,7 @@ test('UI Dual-Write & Backfill: Settings tab includes secondary metadata propert
   fireEvent.click(backfillBtn);
 
   await screen.findByText(
-    /Backfilled \/ re-synced xdm:faceNames & iptc4xmpExt:PersonInImage across \d+ asset\(s\)\./
+    /Backfilled \/ re-synced xdm:faceNames & xdm:persona across \d+ asset\(s\)\./
   );
   assert.ok(
     requests.some((r) => r.action === 'groups' && r.body.operation === 'resyncAllAssets'),

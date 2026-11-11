@@ -254,7 +254,7 @@ export default function AdminConsole() {
     similarityThreshold: 85,
     metadataProperty: 'xdm:faceNames',
     enableSecondaryMetadataProperty: true,
-    secondaryMetadataProperty: 'iptc4xmpExt:PersonInImage',
+    secondaryMetadataProperty: 'xdm:persona',
     includeUnnamedInMetadata: true,
     processingProfileName: 'Face Recognition',
     requireProcessingProfile: true,
@@ -1461,7 +1461,7 @@ export default function AdminConsole() {
                           setSettings((s) => ({ ...s, enableSecondaryMetadataProperty: val }))
                         }
                       >
-                        Also dual-write face names to <code>{settings.secondaryMetadataProperty || 'iptc4xmpExt:PersonInImage'}</code> (standard IPTC Person Shown field for AEM Search Filters)
+                        Also dual-write face names to <code>{settings.secondaryMetadataProperty || 'xdm:persona'}</code> (pre-indexed OOTB field for AEM Assets View Search Filters)
                       </Switch>
                       {settings.enableSecondaryMetadataProperty && (
                         <TextField
@@ -1470,7 +1470,7 @@ export default function AdminConsole() {
                           onChange={(v) =>
                             setSettings((s) => ({ ...s, secondaryMetadataProperty: v }))
                           }
-                          placeholder="iptc4xmpExt:PersonInImage"
+                          placeholder="xdm:persona"
                           width="100%"
                         />
                       )}

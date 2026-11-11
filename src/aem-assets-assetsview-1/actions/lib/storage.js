@@ -42,7 +42,7 @@ const DEFAULT_SETTINGS = {
   similarityThreshold: 85,
   metadataProperty: 'xdm:faceNames',
   enableSecondaryMetadataProperty: true,
-  secondaryMetadataProperty: 'iptc4xmpExt:PersonInImage',
+  secondaryMetadataProperty: 'xdm:persona',
   includeUnnamedInMetadata: true,
   processingProfileName: 'Face Recognition',
   requireProcessingProfile: true,
