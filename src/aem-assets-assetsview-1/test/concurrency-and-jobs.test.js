@@ -384,3 +384,30 @@ test('R14: renameGroup persists the new name BEFORE syncing AEM metadata, so a t
     h.cleanup();
   }
 });
+
+test('R14 Delta Sync: resyncAllAssetsMetadata skips assets whose metadata signature has not changed (zero redundant AEM HTTP writes)', async () => {
+  const h = await createConcurrentHarness();
+  try {
+    const svc = await h.newServiceInstance();
+    // Ingest 3 assets: 1 named, 2 unnamed
+    const r1 = await svc.ingestAsset({ assetPath: '/content/dam/delta/named.jpg', force: true });
+    await svc.ingestAsset({ assetPath: '/content/dam/delta/unnamed1.jpg', force: true });
+    await svc.ingestAsset({ assetPath: '/content/dam/delta/unnamed2.jpg', force: true });
+    await svc.renameGroup({ groupId: r1.faces[0].groupId, name: 'Named Person' });
+
+    const writesBefore = h.aemWrites;
+    // Re-sync with no settings change: all 3 assets already match lastSyncedSignature -> 0 AEM writes!
+    const noChangeSync = await svc.resyncAllAssetsMetadata();
+    assert.equal(noChangeSync.syncedAssetCount, 0);
+    assert.equal(noChangeSync.skippedUnchangedCount, 3);
+    assert.equal(h.aemWrites, writesBefore);
+
+    // Toggle includeUnnamedInMetadata = false: only the 2 unnamed assets changed signature; the named asset is skipped!
+    await h.storage.saveSettings({ includeUnnamedInMetadata: false });
+    const deltaSync = await svc.resyncAllAssetsMetadata();
+    assert.equal(deltaSync.syncedAssetCount, 2, 'only the 2 unnamed assets needed an AEM write');
+    assert.equal(deltaSync.skippedUnchangedCount, 1, 'the named asset was skipped with 0 AEM writes');
+  } finally {
+    h.cleanup();
+  }
+});

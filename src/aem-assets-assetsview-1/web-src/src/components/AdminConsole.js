@@ -317,8 +317,6 @@ export default function AdminConsole() {
   const [scanResult, setScanResult] = useState(null);
   const [rescanExisting, setRescanExisting] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [resyncingAll, setResyncingAll] = useState(false);
-  const [resyncProgress, setResyncProgress] = useState(null);
   const [scanProgress, setScanProgress] = useState(null);
   const [scanningAssetPath, setScanningAssetPath] = useState(null);
 
@@ -641,31 +639,6 @@ export default function AdminConsole() {
       });
     } catch (err) {
       setBanner({ type: 'negative', text: err.message });
-    }
-  };
-
-  const handleBackfillAllAssets = async () => {
-    setResyncingAll(true);
-    setResyncProgress(null);
-    try {
-      const res = await api.resyncAllAssets(hostContext, (prog) => {
-        setResyncProgress(prog);
-      });
-      await loadAll();
-      const targetFields = settings.enableSecondaryMetadataProperty
-        ? `${settings.metadataProperty} & ${settings.secondaryMetadataProperty}`
-        : settings.metadataProperty;
-      setBanner(
-        resultBanner(
-          `Backfilled / re-synced ${targetFields} across ${res.syncedAssetCount} asset(s).`,
-          res
-        )
-      );
-    } catch (err) {
-      setBanner({ type: 'negative', text: err.message });
-    } finally {
-      setResyncingAll(false);
-      setResyncProgress(null);
     }
   };
 
@@ -1574,18 +1547,7 @@ export default function AdminConsole() {
                   </Well>
                 </Flex>
 
-                <Flex justifyContent="end" gap="size-150" wrap>
-                  <Button
-                    variant="secondary"
-                    onPress={handleBackfillAllAssets}
-                    isDisabled={resyncingAll}
-                  >
-                    {resyncingAll
-                      ? resyncProgress
-                        ? `Backfilling (${resyncProgress.syncedAssetCount}/${resyncProgress.totalAssetsToSync})...`
-                        : 'Backfilling All Assets...'
-                      : 'Backfill / Re-sync All Existing Assets Now'}
-                  </Button>
+                <Flex justifyContent="end">
                   <Button variant="cta" onPress={handleSaveSettings}>
                     Save Settings & Sync Asset Metadata
                   </Button>

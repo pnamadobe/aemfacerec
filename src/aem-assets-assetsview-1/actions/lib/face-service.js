@@ -247,10 +247,23 @@ async function createFaceService({
     return Math.min(max, Math.max(min, n));
   }
 
+  function buildMetadataSignature(computed) {
+    return JSON.stringify({
+      metadataProperty: computed.metadataProperty,
+      secondaryMetadataProperty: computed.secondaryMetadataProperty || null,
+      faceNames: computed.faceNames || [],
+      faceGroupIds: computed.faceGroupIds || [],
+      faceCount: computed.faceCount || 0
+    });
+  }
+
   /**
    * Recomputes and writes AEM metadata for a set of assetIds.
    *
    * - Writes run with bounded concurrency (`AEM_WRITE_CONCURRENCY`).
+   * - When `onlyIfChanged: true` (used by `resyncAllAssetsMetadata` on large libraries),
+   *   assets whose computed metadata signature already matches `assetRecord.lastSyncedSignature`
+   *   (and have no prior `metadataSyncError`) are skipped in memory with zero AEM HTTP calls.
    * - Enforces an optional `timeBudgetMs` so large fan-outs (e.g. a person in 1,000 photos
    *   or a full-library resync) stop cleanly before the 30s gateway timeout and return
    *   `hasMore: true, nextOffset, remainingAssetCount` (`R14`).
@@ -261,11 +274,12 @@ async function createFaceService({
     assetIds,
     db,
     settings,
-    { offset = 0, limit = 0, timeBudgetMs = 0 } = {}
+    { offset = 0, limit = 0, timeBudgetMs = 0, onlyIfChanged = false } = {}
   ) {
     const startTime = Date.now();
     const seenPaths = new Set();
     const dedupedRecords = [];
+    let skippedUnchangedCount = 0;
 
     for (const assetId of assetIds.filter(Boolean)) {
       const assetRecord = findAssetRecord(db, assetId, null);
@@ -275,11 +289,22 @@ async function createFaceService({
       seenPaths.add(dedupeKey);
 
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
+      const signature = buildMetadataSignature(computed);
       assetRecord.faceNames = computed.faceNames;
       assetRecord.faceGroupIds = computed.faceGroupIds;
       assetRecord.faceCount = computed.faceCount;
+
+      if (
+        onlyIfChanged &&
+        assetRecord.lastSyncedSignature === signature &&
+        !assetRecord.metadataSyncError
+      ) {
+        skippedUnchangedCount++;
+        continue;
+      }
+
       assetRecord.updatedAt = new Date().toISOString();
-      dedupedRecords.push({ assetRecord, computed });
+      dedupedRecords.push({ assetRecord, computed, signature });
     }
 
     const startIdx = Math.max(0, Number(offset) || 0);
@@ -299,7 +324,7 @@ async function createFaceService({
       const chunk = targetSlice.slice(i, i + AEM_WRITE_CONCURRENCY);
       // eslint-disable-next-line no-await-in-loop
       await Promise.all(
-        chunk.map(async ({ assetRecord, computed }) => {
+        chunk.map(async ({ assetRecord, computed, signature }) => {
           processedCount++;
           if (!assetRecord.assetPath) return;
           try {
@@ -308,6 +333,7 @@ async function createFaceService({
               computed
             );
             assetRecord.metadataSyncError = null;
+            assetRecord.lastSyncedSignature = signature;
             synced.push(syncRes);
           } catch (err) {
             // eslint-disable-next-line no-console
@@ -330,6 +356,7 @@ async function createFaceService({
     return {
       synced,
       failed,
+      skippedUnchangedCount,
       totalAssets: dedupedRecords.length,
       processedCount,
       hasMore,
@@ -342,6 +369,7 @@ async function createFaceService({
     return {
       syncedAssetCount: sync.synced.length,
       syncedAssets: sync.synced,
+      skippedUnchangedCount: sync.skippedUnchangedCount ?? 0,
       failedAssetCount: sync.failed.length,
       failedAssets: sync.failed,
       totalAssetsToSync: sync.totalAssets ?? sync.synced.length + sync.failed.length,
@@ -1400,7 +1428,8 @@ async function createFaceService({
     async resyncAllAssetsMetadata({
       offset = 0,
       limit = 0,
-      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS
+      timeBudgetMs = DEFAULT_SYNC_TIME_BUDGET_MS,
+      onlyIfChanged = true
     } = {}) {
       const [db, settings] = await Promise.all([
         storage.getDatabase(),
@@ -1411,7 +1440,8 @@ async function createFaceService({
       const sync = await syncAssetsToAem(allAssetIds, db, settings, {
         offset,
         limit,
-        timeBudgetMs
+        timeBudgetMs,
+        onlyIfChanged
       });
       await storage.saveDatabase(db);
 

@@ -755,7 +755,7 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
   );
 });
 
-test('UI Dual-Write & Backfill: Settings tab includes secondary metadata property toggle (xdm:persona) and Backfill button that syncs all existing assets', async () => {
+test('UI Dual-Write: Settings tab includes secondary metadata property toggle (xdm:persona) and only a single Save Settings & Sync button', async () => {
   renderConsole();
   await screen.findByText('Alice Example');
 
@@ -768,17 +768,14 @@ test('UI Dual-Write & Backfill: Settings tab includes secondary metadata propert
     'Secondary AEM Asset Metadata Property (multi-value String[])'
   );
   assert.equal(secPropField.value, 'xdm:persona');
+  assert.equal(screen.queryByText(/Backfill \/ Re-sync All Existing Assets Now/), null);
 
-  requests.length = 0;
-  const backfillBtn = screen.getByText('Backfill / Re-sync All Existing Assets Now').closest('button');
-  assert.ok(backfillBtn, 'Backfill button exists in Settings tab');
-  fireEvent.click(backfillBtn);
+  fireEvent.change(secPropField, { target: { value: 'dc:subject' } });
+  fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
+  await screen.findByText(/Settings saved\./);
 
-  await screen.findByText(
-    /Backfilled \/ re-synced xdm:faceNames & xdm:persona across \d+ asset\(s\)\./
-  );
-  assert.ok(
-    requests.some((r) => r.action === 'groups' && r.body.operation === 'resyncAllAssets'),
-    'resyncAllAssets is invoked when Backfill button is clicked'
-  );
+  // Restore to xdm:persona
+  fireEvent.change(secPropField, { target: { value: 'xdm:persona' } });
+  fireEvent.click(screen.getByText('Save Settings & Sync Asset Metadata'));
+  await screen.findByText(/Settings saved\./);
 });
