@@ -1,9 +1,10 @@
 # Project TODOs & Implementation Plans
 
-## 1. Write an Adobe Coworker Skill (`aem-face-recognition`) — ✅ Completed
+## 1. Write an Adobe Coworker Skill (`aem-face-recognition`) & Harden Asset Lifecycle — ✅ Completed
 - [x] Created and installed the `aem-face-recognition` skill (`skills/aem-face-recognition/SKILL.md`, `~/.config/opencode/skills/aem-face-recognition/SKILL.md`, and `~/.claude/skills/aem-face-recognition/SKILL.md`) along with `facerec_cli.mjs`.
 - [x] Synced left-to-right `xdm:faceLabels` and `xdm:faceGroupIds` to AEM `jcr:content/metadata` across all indexed assets so Coworker's native `read-api` (`search-assets`) can list faces per asset in a folder, inspect single assets, and find co-appearing assets via indexed `assetMetadata.xdm:persona` + `xdm:faceGroupIds` with zero local CLI dependencies.
 - [x] Added dynamic AEM Assets View `detailUrl` deep links (using `repo:repositoryId` and dynamic tenant resolution, with no hardcoded tenant/host).
+- [x] Fixed the ghost `sling:Folder` creation bug (`FACE-RECOGNITION-GHOST-FOLDER-BUG.md`) and added pro-active defenses for deleted, moved/renamed, and AEM Trash (`jcr:content/cq:discarded`) soft-deleted assets across `aem.js`, `face-service.js`, `security.js`, `groups/index.js`, and `ingest/index.js`.
 
 ---
 

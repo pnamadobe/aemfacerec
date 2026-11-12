@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const { createStorage } = require('./storage');
 const { createRekognitionService } = require('./rekognition');
 const { createAemClient, normalizeDamPath } = require('./aem');
-const { PublicError, assertDamPath } = require('./security');
+const { PublicError, assertDamPath, isDiscardedOrSystemDamPath } = require('./security');
 const { mapWithConcurrency } = require('./retry');
 
 const AEM_WRITE_CONCURRENCY = 4;
@@ -277,24 +277,66 @@ async function createFaceService({
     });
   }
 
+  async function pruneDeletedAssetFromDbAndRekognition({ assetId, assetPath }, db, rekognition) {
+    const entries = findMatchingAssetEntries(db, { assetId, assetPath });
+    if (entries.length === 0) return { pruned: false, removedFaceCount: 0 };
+
+    const oldFaceIds = Array.from(
+      new Set(entries.flatMap(({ record }) => record.faceIds || []).filter(Boolean))
+    );
+
+    if (rekognition) {
+      try {
+        await removeExistingAssetFaces({ assetId, assetPath, canonicalKey: null }, db, rekognition);
+      } catch (e) {
+        // Fallback to local db cleanup if Rekognition is unreachable
+      }
+    }
+
+    // Ensure local db and avatars are cleaned even if removeExistingAssetFaces was skipped
+    if (oldFaceIds.length > 0) {
+      const removedSet = new Set(oldFaceIds);
+      for (const [groupId, grp] of Object.entries(db.groups || {})) {
+        if (!grp) continue;
+        if ((grp.faceIds || []).some((id) => removedSet.has(id))) {
+          grp.faceIds = (grp.faceIds || []).filter((id) => !removedSet.has(id));
+          if (grp.faceIds.length === 0) {
+            delete db.groups[groupId];
+          } else if (removedSet.has(grp.coverFaceId)) {
+            grp.coverFaceId = grp.faceIds[0];
+          }
+        }
+      }
+      for (const fId of oldFaceIds) {
+        delete db.faces[fId];
+      }
+      await Promise.all(oldFaceIds.map((id) => storage.deleteAvatar(id).catch(() => {})));
+    }
+
+    for (const { key } of entries) {
+      delete db.assets[key];
+    }
+
+    return { pruned: true, removedFaceCount: oldFaceIds.length };
+  }
+
   /**
    * Recomputes and writes AEM metadata for a set of assetIds.
    *
    * - Writes run with bounded concurrency (`AEM_WRITE_CONCURRENCY`).
-   * - When `onlyIfChanged: true` (used by `resyncAllAssetsMetadata` on large libraries),
-   *   assets whose computed metadata signature already matches `assetRecord.lastSyncedSignature`
-   *   (and have no prior `metadataSyncError`) are skipped in memory with zero AEM HTTP calls.
-   * - Enforces an optional `timeBudgetMs` so large fan-outs (e.g. a person in 1,000 photos
-   *   or a full-library resync) stop cleanly before the 30s gateway timeout and return
-   *   `hasMore: true, nextOffset, remainingAssetCount` (`R14`).
-   * - A failure on one asset never aborts the batch; callers always persist their database
-   *   changes first and report failures/remaining counts to the user.
+   * - When `verifyExists: true` (default on all re-syncs and group mutations), verifies that each
+   *   asset still exists in AEM as a `dam:Asset` before issuing a Sling POST, preventing
+   *   `SlingPostServlet` from creating ghost `sling:Folder` nodes for deleted assets.
+   * - If an asset was moved/renamed in AEM (404 at old path, but `jcr:uuid` resolves to a new
+   *   DAM path), updates `assetPath` in-place and syncs metadata to the new path.
+   * - If an asset was genuinely deleted in AEM, prunes it (and its orphaned faces, avatars, and
+   *   Rekognition vectors) from the database and deletes any ghost `sling:Folder`.
    */
   async function syncAssetsToAem(
     assetIds,
     db,
     settings,
-    { offset = 0, limit = 0, timeBudgetMs = 0, onlyIfChanged = false } = {}
+    { offset = 0, limit = 0, timeBudgetMs = 0, onlyIfChanged = false, verifyExists = true } = {}
   ) {
     const startTime = Date.now();
     const seenPaths = new Set();
@@ -333,6 +375,7 @@ async function createFaceService({
 
     const synced = [];
     const failed = [];
+    const deletedToPrune = [];
     let processedCount = 0;
     let stoppedForTimeBudget = false;
 
@@ -348,10 +391,58 @@ async function createFaceService({
           processedCount++;
           if (!assetRecord.assetPath) return;
           try {
-            const syncRes = await aemClient.updateAssetFaceMetadata(
-              assetRecord.assetPath,
-              computed
-            );
+            let syncRes = await aemClient.updateAssetFaceMetadata(assetRecord.assetPath, {
+              ...computed,
+              verifyExists
+            });
+
+            if (syncRes && syncRes.assetDeleted) {
+              // Pro-active check: was the asset moved/renamed in AEM rather than deleted?
+              const candidateUuid = stripUrnPrefix(assetRecord.uuid || assetRecord.assetId || '');
+              let movedPath = null;
+              if (
+                candidateUuid &&
+                !candidateUuid.startsWith('/') &&
+                typeof aemClient.resolvePathByAssetUuid === 'function'
+              ) {
+                try {
+                  movedPath = await aemClient.resolvePathByAssetUuid(candidateUuid);
+                } catch (e) {
+                  movedPath = null;
+                }
+              }
+
+              const cleanMoved =
+                movedPath && !isDiscardedOrSystemDamPath(movedPath)
+                  ? safeNormalizeDamPath(movedPath)
+                  : '';
+              if (cleanMoved && cleanMoved !== safeNormalizeDamPath(assetRecord.assetPath)) {
+                const newTitle = cleanMoved.split('/').pop() || assetRecord.assetTitle;
+                assetRecord.assetPath = cleanMoved;
+                assetRecord.assetTitle = newTitle;
+                for (const fId of assetRecord.faceIds || []) {
+                  if (db.faces[fId]) {
+                    db.faces[fId].assetPath = cleanMoved;
+                    db.faces[fId].assetTitle = newTitle;
+                  }
+                }
+                syncRes = await aemClient.updateAssetFaceMetadata(cleanMoved, {
+                  ...computed,
+                  verifyExists: true
+                });
+              }
+
+              if (syncRes && syncRes.assetDeleted) {
+                deletedToPrune.push({
+                  assetId: assetRecord.assetId,
+                  assetPath: assetRecord.assetPath,
+                  isGhostFolder: Boolean(syncRes.isGhostFolder),
+                  ghostFolderDeleted: Boolean(syncRes.ghostFolderDeleted)
+                });
+                return;
+              }
+            }
+
             assetRecord.metadataSyncError = null;
             assetRecord.lastSyncedSignature = signature;
             synced.push(syncRes);
@@ -369,16 +460,33 @@ async function createFaceService({
       );
     }
 
-    const nextOffset = startIdx + processedCount;
-    const hasMore = stoppedForTimeBudget || nextOffset < dedupedRecords.length;
-    const remainingAssetCount = Math.max(0, dedupedRecords.length - nextOffset);
+    if (deletedToPrune.length > 0) {
+      let rekognition = null;
+      try {
+        const rekCtx = await getRekognition();
+        rekognition = rekCtx.rekognition;
+      } catch (e) {
+        rekognition = null;
+      }
+      for (const item of deletedToPrune) {
+        // eslint-disable-next-line no-await-in-loop
+        await pruneDeletedAssetFromDbAndRekognition(item, db, rekognition);
+      }
+    }
+
+    const rawNextOffset = startIdx + processedCount;
+    const hasMore = stoppedForTimeBudget || rawNextOffset < dedupedRecords.length;
+    const remainingAssetCount = Math.max(0, dedupedRecords.length - rawNextOffset);
     // When onlyIfChanged filters out already-synced records on the next call, the remaining
     // unsynced records shift to index 0, so nextOffset for onlyIfChanged is always 0.
-    const nextCallOffset = hasMore ? (onlyIfChanged ? 0 : nextOffset) : null;
+    // When onlyIfChanged is false, pruned records shift remaining records down by deletedToPrune.length.
+    const adjustedOffset = Math.max(0, rawNextOffset - deletedToPrune.length);
+    const nextCallOffset = hasMore ? (onlyIfChanged ? 0 : adjustedOffset) : null;
 
     return {
       synced,
       failed,
+      pruned: deletedToPrune,
       skippedUnchangedCount,
       totalAssets: dedupedRecords.length,
       processedCount,
@@ -389,9 +497,13 @@ async function createFaceService({
   }
 
   function syncSummary(sync) {
+    const prunedList = sync.pruned || [];
     return {
       syncedAssetCount: sync.synced.length,
       syncedAssets: sync.synced,
+      prunedAssetCount: prunedList.length,
+      prunedAssets: prunedList.map((p) => p.assetPath),
+      ghostFoldersCleanedCount: prunedList.filter((p) => p.ghostFolderDeleted).length,
       skippedUnchangedCount: sync.skippedUnchangedCount ?? 0,
       failedAssetCount: sync.failed.length,
       failedAssets: sync.failed,
@@ -522,6 +634,19 @@ async function createFaceService({
       if (resolvedFromUuid) {
         cleanPath = normalizeDamPath(resolvedFromUuid);
       }
+    }
+
+    if (cleanPath && isDiscardedOrSystemDamPath(cleanPath)) {
+      await pruneDeletedAssetFromDbAndRekognition(
+        { assetId, assetPath: cleanPath },
+        db,
+        rekognition
+      );
+      return skippedResult(
+        cleanPath,
+        'discarded-asset',
+        'Asset is in AEM Trash (cq:discarded) or is a JCR system node and was skipped.'
+      );
     }
 
     if (!force && cleanPath) {
@@ -692,12 +817,12 @@ async function createFaceService({
     if (applyError) {
       const unapplied = indexedFaceIds.filter((id) => !newFaceIds.includes(id));
       await discardIndexedFaces(unapplied, rekognition);
-      await syncAssetsToAem([resolvedAssetId], db, settings);
+      await syncAssetsToAem([resolvedAssetId], db, settings, { verifyExists: false });
       applyError.dbMutated = true;
       throw applyError;
     }
 
-    const sync = await syncAssetsToAem([resolvedAssetId], db, settings);
+    const sync = await syncAssetsToAem([resolvedAssetId], db, settings, { verifyExists: false });
 
     const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
     const enrichedFaces = newFaceIds.map((id) => enrichFace(db.faces[id], db.groups)).filter(Boolean);
@@ -810,10 +935,12 @@ async function createFaceService({
       ]);
 
       let browsed = { folderPath: cleanFolder, folders: [], assets: [], excludedAssetCount: 0 };
+      let liveBrowseSucceeded = false;
       try {
         browsed = await aemClient.browseDamFolder(cleanFolder, {
           allowedImageTypes: settings.allowedImageTypes
         });
+        liveBrowseSucceeded = Boolean(aemHost && (browsed.assets?.length > 0 || browsed.folders?.length > 0));
       } catch (e) {
         // Fallback to indexed assets in db.assets if live AEM folder browse is unavailable
       }
@@ -830,21 +957,23 @@ async function createFaceService({
         });
       }
 
-      for (const rec of Object.values(db.assets || {})) {
-        if (!rec || !rec.assetPath) continue;
-        const normPath = safeNormalizeDamPath(rec.assetPath);
-        if (!normPath || byPath.has(normPath)) continue;
-        const parentDir = normPath.slice(0, normPath.lastIndexOf('/')) || '/content/dam';
-        const inScope = includeSubfolders
-          ? parentDir === cleanFolder || normPath.startsWith(`${cleanFolder}/`)
-          : parentDir === cleanFolder;
-        if (inScope) {
-          byPath.set(normPath, {
-            assetId: rec.assetId,
-            assetPath: normPath,
-            assetTitle: rec.assetTitle || normPath.split('/').pop(),
-            indexedRecord: rec
-          });
+      if (!liveBrowseSucceeded || includeSubfolders) {
+        for (const rec of Object.values(db.assets || {})) {
+          if (!rec || !rec.assetPath) continue;
+          const normPath = safeNormalizeDamPath(rec.assetPath);
+          if (!normPath || byPath.has(normPath)) continue;
+          const parentDir = normPath.slice(0, normPath.lastIndexOf('/')) || '/content/dam';
+          const inScope = includeSubfolders
+            ? parentDir === cleanFolder || normPath.startsWith(`${cleanFolder}/`)
+            : parentDir === cleanFolder;
+          if (inScope) {
+            byPath.set(normPath, {
+              assetId: rec.assetId,
+              assetPath: normPath,
+              assetTitle: rec.assetTitle || normPath.split('/').pop(),
+              indexedRecord: rec
+            });
+          }
         }
       }
 
@@ -1791,6 +1920,31 @@ async function createFaceService({
         deletedDisplayName,
         deletedFaceCount: memberFaceIds.length,
         ...syncSummary(sync)
+      };
+    },
+
+    /**
+     * Prunes a deleted AEM asset (e.g. on an `aem.assets.asset.deleted` I/O Event webhook)
+     * from the database, avatar storage, and AWS Rekognition Collection.
+     */
+    async pruneDeletedAsset({ assetId, assetPath }) {
+      const db = await storage.getDatabase();
+      let rekognition = null;
+      try {
+        const rekCtx = await getRekognition();
+        rekognition = rekCtx.rekognition;
+      } catch (e) {
+        rekognition = null;
+      }
+      const res = await pruneDeletedAssetFromDbAndRekognition({ assetId, assetPath }, db, rekognition);
+      if (res.pruned) {
+        await storage.saveDatabase(db);
+      }
+      return {
+        pruned: res.pruned,
+        removedFaceCount: res.removedFaceCount,
+        assetId: assetId || null,
+        assetPath: assetPath || null
       };
     },
 

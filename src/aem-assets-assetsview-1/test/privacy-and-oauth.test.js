@@ -463,3 +463,268 @@ test('P1: ingested faces omit inline avatarDataUrl in db/faces.json on disk and 
     h.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Ghost `sling:Folder` bug prevention, ghost folder cleanup, and moved-asset recovery
+// ---------------------------------------------------------------------------
+
+test('Ghost folder defense: deleted assets are never POSTed to jcr:content/metadata, ghost sling:Folders are cleaned up, and orphaned faces are pruned', async () => {
+  const h = await createErasureHarness();
+  try {
+    const ghostPath = '/content/dam/26H2/upload-test/20261111_test-campaign_whitelotus1.jpg';
+    const livePath = '/content/dam/26H2/upload-test/live-photo.jpg';
+
+    await h.svc.ingestAsset({ assetPath: ghostPath, force: true });
+    await h.svc.ingestAsset({ assetPath: livePath, force: true });
+
+    const requests = [];
+    const realAem = createAemClient({
+      aemHost: 'https://author-p1-e1.adobeaemcloud.com',
+      token: 'user-token',
+      fetchImpl: async (url, opts = {}) => {
+        requests.push({ url: String(url), method: opts.method || 'GET', body: opts.body || '' });
+        if (String(url).endsWith('whitelotus1.jpg.2.json')) {
+          // Simulate a ghost sling:Folder created by an earlier sync on a deleted image
+          const ghostJson = JSON.stringify({
+            'jcr:primaryType': 'sling:Folder',
+            'jcr:content': {
+              'jcr:primaryType': 'sling:Folder',
+              metadata: { 'jcr:primaryType': 'sling:Folder', 'xdm:faceCount': 2 }
+            }
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => ghostJson,
+            json: async () => JSON.parse(ghostJson)
+          };
+        }
+        if (String(url).endsWith('live-photo.jpg.2.json')) {
+          const liveJson = JSON.stringify({
+            'jcr:primaryType': 'dam:Asset',
+            'jcr:content': { 'jcr:primaryType': 'dam:AssetContent' }
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => liveJson,
+            json: async () => JSON.parse(liveJson)
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => '{}',
+          json: async () => ({})
+        };
+      }
+    });
+
+    const svcWithRealAem = await createFaceService({
+      storage: h.storage,
+      rekognitionClient: h.rekognitionClient,
+      aemClient: realAem
+    });
+
+    const resync = await svcWithRealAem.resyncAllAssetsMetadata({ onlyIfChanged: false });
+    assert.equal(resync.syncedAssetCount, 1, 'only the live dam:Asset should receive a metadata write');
+    assert.equal(resync.prunedAssetCount, 1, 'the deleted ghost-folder asset must be pruned');
+    assert.equal(resync.ghostFoldersCleanedCount, 1, 'the ghost sling:Folder must be deleted in AEM');
+
+    // Verify no Sling POST was sent to whitelotus1.jpg/jcr:content/metadata
+    const ghostMetaPosts = requests.filter(
+      (r) => r.method === 'POST' && r.url.includes('whitelotus1.jpg/jcr:content/metadata')
+    );
+    assert.equal(ghostMetaPosts.length, 0, 'must never POST metadata to a ghost folder or deleted asset');
+
+    // Verify `:operation=delete` was sent to clean up the ghost folder node
+    const ghostDeleteCalls = requests.filter(
+      (r) => r.url.endsWith('whitelotus1.jpg') && r.body.includes('delete')
+    );
+    assert.equal(ghostDeleteCalls.length, 1);
+
+    // Verify the deleted asset and its faces were pruned from db
+    const dbAfter = await h.storage.getDatabase();
+    assert.equal(
+      Object.values(dbAfter.assets).some((a) => a.assetPath === ghostPath),
+      false,
+      'deleted asset must be removed from db.assets'
+    );
+    assert.equal(
+      Object.values(dbAfter.faces).some((f) => f.assetPath === ghostPath),
+      false,
+      'deleted asset faces must be removed from db.faces'
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Pro-active move/rename defense: if an asset 404s at its old path but its UUID resolves to a new path, metadata syncs to the new path without pruning', async () => {
+  const h = await createErasureHarness();
+  try {
+    const oldPath = '/content/dam/26H2/upload-test/moved-photo.jpg';
+    const newPath = '/content/dam/26H2/campaigns/moved-photo-renamed.jpg';
+    const ingested = await h.svc.ingestAsset({ assetPath: oldPath, force: true });
+    const grpId = ingested.faces[0].groupId;
+
+    const writtenPaths = [];
+    const moveAwareAem = {
+      ...h.aemClient,
+      async resolvePathByAssetUuid(uuid) {
+        if (uuid === 'uuid-moved-photo.jpg') return newPath;
+        return null;
+      },
+      async updateAssetFaceMetadata(assetPath, payload) {
+        if (assetPath === oldPath && payload.verifyExists) {
+          return { updated: false, assetDeleted: true, assetPath };
+        }
+        writtenPaths.push(assetPath);
+        return { updated: true, assetPath, metadata: payload };
+      }
+    };
+
+    const svc = await createFaceService({
+      storage: h.storage,
+      rekognitionClient: h.rekognitionClient,
+      aemClient: moveAwareAem
+    });
+
+    const renameRes = await svc.renameGroup({ groupId: grpId, name: 'Moved Person' });
+    assert.equal(renameRes.syncedAssetCount, 1);
+    assert.equal(renameRes.prunedAssetCount, 0);
+    assert.deepEqual(writtenPaths, [newPath]);
+
+    const dbAfter = await h.storage.getDatabase();
+    assert.equal(dbAfter.assets['uuid-moved-photo.jpg'].assetPath, newPath);
+    for (const fId of dbAfter.assets['uuid-moved-photo.jpg'].faceIds) {
+      assert.equal(dbAfter.faces[fId].assetPath, newPath);
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('AEM Trash (cq:discarded) defense: soft-deleted assets in jcr:content/cq:discarded are ignored by UUID lookup and pruned along with intermediate ghost folders', async () => {
+  const h = await createErasureHarness();
+  try {
+    const deletedNestedPath = '/content/dam/26H2/upload-test/folder1/20261111_test-campaign_gotkey.jpg';
+    await h.svc.ingestAsset({ assetPath: deletedNestedPath, force: true });
+
+    const deletedCalls = [];
+    const realAem = createAemClient({
+      aemHost: 'https://author-p1-e1.adobeaemcloud.com',
+      token: 'user-token',
+      fetchImpl: async (url, opts = {}) => {
+        const u = String(url);
+        if (opts.method === 'POST' && String(opts.body || '').includes('delete')) {
+          deletedCalls.push(u);
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => '{}',
+            json: async () => ({})
+          };
+        }
+        if (u.includes('/bin/querybuilder.json')) {
+          // Simulate AEM QueryBuilder returning the soft-deleted asset inside jcr:content/cq:discarded
+          const qbJson = JSON.stringify({
+            hits: [
+              {
+                path: '/content/dam/26H2/upload-test/jcr:content/cq:discarded/e998f6e5/folder1/20261111_test-campaign_gotkey.jpg'
+              }
+            ]
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => qbJson,
+            json: async () => JSON.parse(qbJson)
+          };
+        }
+        if (u.endsWith('20261111_test-campaign_gotkey.jpg.2.json')) {
+          // Leaf ghost folder
+          const ghostLeaf = JSON.stringify({
+            'jcr:primaryType': 'sling:Folder',
+            'jcr:content': { 'jcr:primaryType': 'sling:Folder' }
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => ghostLeaf,
+            json: async () => JSON.parse(ghostLeaf)
+          };
+        }
+        if (u.endsWith('/upload-test/folder1.1.json')) {
+          // Empty intermediate ghost ancestor folder created by SlingPostServlet without jcr:content
+          const emptyAncestor = JSON.stringify({
+            'jcr:primaryType': 'sling:Folder'
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => emptyAncestor,
+            json: async () => JSON.parse(emptyAncestor)
+          };
+        }
+        if (u.endsWith('/upload-test.1.json')) {
+          // Real DAM folder has jcr:content
+          const realFolder = JSON.stringify({
+            'jcr:primaryType': 'sling:Folder',
+            'jcr:content': { 'jcr:primaryType': 'nt:unstructured', 'jcr:title': 'upload-test' }
+          });
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => realFolder,
+            json: async () => JSON.parse(realFolder)
+          };
+        }
+        return {
+          ok: false,
+          status: 404,
+          headers: { get: () => 'application/json' },
+          text: async () => '{}',
+          json: async () => ({})
+        };
+      }
+    });
+
+    // 1. resolvePathByAssetUuid must ignore jcr:content/cq:discarded hits
+    const resolved = await realAem.resolvePathByAssetUuid('uuid-20261111_test-campaign_gotkey.jpg');
+    assert.equal(resolved, null, 'must never resolve a UUID to an AEM Trash cq:discarded path');
+
+    // 2. resyncAllAssetsMetadata cleans both the leaf ghost folder and the empty intermediate folder1 ancestor, and prunes the asset
+    const svc = await createFaceService({
+      storage: h.storage,
+      rekognitionClient: h.rekognitionClient,
+      aemClient: realAem
+    });
+    const resync = await svc.resyncAllAssetsMetadata({ onlyIfChanged: false });
+    assert.equal(resync.prunedAssetCount, 1);
+    assert.equal(resync.ghostFoldersCleanedCount, 1);
+    assert.ok(
+      deletedCalls.some((u) => u.endsWith('/upload-test/folder1/20261111_test-campaign_gotkey.jpg')),
+      'leaf ghost folder must be deleted'
+    );
+    assert.ok(
+      deletedCalls.some((u) => u.endsWith('/upload-test/folder1')),
+      'empty intermediate SlingPostServlet ghost folder without jcr:content must be deleted'
+    );
+    assert.equal(
+      deletedCalls.some((u) => u.endsWith('/upload-test')),
+      false,
+      'real parent DAM folder with jcr:content must never be deleted'
+    );
+  } finally {
+    h.cleanup();
+  }
+});

@@ -15,10 +15,12 @@ const {
   PublicError,
   assertDamPath,
   isValidDamPath,
+  isDiscardedOrSystemDamPath,
   isValidMetadataProperty
 } = require('./security');
 const { withRetry, isNetworkError, RETRYABLE_HTTP_STATUSES } = require('./retry');
 
+const IMAGE_FILE_NAME_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic|heif|psd)$/i;
 // AWS Rekognition accepts at most 5 MB of image bytes, so anything larger is useless and
 // only risks exhausting action memory.
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -450,22 +452,30 @@ function createAemClient({
     /**
      * Resolves an AEM `urn:aaid:aem:<uuid>` or raw `jcr:uuid` to its `/content/dam/...` path
      * via AEM QueryBuilder.
+     *
+     * Explicitly ignores soft-deleted assets sitting in AEM Trash (`.../jcr:content/cq:discarded/...`)
+     * or JCR system subnodes (`jcr:content`, `_jcr_content`, `rep:policy`, etc.).
      */
     async resolvePathByAssetUuid(assetId) {
       if (!assetId || !baseUrl || !fetchImpl) return null;
       const rawUuid = String(assetId).replace(/^urn:aaid:aem:/i, '').trim();
       if (!rawUuid) return null;
-      if (rawUuid.startsWith('/')) return isValidDamPath(rawUuid) ? rawUuid : null;
+      if (rawUuid.startsWith('/')) {
+        return isValidDamPath(rawUuid) && !isDiscardedOrSystemDamPath(rawUuid) ? rawUuid : null;
+      }
       if (!/^[A-Za-z0-9-]{8,64}$/.test(rawUuid)) return null;
 
       try {
         const qbUrl = `${baseUrl}/bin/querybuilder.json?property=jcr:uuid&property.value=${encodeURIComponent(
           rawUuid
-        )}&p.limit=1`;
+        )}&p.limit=5`;
         const data = await fetchAemJson(qbUrl);
-        const hitPath = data.hits?.[0]?.path;
-        if (hitPath && isValidDamPath(hitPath)) {
-          return hitPath;
+        const hits = Array.isArray(data.hits) ? data.hits : [];
+        for (const hit of hits) {
+          const hitPath = hit?.path;
+          if (hitPath && isValidDamPath(hitPath) && !isDiscardedOrSystemDamPath(hitPath)) {
+            return hitPath;
+          }
         }
       } catch (e) {
         // ignore if QueryBuilder is unavailable
@@ -599,6 +609,7 @@ function createAemClient({
 
       const folders = [];
       const assets = [];
+      const ghostCandidates = [];
       const seenPaths = new Set();
       let folderTitle = null;
       let offset = 0;
@@ -626,6 +637,11 @@ function createAemClient({
         newInPage++;
 
         if (classes.includes('assets/folder')) {
+          if (IMAGE_FILE_NAME_RE.test(name)) {
+            // Skip and schedule cleanup for ghost sling:Folder nodes named after deleted image files
+            ghostCandidates.push(fullPath);
+            continue;
+          }
           folders.push({
             name,
             title: Array.isArray(title) ? title[0] : title,
@@ -664,6 +680,14 @@ function createAemClient({
         // Stop once we see a short page (with no 'next' link) or a server that ignores offset
         if (newInPage === 0 || (entities.length < FOLDER_PAGE_SIZE && !hasNextLink)) break;
         offset += entities.length;
+      }
+
+      if (ghostCandidates.length > 0) {
+        await Promise.all(
+          ghostCandidates.map((ghostPath) =>
+            this.verifyAssetExistsBeforeWrite(ghostPath, { cleanGhostFolder: true }).catch(() => {})
+          )
+        );
       }
 
       return {
@@ -835,9 +859,208 @@ function createAemClient({
     },
 
     /**
+     * Verifies that `assetPath` still exists in AEM JCR as a genuine `dam:Asset` before any
+     * Sling POST metadata writeback.
+     *
+     * Prevents `SlingPostServlet` from auto-creating missing ancestor nodes as ghost
+     * `sling:Folder` nodes when an indexed asset has been deleted or moved in AEM DAM.
+     * Also detects AEM Trash / soft-deleted paths (`.../jcr:content/cq:discarded/...`) and
+     * safely deletes any ghost `sling:Folder` created at the original path.
+     */
+    async verifyAssetExistsBeforeWrite(assetPath, { cleanGhostFolder = true } = {}) {
+      const cleanPath = assertDamPath(assetPath, 'asset path');
+      if (isDiscardedOrSystemDamPath(cleanPath)) {
+        let isGhostFolder = false;
+        let ghostFolderDeleted = false;
+        if (cleanGhostFolder && baseUrl && fetchImpl) {
+          const discardedMatch = cleanPath.match(
+            /^(\/content\/dam\/.+?)\/jcr:content\/cq:discarded\/[^/]+\/(.+)$/
+          );
+          if (discardedMatch) {
+            const candidatePaths = new Set();
+            const restoredPath = `${discardedMatch[1]}/${discardedMatch[2]}`;
+            if (!isDiscardedOrSystemDamPath(restoredPath)) {
+              candidatePaths.add(restoredPath);
+              const withoutCollisionSuffix = restoredPath.replace(/_\d{3}(\.[A-Za-z0-9]+)$/, '$1');
+              if (withoutCollisionSuffix !== restoredPath) {
+                candidatePaths.add(withoutCollisionSuffix);
+              }
+            }
+            for (const cand of candidatePaths) {
+              try {
+                // eslint-disable-next-line no-await-in-loop
+                const origCheck = await this.verifyAssetExistsBeforeWrite(cand, {
+                  cleanGhostFolder: true
+                });
+                if (origCheck.isGhostFolder) isGhostFolder = true;
+                if (origCheck.ghostFolderDeleted) ghostFolderDeleted = true;
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+        return {
+          exists: false,
+          isDiscarded: true,
+          isGhostFolder,
+          ghostFolderDeleted
+        };
+      }
+      if (!baseUrl || !fetchImpl) {
+        return { exists: true, isGhostFolder: false, offline: true };
+      }
+
+      const encodedPath = encodeDamPath(cleanPath);
+      const inspectUrl = `${baseUrl}${encodedPath}.2.json`;
+      const res = await fetchAemWithFallback(inspectUrl);
+
+      if (res.status === 404) {
+        return { exists: false, isGhostFolder: false, ghostFolderDeleted: false, status: 404 };
+      }
+      if (!res.ok) {
+        throw new Error(
+          `AEM asset existence check failed (HTTP ${res.status}) for ${cleanPath}`
+        );
+      }
+
+      let node = null;
+      try {
+        const text =
+          typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+        if (isHtmlPayload(text)) {
+          throw new Error(
+            `AEM returned an HTML login page instead of JSON for ${inspectUrl}.`
+          );
+        }
+        node = text ? JSON.parse(text) : {};
+      } catch (err) {
+        if (String(err.message || '').includes('HTML login page')) throw err;
+        return { exists: true, isGhostFolder: false };
+      }
+
+      const primaryType = node && node['jcr:primaryType'];
+      // Unit test mocks that return `{}` without `jcr:primaryType` are treated as existing
+      if (!primaryType || primaryType === 'dam:Asset') {
+        return { exists: true, isGhostFolder: false, primaryType: primaryType || 'dam:Asset' };
+      }
+
+      // Check whether this non-`dam:Asset` node is a ghost `sling:Folder` created by a prior
+      // Sling POST to `<deletedAsset>/jcr:content/metadata`:
+      // - Primary type is `sling:Folder` or `nt:unstructured`
+      // - Has no child folders or assets (only system properties and `jcr:content`)
+      const isFolderType = primaryType === 'sling:Folder' || primaryType === 'nt:unstructured';
+      const onlyJcrContentChild = Object.entries(node || {}).every(
+        ([k, v]) =>
+          k === 'jcr:content' ||
+          k.startsWith('jcr:') ||
+          k.startsWith('rep:') ||
+          k.startsWith('sling:') ||
+          typeof v !== 'object' ||
+          v === null
+      );
+      const jcrContentType = node?.['jcr:content']?.['jcr:primaryType'];
+      const hasGhostJcrContent =
+        !jcrContentType ||
+        jcrContentType === 'sling:Folder' ||
+        jcrContentType === 'nt:unstructured';
+      const isGhostFolder = Boolean(
+        isFolderType &&
+          onlyJcrContentChild &&
+          hasGhostJcrContent &&
+          (IMAGE_FILE_NAME_RE.test(cleanPath) ||
+            node?.['jcr:content']?.metadata?.['xdm:faceCount'] !== undefined ||
+            node?.['jcr:content']?.metadata?.['xdm:faceGroupIds'] !== undefined)
+      );
+
+      let ghostFolderDeleted = false;
+      if (isGhostFolder && cleanGhostFolder) {
+        ghostFolderDeleted = await this.deleteGhostFolder(cleanPath);
+      }
+
+      return {
+        exists: false,
+        isGhostFolder,
+        ghostFolderDeleted,
+        primaryType
+      };
+    },
+
+    /**
+     * Deletes a verified ghost `sling:Folder` node from AEM JCR, and also cleans up any empty
+     * intermediate `SlingPostServlet`-created ancestor `sling:Folder` nodes (nodes with
+     * `jcr:primaryType === 'sling:Folder'`, no `jcr:content`, and zero child nodes).
+     */
+    async deleteGhostFolder(assetPath) {
+      const cleanPath = assertDamPath(assetPath, 'asset path');
+      if (!baseUrl || !fetchImpl) return false;
+      const deleteJcrNode = async (pathToDelete) => {
+        const targetUrl = `${baseUrl}${encodeDamPath(pathToDelete)}`;
+        const delForm = new URLSearchParams({ ':operation': 'delete' });
+        const postRes = await fetchAemWithFallback(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: delForm.toString()
+        });
+        if (postRes.ok || postRes.status === 404) return true;
+        const delRes = await fetchAemWithFallback(targetUrl, { method: 'DELETE' });
+        return delRes.ok || delRes.status === 404;
+      };
+
+      try {
+        const deleted = await deleteJcrNode(cleanPath);
+        if (!deleted) return false;
+
+        // Walk up ancestor directories (stopping before `/content/dam/<topLevel>`) to clean any
+        // empty intermediate `sling:Folder` ancestors auto-created by SlingPostServlet without `jcr:content`
+        let parentPath = cleanPath.slice(0, cleanPath.lastIndexOf('/'));
+        while (parentPath && parentPath.split('/').filter(Boolean).length >= 4) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            const parentRes = await fetchAemWithFallback(`${baseUrl}${encodeDamPath(parentPath)}.1.json`);
+            if (!parentRes.ok) break;
+            // eslint-disable-next-line no-await-in-loop
+            const text =
+              typeof parentRes.text === 'function'
+                ? await parentRes.text()
+                : JSON.stringify(await parentRes.json());
+            if (!text || isHtmlPayload(text)) break;
+            const parentNode = JSON.parse(text);
+            const pType = parentNode?.['jcr:primaryType'];
+            const hasJcrContent = Boolean(parentNode && parentNode['jcr:content']);
+            const hasAnyChildNodes = Object.entries(parentNode || {}).some(
+              ([k, v]) =>
+                !k.startsWith('jcr:') &&
+                !k.startsWith('rep:') &&
+                !k.startsWith('sling:') &&
+                typeof v === 'object' &&
+                v !== null
+            );
+            if (pType === 'sling:Folder' && !hasJcrContent && !hasAnyChildNodes) {
+              // eslint-disable-next-line no-await-in-loop
+              await deleteJcrNode(parentPath);
+              parentPath = parentPath.slice(0, parentPath.lastIndexOf('/'));
+            } else {
+              break;
+            }
+          } catch (e) {
+            break;
+          }
+        }
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    /**
      * Writes multi-value face metadata (`xdm:faceNames`, optional secondary property such as
-     * `iptc4xmpExt:PersonInImage`, `xdm:faceGroupIds`, `xdm:faceCount`) back to
+     * `iptc4xmpExt:PersonInImage`, `xdm:faceLabels`, `xdm:faceGroupIds`, `xdm:faceCount`) back to
      * `jcr:content/metadata` on the AEM Asset.
+     *
+     * When `verifyExists: true` is passed, verifies that the target node still exists in AEM as
+     * a `dam:Asset` before issuing the Sling POST, preventing `SlingPostServlet` from creating
+     * ghost `sling:Folder` nodes for deleted assets.
      */
     async updateAssetFaceMetadata(
       assetPath,
@@ -847,7 +1070,8 @@ function createAemClient({
         faceGroupIds = [],
         faceCount = 0,
         metadataProperty = 'xdm:faceNames',
-        secondaryMetadataProperty = null
+        secondaryMetadataProperty = null,
+        verifyExists = false
       }
     ) {
       const cleanPath = assertDamPath(assetPath, 'asset path');
@@ -877,6 +1101,23 @@ function createAemClient({
           assetPath: cleanPath,
           metadata: metadataOut
         };
+      }
+
+      if (verifyExists || isDiscardedOrSystemDamPath(cleanPath)) {
+        const existence = await this.verifyAssetExistsBeforeWrite(cleanPath, {
+          cleanGhostFolder: true
+        });
+        if (!existence.exists) {
+          return {
+            updated: false,
+            assetDeleted: true,
+            isDiscarded: Boolean(existence.isDiscarded),
+            isGhostFolder: Boolean(existence.isGhostFolder),
+            ghostFolderDeleted: Boolean(existence.ghostFolderDeleted),
+            assetPath: cleanPath,
+            metadata: metadataOut
+          };
+        }
       }
 
       const formData = new URLSearchParams();

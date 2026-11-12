@@ -252,10 +252,15 @@ async function main(params = {}) {
       }
 
       case 'resyncAllAssets': {
+        const onlyIfChanged =
+          params.onlyIfChanged === undefined
+            ? true
+            : params.onlyIfChanged !== false && String(params.onlyIfChanged) !== 'false';
         const result = await faceService.resyncAllAssetsMetadata({
           offset: params.offset,
           limit: params.limit,
-          timeBudgetMs: params.timeBudgetMs
+          timeBudgetMs: params.timeBudgetMs,
+          onlyIfChanged
         });
         return { statusCode: 200, headers: corsHeaders, body: result };
       }

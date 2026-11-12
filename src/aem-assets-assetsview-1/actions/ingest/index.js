@@ -45,11 +45,20 @@ function extractAssetFromIoEvent(params) {
     repoMeta['repo:etag'] ||
     null;
 
+  const eventType = String(
+    params.type || event.type || event['@type'] || obj['@type'] || ''
+  ).toLowerCase();
+  const isDeleteEvent =
+    eventType.includes('deleted') ||
+    eventType.includes('delete') ||
+    String(params.operation || '').toLowerCase() === 'pruneasset';
+
   return {
     assetPath,
     assetId,
     mimeType: format ? String(format) : null,
-    eventId: eventId ? String(eventId) : null
+    eventId: eventId ? String(eventId) : null,
+    isDeleteEvent
   };
 }
 
@@ -127,7 +136,15 @@ async function main(params = {}) {
       return { statusCode: 200, headers: corsHeaders, body: result };
     }
 
-    const { assetPath, assetId, mimeType, eventId } = extractAssetFromIoEvent(params);
+    const { assetPath, assetId, mimeType, eventId, isDeleteEvent } = extractAssetFromIoEvent(params);
+    if (isDeleteEvent && (assetPath || assetId)) {
+      const pruned = await faceService.pruneDeletedAsset({ assetPath, assetId });
+      return {
+        statusCode: 200,
+        headers: corsHeaders,
+        body: pruned
+      };
+    }
     if (!assetPath) {
       return {
         statusCode: 400,

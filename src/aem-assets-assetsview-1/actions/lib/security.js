@@ -104,6 +104,18 @@ function assertDamPath(inputPath, label = 'path') {
   return clean;
 }
 
+const SYSTEM_DAM_SEGMENT_RE = /^(?:_jcr_content|(?:jcr|cq|rep|oak|sling):)/i;
+
+/**
+ * True if a DAM path points inside an AEM Trash / soft-delete subtree (`.../jcr:content/cq:discarded/...`)
+ * or a JCR system node (`jcr:content`, `_jcr_content`, `rep:policy`, etc.) rather than a live DAM asset/folder.
+ */
+function isDiscardedOrSystemDamPath(inputPath) {
+  if (!inputPath || typeof inputPath !== 'string') return false;
+  const segments = inputPath.split('/').filter(Boolean);
+  return segments.some((seg) => SYSTEM_DAM_SEGMENT_RE.test(seg));
+}
+
 function isValidDamPath(inputPath) {
   try {
     assertDamPath(inputPath);
@@ -262,6 +274,7 @@ module.exports = {
   resolveAemHost,
   assertDamPath,
   isValidDamPath,
+  isDiscardedOrSystemDamPath,
   isValidMetadataProperty,
   requireEncryptionSecret,
   isTruthyFlag,
