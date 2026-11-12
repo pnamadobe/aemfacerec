@@ -20,7 +20,7 @@ Every image scanned by the Face Recognition App Builder extension has its face-d
 | `xdm:faceLabels` | `String[]` | **Ordered left-to-right (`#1 leftmost` → `#N rightmost`)**. Always contains the display label for every detected person — **both named people (`"John Johnson"`, `"Jill Jelly"`) AND unnamed placeholders (`"Person #38"`, `"Person #70"`)**. |
 | `xdm:faceGroupIds` | `String[]` | **Ordered left-to-right** in 1-to-1 correspondence with `xdm:faceLabels` (e.g. `["grp_2a9b64a3", "grp_cc233d4a"]`). Uniquely identifies each person across the entire DAM even before they are given a real name. |
 | `xdm:faceNames` | `String[]` | Named people on the asset (omits `Person #N` placeholders when *Hide unnamed placeholders* is enabled in Settings). |
-| `xdm:persona` | `String[]` | Dual-written copy of `xdm:faceNames` (pre-indexed in AEM Assets View's Search Filter rail). |
+| `xdm:persona` | `String[]` | **Search-indexed (`searchIndexed: true`)** dual-written copy of `xdm:faceNames`. Supports direct exact-term index queries via `termFilters: [{ key: "assetMetadata.xdm:persona", value: "<Person Name>" }]` in `search-assets`! |
 
 > **Practitioner Communication Note**: Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right, and refer to assets by their filename/title. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
 
@@ -122,7 +122,9 @@ When the user is on an **Asset Detail** page (or names a specific image) and ask
 - *"What other assets have the same people as the current image?"*
 - *"Where else do the people in this photo appear?"*
 
-Run this single **`read-api`** call. It looks up the source image's `xdm:faceGroupIds` and `xdm:faceLabels` (ordered left-to-right), then searches across `/content/dam` for every other asset sharing one or more of those `xdm:faceGroupIds` — **working for both named people (`Freddie Father`, `Jill Jelly`) AND unnamed placeholders (`Person #38`)**:
+Run this **`read-api`** call:
+1. For **named people** on the source asset (`xdm:persona`), it queries AEM's indexed **`assetMetadata.xdm:persona`** field directly via `termFilters: [{ key: "assetMetadata.xdm:persona", value: personName }]` (instant index lookup!).
+2. If the source asset also contains **unnamed placeholders (`Person #N`)**, it matches their `xdm:faceGroupIds` across the DAM so unnamed people are also matched across photos:
 
 ```javascript
 // Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
@@ -143,56 +145,70 @@ if (!srcAsset) return { error: `Asset ${SOURCE_NAME} not found in ${SOURCE_FOLDE
 
 const srcMeta = srcAsset.assetMetadata || {};
 const srcPath = srcAsset.repositoryMetadata['repo:path'];
-const srcLabels = toArray(srcMeta['xdm:faceLabels'] || srcMeta['xdm:faceNames']);
+const srcLabels = toArray(srcMeta['xdm:faceLabels'] || srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
+const srcPersonas = toArray(srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
 const srcGroupIds = toArray(srcMeta['xdm:faceGroupIds']);
 
-// Map groupId -> display label from source asset
-const labelByGroupId = {};
-srcGroupIds.forEach((gId, i) => {
-  labelByGroupId[gId] = srcLabels[i] || gId;
-});
-const targetGroupSet = new Set(srcGroupIds);
-
-// 2. Scan indexed DAM assets to find all other assets sharing any of these people
-const allDamAssets = [];
-let cursor = null, pages = 0;
-do {
-  const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
-    termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
-    limit: 100,
-    cursor
-  });
-  allDamAssets.push(...(r.body.results || []));
-  cursor = r.body.cursor;
-  pages++;
-} while (cursor && pages < 25);
-
-const relatedAssets = [];
-for (const a of allDamAssets) {
-  const path = a.repositoryMetadata?.['repo:path'];
-  if (!path || path === srcPath) continue;
-  const meta = a.assetMetadata || {};
-  const gIds = toArray(meta['xdm:faceGroupIds']);
-  const labels = toArray(meta['xdm:faceLabels'] || meta['xdm:faceNames']);
-  const sharedPeople = [];
-  gIds.forEach((gId, idx) => {
-    if (targetGroupSet.has(gId)) {
-      sharedPeople.push(labels[idx] || labelByGroupId[gId] || gId);
-    }
-  });
-  if (sharedPeople.length > 0) {
-    relatedAssets.push({
-      name: a.repositoryMetadata['repo:name'],
-      path,
-      sharedPeopleCount: sharedPeople.length,
-      sharedPeople,
-      allFacesLeftToRight: labels,
-      totalFacesOnAsset: Number(meta['xdm:faceCount'] || labels.length)
-    });
-  }
+const byPath = new Map();
+function recordHit(asset, sharedPersonLabel) {
+  const path = asset.repositoryMetadata?.['repo:path'];
+  if (!path || path === srcPath) return;
+  const meta = asset.assetMetadata || {};
+  const labels = toArray(meta['xdm:faceLabels'] || meta['xdm:persona'] || meta['xdm:faceNames']);
+  const entry = byPath.get(path) || {
+    name: asset.repositoryMetadata['repo:name'],
+    path,
+    sharedPeopleSet: new Set(),
+    allFacesLeftToRight: labels,
+    totalFacesOnAsset: Number(meta['xdm:faceCount'] || labels.length)
+  };
+  entry.sharedPeopleSet.add(sharedPersonLabel);
+  byPath.set(path, entry);
 }
 
-relatedAssets.sort((a, b) => b.sharedPeopleCount - a.sharedPeopleCount || a.path.localeCompare(b.path));
+// 2A. Fast indexed lookup via `assetMetadata.xdm:persona` for every named person on the source asset
+await Promise.all(
+  srcPersonas.map(async (personName) => {
+    const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+      termFilters: [{ key: "assetMetadata.xdm:persona", value: personName }],
+      limit: 100
+    });
+    for (const a of (r.body.results || [])) recordHit(a, personName);
+  })
+);
+
+// 2B. If the source asset has unnamed placeholders (`Person #N`), also match by `xdm:faceGroupIds`
+const hasUnnamedOnSource = srcLabels.some(l => l.startsWith('Person #'));
+if (hasUnnamedOnSource && srcGroupIds.length > 0) {
+  const labelByGroupId = {};
+  srcGroupIds.forEach((gId, i) => { labelByGroupId[gId] = srcLabels[i] || gId; });
+  const targetGroupSet = new Set(srcGroupIds);
+  let cursor = null, pages = 0;
+  do {
+    const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+      termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
+      limit: 100,
+      cursor
+    });
+    for (const a of (r.body.results || [])) {
+      const gIds = toArray(a.assetMetadata?.['xdm:faceGroupIds']);
+      const labels = toArray(a.assetMetadata?.['xdm:faceLabels']);
+      gIds.forEach((gId, idx) => {
+        if (targetGroupSet.has(gId)) recordHit(a, labels[idx] || labelByGroupId[gId] || gId);
+      });
+    }
+    cursor = r.body.cursor;
+    pages++;
+  } while (cursor && pages < 15);
+}
+
+const relatedAssets = Array.from(byPath.values())
+  .map(({ sharedPeopleSet, ...rest }) => ({
+    ...rest,
+    sharedPeople: Array.from(sharedPeopleSet),
+    sharedPeopleCount: sharedPeopleSet.size
+  }))
+  .sort((a, b) => b.sharedPeopleCount - a.sharedPeopleCount || a.path.localeCompare(b.path));
 
 return {
   sourceAsset: {
@@ -200,7 +216,8 @@ return {
     path: srcPath,
     scanned: srcMeta['xdm:faceCount'] !== undefined,
     faceCount: Number(srcMeta['xdm:faceCount'] || 0),
-    facesLeftToRight: srcLabels
+    facesLeftToRight: srcLabels,
+    personas: srcPersonas
   },
   totalRelatedAssets: relatedAssets.length,
   relatedAssets
@@ -209,59 +226,30 @@ return {
 
 ---
 
-## Workflow 3: Find All Assets Containing a Specific Person (or Combination of People) or Triage Unnamed Faces
+## Workflow 3: Find All Assets Containing Named People (Fast Indexed Search via `assetMetadata.xdm:persona`)
 
-When the user asks *"Find all photos with Jill Jelly"*, *"Which photos have both Freddie Father and Belinda Baker?"*, or *"Which unnamed people appear in the most photos?"*:
+Because `jcr:content/metadata/xdm:persona` is indexed out-of-the-box in AEM's Searchable Property Index (`assetMetadata.xdm:persona`, `searchIndexed: true`), always use `termFilters` on `assetMetadata.xdm:persona` when searching for named people:
 
 ```javascript
 // Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
-const SEARCH_PEOPLE = ["Jill Jelly"]; // or leave empty [] to rank all people across the DAM
-const REQUIRE_ALL = false;            // true = must contain ALL listed people together
+// Pass 1 person name, or multiple termFilters if the asset must contain ALL of those people together:
+const PERSON_NAMES = ["Jill Jelly"];
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
-const allDamAssets = [];
-let cursor = null, pages = 0;
-do {
-  const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
-    termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
-    limit: 100,
-    cursor
-  });
-  allDamAssets.push(...(r.body.results || []));
-  cursor = r.body.cursor;
-  pages++;
-} while (cursor && pages < 25);
+const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+  termFilters: PERSON_NAMES.map(name => ({ key: "assetMetadata.xdm:persona", value: name })),
+  limit: 100
+});
 
-const roster = {};
-const matchingAssets = [];
+const assets = (r.body.results || []).map(a => ({
+  name: a.repositoryMetadata['repo:name'],
+  path: a.repositoryMetadata['repo:path'],
+  personas: toArray(a.assetMetadata?.['xdm:persona']),
+  facesLeftToRight: toArray(a.assetMetadata?.['xdm:faceLabels'] || a.assetMetadata?.['xdm:persona']),
+  faceCount: Number(a.assetMetadata?.['xdm:faceCount'] || 0)
+}));
 
-for (const a of allDamAssets) {
-  const meta = a.assetMetadata || {};
-  if (meta['xdm:faceCount'] === undefined) continue;
-  const labels = toArray(meta['xdm:faceLabels'] || meta['xdm:faceNames']);
-  const name = a.repositoryMetadata?.['repo:name'];
-  const path = a.repositoryMetadata?.['repo:path'];
-
-  for (const label of labels) {
-    if (!roster[label]) roster[label] = { person: label, isNamed: !label.startsWith('Person #'), count: 0, sampleAssets: [] };
-    roster[label].count++;
-    if (roster[label].sampleAssets.length < 5) roster[label].sampleAssets.push(path);
-  }
-
-  if (SEARCH_PEOPLE.length > 0) {
-    const matched = SEARCH_PEOPLE.filter(q =>
-      labels.some(l => l.toLowerCase().includes(q.toLowerCase()))
-    );
-    if ((REQUIRE_ALL && matched.length === SEARCH_PEOPLE.length) || (!REQUIRE_ALL && matched.length > 0)) {
-      matchingAssets.push({ name, path, matchedPeople: matched, facesLeftToRight: labels });
-    }
-  }
-}
-
-return {
-  matchingAssets,
-  topPeople: Object.values(roster).sort((a, b) => b.count - a.count).slice(0, 30)
-};
+return { count: assets.length, assets };
 ```
 
 ---
