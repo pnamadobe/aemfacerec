@@ -5,12 +5,12 @@ description: Inspect, list, search, and manage recognized faces and people acros
 
 # AEM Assets Facial Recognition & Grouping (`aem-face-recognition`)
 
-Works with the **AEM Assets View Facial Recognition & Grouping App Builder Extension** (`aem/assets/assetsview/1`, bound to `https://author-p59602-e520244.adobeaemcloud.com`).
+Works with the **AEM Assets View Facial Recognition & Grouping App Builder Extension** (`aem/assets/assetsview/1`) on any AEM as a Cloud Service environment where the extension is active.
 
 ## Critical: How This Skill Runs in the AEM Coworker Sidebar
 
 **Do NOT shell out to `node` or look for local `.env` files when running inside the AEM Coworker cloud sandbox.**
-Instead, use **`Adobe Experience Manager: read-api`** (`aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', ...)`).
+Instead, use **`Adobe Experience Manager: read-api`** (`aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', ...)`) against the user's current `aemUrl` (discoverable via `list-aem-environments` or the `repoId` in the user's current AEM Assets View URL).
 
 Every image scanned by the Face Recognition App Builder extension has its face-detection results synced directly onto `assetMetadata` (`jcr:content/metadata`) in AEM Author:
 
@@ -24,18 +24,19 @@ Every image scanned by the Face Recognition App Builder extension has its face-d
 
 > **Practitioner Communication & Deep-Link Rule**:
 > - Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
-> - **Always render every asset filename as a clickable Markdown link `[asset.name](asset.detailUrl)`** pointing to its AEM Assets View detail page (`https://experience.adobe.com/?repoId=<repoId>#/@<tenant>/assets/detail/767251-759moccasingayal_face-recognition-panel/content/dam/...` with spaces, `(`, and `)` encoded as `%20`, `%28`, `%29` so Markdown link syntax never breaks). Clicking the link opens that asset directly in AEM Assets View with the **Recognized Faces** side panel active.
+> - **Always render every asset filename as a clickable Markdown link `[asset.name](asset.detailUrl)`** pointing to its AEM Assets View detail page:
+>   - Extract `repoId` dynamically from `a.repositoryMetadata['repo:repositoryId']` (returned on every asset by `search-assets`).
+>   - If the user's current URL/context contains `/@<tenant>/` (e.g. `#/@myorg/assets/...`), preserve `/@<tenant>` in the hash (`#/@<tenant>/assets/detail/content/dam/...`); otherwise omit it (`#/assets/detail/content/dam/...` — Experience Cloud Shell automatically resolves the signed-in user's tenant).
+>   - Encode spaces, `(`, and `)` in the DAM path as `%20`, `%28`, `%29` so Markdown link syntax never breaks.
 
 ---
 
 ## Workflow 0: Verify the Face Recognition Extension Is Active on the AEM Instance
 
-Before running a query (or if the user asks whether face recognition is available on the current AEM environment), check:
-1. This extension deployment is bound to **`https://author-p59602-e520244.adobeaemcloud.com`**.
-2. You can verify face recognition metadata is active on any `aemUrl` with a single `read-api` call:
+Before running a query (or if the user asks whether face recognition is available on the current AEM environment), verify whether assets in this AEM environment have face recognition metadata (`xdm:faceCount` / `xdm:faceGroupIds`) with a single `read-api` call:
 
 ```javascript
-// Run in read-api with aemUrl
+// Run in read-api with the target aemUrl
 const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
   termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
   limit: 50
@@ -48,24 +49,31 @@ return {
   scannedAssetsInSample: scannedSample.length
 };
 ```
-If `extensionActive` is `false` (and the host is not `author-p59602-e520244.adobeaemcloud.com`), let the user know that the Face Recognition extension is not active on that AEM environment.
+If `extensionActive` is `false`, let the user know that no Face Recognition metadata was found on this AEM instance (either the extension is not installed on this environment or no folders have been scanned yet).
 
 ---
 
 ## Workflow 1: List the Faces in Each Asset in a Folder ("list the faces in each of the assets here")
 
-When the user is on a DAM folder (e.g. `/content/dam/26H2/hertz/hertz-2026-fall shoot`) and asks to **list the faces in each asset**, **see who is in the folder**, or **inspect the folder**:
+When the user is on a DAM folder and asks to **list the faces in each asset**, **see who is in the folder**, or **inspect the folder**:
 - **Never re-scan already-scanned assets.**
-- Run this single **`read-api`** call to get every asset in the folder, its left-to-right face list (`xdm:faceLabels`), and a summary of recurring people across the folder:
+- Run this single **`read-api`** call to get every asset in the folder, its left-to-right face list (`xdm:faceLabels`), a clickable `detailUrl` derived dynamically from `repo:repositoryId`, and a summary of recurring people across the folder:
 
 ```javascript
-// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
-const FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // replace with target folder path
-const TENANT = "peternam"; // replace if user's URL has a different /@<tenant>/
-const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+// Run in read-api with the user's active aemUrl
+const FOLDER = "/content/dam/..."; // set to the user's current DAM folder path
+const PAGE_URL = "";               // optional: pass the user's current browser URL if known (to preserve /@<tenant>/)
+const tenantMatch = String(PAGE_URL).match(/\/@([a-zA-Z0-9_-]+)\//);
+const tenantPrefix = tenantMatch ? `/@${tenantMatch[1]}` : "";
+
 const buildDetailUrl = (repoId, damPath) => {
-  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
-  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+  const safePath = String(damPath || "")
+    .split("/")
+    .map(s => encodeURIComponent(s).replace(/\(/g, "%28").replace(/\)/g, "%29"))
+    .join("/");
+  return repoId
+    ? `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#${tenantPrefix}/assets/detail${safePath}`
+    : safePath;
 };
 
 const allAssets = [];
@@ -95,7 +103,7 @@ const assets = allAssets
       peopleCounts[label] = (peopleCounts[label] || 0) + 1;
     }
     const path = repoMeta['repo:path'];
-    const repoId = repoMeta['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
+    const repoId = repoMeta['repo:repositoryId'] || '';
     return {
       name: repoMeta['repo:name'],
       path,
@@ -140,14 +148,21 @@ Run this **`read-api`** call:
 2. If the source asset also contains **unnamed placeholders (`Person #N`)**, it matches their `xdm:faceGroupIds` across the DAM so unnamed people are also matched across photos:
 
 ```javascript
-// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
-const SOURCE_FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // parent folder of current asset
-const SOURCE_NAME = "hertz_elderly-couple_resort_luxury-sedan_v1.png";   // filename of current asset
-const TENANT = "peternam";
-const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+// Run in read-api with the user's active aemUrl
+const SOURCE_FOLDER = "/content/dam/..."; // parent folder of current asset
+const SOURCE_NAME = "example.png";        // filename of current asset
+const PAGE_URL = "";                      // optional: user's current browser URL if known (to preserve /@<tenant>/)
+const tenantMatch = String(PAGE_URL).match(/\/@([a-zA-Z0-9_-]+)\//);
+const tenantPrefix = tenantMatch ? `/@${tenantMatch[1]}` : "";
+
 const buildDetailUrl = (repoId, damPath) => {
-  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
-  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+  const safePath = String(damPath || "")
+    .split("/")
+    .map(s => encodeURIComponent(s).replace(/\(/g, "%28").replace(/\)/g, "%29"))
+    .join("/");
+  return repoId
+    ? `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#${tenantPrefix}/assets/detail${safePath}`
+    : safePath;
 };
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
@@ -165,7 +180,7 @@ if (!srcAsset) return { error: `Asset ${SOURCE_NAME} not found in ${SOURCE_FOLDE
 const srcMeta = srcAsset.assetMetadata || {};
 const srcRepoMeta = srcAsset.repositoryMetadata || {};
 const srcPath = srcRepoMeta['repo:path'];
-const repoId = srcRepoMeta['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
+const repoId = srcRepoMeta['repo:repositoryId'] || '';
 const srcLabels = toArray(srcMeta['xdm:faceLabels'] || srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
 const srcPersonas = toArray(srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
 const srcGroupIds = toArray(srcMeta['xdm:faceGroupIds']);
@@ -254,14 +269,21 @@ return {
 Because `jcr:content/metadata/xdm:persona` is indexed out-of-the-box in AEM's Searchable Property Index (`assetMetadata.xdm:persona`, `searchIndexed: true`), always use `termFilters` on `assetMetadata.xdm:persona` when searching for named people:
 
 ```javascript
-// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
+// Run in read-api with the user's active aemUrl
 // Pass 1 person name, or multiple termFilters if the asset must contain ALL of those people together:
 const PERSON_NAMES = ["Jill Jelly"];
-const TENANT = "peternam";
-const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+const PAGE_URL = ""; // optional: user's current browser URL if known (to preserve /@<tenant>/)
+const tenantMatch = String(PAGE_URL).match(/\/@([a-zA-Z0-9_-]+)\//);
+const tenantPrefix = tenantMatch ? `/@${tenantMatch[1]}` : "";
+
 const buildDetailUrl = (repoId, damPath) => {
-  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
-  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+  const safePath = String(damPath || "")
+    .split("/")
+    .map(s => encodeURIComponent(s).replace(/\(/g, "%28").replace(/\)/g, "%29"))
+    .join("/");
+  return repoId
+    ? `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#${tenantPrefix}/assets/detail${safePath}`
+    : safePath;
 };
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
@@ -272,7 +294,7 @@ const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/sear
 
 const assets = (r.body.results || []).map(a => {
   const path = a.repositoryMetadata['repo:path'];
-  const repoId = a.repositoryMetadata['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
+  const repoId = a.repositoryMetadata['repo:repositoryId'] || '';
   return {
     name: a.repositoryMetadata['repo:name'],
     path,
