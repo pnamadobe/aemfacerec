@@ -22,7 +22,9 @@ Every image scanned by the Face Recognition App Builder extension has its face-d
 | `xdm:faceNames` | `String[]` | Named people on the asset (omits `Person #N` placeholders when *Hide unnamed placeholders* is enabled in Settings). |
 | `xdm:persona` | `String[]` | **Search-indexed (`searchIndexed: true`)** dual-written copy of `xdm:faceNames`. Supports direct exact-term index queries via `termFilters: [{ key: "assetMetadata.xdm:persona", value: "<Person Name>" }]` in `search-assets`! |
 
-> **Practitioner Communication Note**: Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right, and refer to assets by their filename/title. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
+> **Practitioner Communication & Deep-Link Rule**:
+> - Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
+> - **Always render every asset filename as a clickable Markdown link `[asset.name](asset.detailUrl)`** pointing to its AEM Assets View detail page (`https://experience.adobe.com/?repoId=<repoId>#/@<tenant>/assets/detail/767251-759moccasingayal_face-recognition-panel/content/dam/...` with spaces, `(`, and `)` encoded as `%20`, `%28`, `%29` so Markdown link syntax never breaks). Clicking the link opens that asset directly in AEM Assets View with the **Recognized Faces** side panel active.
 
 ---
 
@@ -59,6 +61,13 @@ When the user is on a DAM folder (e.g. `/content/dam/26H2/hertz/hertz-2026-fall 
 ```javascript
 // Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
 const FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // replace with target folder path
+const TENANT = "peternam"; // replace if user's URL has a different /@<tenant>/
+const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+const buildDetailUrl = (repoId, damPath) => {
+  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
+  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+};
+
 const allAssets = [];
 let cursor = null;
 do {
@@ -71,22 +80,26 @@ do {
   cursor = r.body.cursor;
 } while (cursor);
 
-// Filter to direct child image assets of FOLDER (or keep all descendants if user asked recursively)
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 const peopleCounts = {};
 const assets = allAssets
   .filter(a => String(a.repositoryMetadata?.['dc:format'] || '').startsWith('image/'))
   .map(a => {
     const meta = a.assetMetadata || {};
+    const repoMeta = a.repositoryMetadata || {};
     const scanned = meta['xdm:faceCount'] !== undefined;
     const faceCount = scanned ? Number(meta['xdm:faceCount'] || 0) : null;
-    const facesLeftToRight = toArray(meta['xdm:faceLabels'].length ? meta['xdm:faceLabels'] : meta['xdm:faceNames']);
+    const rawLabels = toArray(meta['xdm:faceLabels']);
+    const facesLeftToRight = rawLabels.length ? rawLabels : toArray(meta['xdm:faceNames']);
     for (const label of facesLeftToRight) {
       peopleCounts[label] = (peopleCounts[label] || 0) + 1;
     }
+    const path = repoMeta['repo:path'];
+    const repoId = repoMeta['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
     return {
-      name: a.repositoryMetadata['repo:name'],
-      path: a.repositoryMetadata['repo:path'],
+      name: repoMeta['repo:name'],
+      path,
+      detailUrl: buildDetailUrl(repoId, path),
       scanned,
       faceCount,
       facesLeftToRight
@@ -110,7 +123,7 @@ return {
 
 Present the results clearly:
 1. **Summary**: Total images in the folder, how many have faces detected, and any recurring people across multiple photos in the folder.
-2. **Per-Asset Breakdown**: Each image filename, its face count, and the people detected (ordered **left-to-right**).
+2. **Per-Asset Breakdown**: Render each image filename as a clickable link `[asset.name](asset.detailUrl)`, its face count, and the people detected (ordered **left-to-right**).
 3. If `unscannedCount > 0`, mention which images haven't been scanned yet and let the user know they can click **Scan Current Folder** in the **Face Groups** modal (or **Recognize Faces** in the action bar) to analyze the new ones.
 
 ---
@@ -130,6 +143,12 @@ Run this **`read-api`** call:
 // Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
 const SOURCE_FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // parent folder of current asset
 const SOURCE_NAME = "hertz_elderly-couple_resort_luxury-sedan_v1.png";   // filename of current asset
+const TENANT = "peternam";
+const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+const buildDetailUrl = (repoId, damPath) => {
+  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
+  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+};
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
 // 1. Fetch the source asset
@@ -144,7 +163,9 @@ const srcAsset = (srcRes.body.results || [])[0];
 if (!srcAsset) return { error: `Asset ${SOURCE_NAME} not found in ${SOURCE_FOLDER}` };
 
 const srcMeta = srcAsset.assetMetadata || {};
-const srcPath = srcAsset.repositoryMetadata['repo:path'];
+const srcRepoMeta = srcAsset.repositoryMetadata || {};
+const srcPath = srcRepoMeta['repo:path'];
+const repoId = srcRepoMeta['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
 const srcLabels = toArray(srcMeta['xdm:faceLabels'] || srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
 const srcPersonas = toArray(srcMeta['xdm:persona'] || srcMeta['xdm:faceNames']);
 const srcGroupIds = toArray(srcMeta['xdm:faceGroupIds']);
@@ -158,6 +179,7 @@ function recordHit(asset, sharedPersonLabel) {
   const entry = byPath.get(path) || {
     name: asset.repositoryMetadata['repo:name'],
     path,
+    detailUrl: buildDetailUrl(asset.repositoryMetadata?.['repo:repositoryId'] || repoId, path),
     sharedPeopleSet: new Set(),
     allFacesLeftToRight: labels,
     totalFacesOnAsset: Number(meta['xdm:faceCount'] || labels.length)
@@ -214,6 +236,7 @@ return {
   sourceAsset: {
     name: SOURCE_NAME,
     path: srcPath,
+    detailUrl: buildDetailUrl(repoId, srcPath),
     scanned: srcMeta['xdm:faceCount'] !== undefined,
     faceCount: Number(srcMeta['xdm:faceCount'] || 0),
     facesLeftToRight: srcLabels,
@@ -234,6 +257,12 @@ Because `jcr:content/metadata/xdm:persona` is indexed out-of-the-box in AEM's Se
 // Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
 // Pass 1 person name, or multiple termFilters if the asset must contain ALL of those people together:
 const PERSON_NAMES = ["Jill Jelly"];
+const TENANT = "peternam";
+const PANEL_NS = "767251-759moccasingayal_face-recognition-panel";
+const buildDetailUrl = (repoId, damPath) => {
+  const safePath = String(damPath || '').split('/').map(s => encodeURIComponent(s).replace(/\(/g, '%28').replace(/\)/g, '%29')).join('/');
+  return `https://experience.adobe.com/?repoId=${encodeURIComponent(repoId)}#/@${TENANT}/assets/detail/${PANEL_NS}${safePath}`;
+};
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
 const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
@@ -241,13 +270,18 @@ const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/sear
   limit: 100
 });
 
-const assets = (r.body.results || []).map(a => ({
-  name: a.repositoryMetadata['repo:name'],
-  path: a.repositoryMetadata['repo:path'],
-  personas: toArray(a.assetMetadata?.['xdm:persona']),
-  facesLeftToRight: toArray(a.assetMetadata?.['xdm:faceLabels'] || a.assetMetadata?.['xdm:persona']),
-  faceCount: Number(a.assetMetadata?.['xdm:faceCount'] || 0)
-}));
+const assets = (r.body.results || []).map(a => {
+  const path = a.repositoryMetadata['repo:path'];
+  const repoId = a.repositoryMetadata['repo:repositoryId'] || 'author-p59602-e520244.adobeaemcloud.com';
+  return {
+    name: a.repositoryMetadata['repo:name'],
+    path,
+    detailUrl: buildDetailUrl(repoId, path),
+    personas: toArray(a.assetMetadata?.['xdm:persona']),
+    facesLeftToRight: toArray(a.assetMetadata?.['xdm:faceLabels'] || a.assetMetadata?.['xdm:persona']),
+    faceCount: Number(a.assetMetadata?.['xdm:faceCount'] || 0)
+  };
+});
 
 return { count: assets.length, assets };
 ```
