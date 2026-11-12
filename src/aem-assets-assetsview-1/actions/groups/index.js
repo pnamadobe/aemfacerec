@@ -20,8 +20,8 @@ const CURATOR_MUTATION_OPERATIONS = new Set([
   'resyncAllAssets'
 ]);
 
-async function resolveCallerPermissions(aemClient, settings) {
-  if (!settings.restrictCuratorActionsToAdmins) {
+async function resolveCallerPermissions(aemClient, settings, ctx = {}) {
+  if (ctx.isSkillAuth || !settings.restrictCuratorActionsToAdmins) {
     return { canManageGroups: true };
   }
   const { isCurator } = await aemClient.getAdminStatusAndProfiles({
@@ -62,7 +62,7 @@ async function main(params = {}) {
 
     if (CURATOR_MUTATION_OPERATIONS.has(operation)) {
       const settings = await storage.getSettings({ includeDecryptedSecret: false });
-      const { canManageGroups } = await resolveCallerPermissions(aemClient, settings);
+      const { canManageGroups } = await resolveCallerPermissions(aemClient, settings, ctx);
       if (!canManageGroups) {
         throw new PublicError(
           `Only AEM Administrators or members of the configured Curator Groups (${(
@@ -74,6 +74,54 @@ async function main(params = {}) {
     }
 
     switch (operation) {
+      case 'checkInstance': {
+        const normalizeHost = (h) =>
+          String(h || '')
+            .trim()
+            .toLowerCase()
+            .replace(/^https?:\/\//i, '')
+            .replace(/\/+$/, '');
+        const boundHost = normalizeHost(ctx.aemHost);
+        const targetHost = normalizeHost(params.targetAemHost || params.aemHost || '');
+        const hostMatches = !targetHost || !boundHost || targetHost === boundHost;
+        const [settings, listSummary] = await Promise.all([
+          storage.getSettings({ includeDecryptedSecret: false }),
+          faceService.listGroups({ limit: 1 })
+        ]);
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: {
+            extensionActiveOnInstance: Boolean(hostMatches && settings.hasAwsSecretKey),
+            hostMatches,
+            targetAemHost: targetHost ? `https://${targetHost}` : ctx.aemHost || null,
+            boundAemHost: ctx.aemHost || null,
+            awsConfigured: Boolean(settings.hasAwsSecretKey && settings.awsAccessKeyId),
+            awsRegion: settings.awsRegion,
+            collectionId: settings.collectionId,
+            metadataProperty: settings.metadataProperty,
+            secondaryMetadataProperty: settings.enableSecondaryMetadataProperty
+              ? settings.secondaryMetadataProperty
+              : null,
+            processingProfileName: settings.processingProfileName,
+            requireProcessingProfile: settings.requireProcessingProfile,
+            enabledFolders: settings.enabledFolders,
+            indexedStats: {
+              totalGroups: listSummary.totalGroups || 0,
+              namedGroups: listSummary.namedCount || 0,
+              unnamedGroups: listSummary.unnamedCount || 0,
+              totalFaces: listSummary.totalFaces || 0,
+              totalAssets: listSummary.totalAssets || 0
+            },
+            ...(hostMatches
+              ? {}
+              : {
+                  reason: `Target AEM host https://${targetHost} does not match the AEM instance bound to this Face Recognition extension (${ctx.aemHost}).`
+                })
+          }
+        };
+      }
+
       case 'listGroups': {
         const settingsPromise = storage.getSettings({ includeDecryptedSecret: false });
         const [result, { canManageGroups }] = await Promise.all([
@@ -84,7 +132,7 @@ async function main(params = {}) {
             query: params.query,
             settingsPromise
           }),
-          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings))
+          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings, ctx))
         ]);
         return {
           statusCode: 200,
@@ -119,7 +167,7 @@ async function main(params = {}) {
             assetName: params.assetName,
             settingsPromise
           }),
-          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings))
+          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings, ctx))
         ]);
         return {
           statusCode: 200,
@@ -137,6 +185,15 @@ async function main(params = {}) {
           personNames: params.personNames,
           matchMode: params.matchMode,
           limit: params.limit
+        });
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
+      case 'getFolderFaces': {
+        const result = await faceService.getFolderFaces({
+          folderPath: params.folderPath || '/content/dam',
+          includeSubfolders:
+            params.includeSubfolders === true || String(params.includeSubfolders) === 'true'
         });
         return { statusCode: 200, headers: corsHeaders, body: result };
       }

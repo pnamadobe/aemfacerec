@@ -91,7 +91,7 @@ async function main(params = {}) {
     const operation = params.operation || 'ingestAsset';
 
     if (operation === 'browseFolder' || operation === 'scanFolder') {
-      if (ctx.isWeb && isRuntimeEnvironment() && !ctx.token) {
+      if (ctx.isWeb && isRuntimeEnvironment() && !ctx.token && !ctx.isSkillAuth) {
         throw new PublicError('Authentication required.', 401);
       }
     }
@@ -136,7 +136,8 @@ async function main(params = {}) {
     // If invoked directly from the UI ("Scan / Re-scan Asset") with a user token, force=true
     // bypasses the folder check. Unauthenticated I/O Event webhooks are ALWAYS force=false so
     // they strictly require the Face Recognition Processing Profile on the folder.
-    const isManualTrigger = Boolean(ctx.token || !ctx.isWeb) && parseFlag(params.force, false);
+    const isManualTrigger =
+      Boolean(ctx.token || ctx.isSkillAuth || !ctx.isWeb) && parseFlag(params.force, false);
 
     // R10: I/O Event idempotency — skip duplicate/retry deliveries of the same event
     if (!isManualTrigger && eventId) {

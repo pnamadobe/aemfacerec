@@ -1,128 +1,284 @@
 ---
 name: aem-face-recognition
-description: Scan AEM DAM folders or individual image assets for faces using AWS Rekognition, find other DAM assets containing the same people as a given image (co-appearance search across named and unnamed people), search assets by person name, name people in a photo from left-to-right, rename/combine/split/delete face groups, and triage frequent unnamed faces. Use whenever the user is on a DAM folder or asset detail page in AEM and asks to "scan this folder for faces", "scan this asset/image for faces", "who is in this photo?", "what other assets have the same people as this image?", "find all photos with <Person>", "name the people in this image from left to right", "combine/merge/split these face groups", or "which unnamed people appear the most?".
+description: Inspect, list, search, and manage recognized faces and people across AEM DAM folders and image assets. Use whenever the user is viewing a DAM folder or asset detail page in AEM and asks to "list the faces in each of the assets here", "who is in this folder/image?", "what other assets have the same people as this image?", "find all photos with <Person>", "which unnamed people appear the most?", "is face recognition enabled on this AEM instance?", or "scan this folder/asset for faces". Works natively inside the AEM Coworker sidebar via AEM `read-api` (`search-assets`) with zero local files or Node/CLI dependencies required.
 ---
 
 # AEM Assets Facial Recognition & Grouping (`aem-face-recognition`)
 
-Interacts with the **AEM Assets View Facial Recognition & Grouping App Builder Extension** (`aem/assets/assetsview/1`, deployed in `/Users/pnam/Sandbox/aemfacerec`) powered by customer BYOK **AWS Rekognition**.
+Works with the **AEM Assets View Facial Recognition & Grouping App Builder Extension** (`aem/assets/assetsview/1`, bound to `https://author-p59602-e520244.adobeaemcloud.com`).
 
-`$SKILL` = the directory containing this `SKILL.md` (`/Users/pnam/.claude/skills/aem-face-recognition` or `/Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition`).
+## Critical: How This Skill Runs in the AEM Coworker Sidebar
 
----
+**Do NOT shell out to `node` or look for local `.env` files when running inside the AEM Coworker cloud sandbox.**
+Instead, use **`Adobe Experience Manager: read-api`** (`aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', ...)`).
 
-## Core Practitioner Workflows Supported
+Every image scanned by the Face Recognition App Builder extension has its face-detection results synced directly onto `assetMetadata` (`jcr:content/metadata`) in AEM Author:
 
-0. **Verify Extension Is Active on the Target AEM Instance (`check-instance`)**:
-   - Before running face recognition on an AEM instance (or when the user provides an AEM URL with a specific `repoId` / `author-p...-e....adobeaemcloud.com` host), verifies that:
-     1. The target AEM host matches the AEM environment bound to this App Builder extension (`AEM_HOST` / `AEM_ALLOWED_HOSTS`),
-     2. The App Builder Runtime actions (`groups`, `ingest`, `settings`) are reachable and AWS Rekognition credentials + Collection ID are configured,
-     3. The **`Face Recognition`** Processing Profile is installed on that AEM instance (`/conf/global/settings/dam/processing`) and reports which DAM folders are enabled.
-   - Note: Every command (`scan-folder`, `scan-asset`, `inspect-asset`, `related-assets`, `name-faces-ltr`) also runs this host check automatically when given an AEM URL and fails fast with a clear message if the user is on a different AEM environment.
-1. **Scan a DAM Folder for Faces (`scan-folder`)**:
-   - User is viewing a folder in AEM Assets View (or provides a folder URL / `/content/dam/...` path) and asks to scan the assets for faces.
-   - Automatically skips already-scanned images at zero AWS cost (pass `--rescan` to force re-analysis), batches in chunks of 5 to avoid 30s gateway timeouts, and summarizes detected faces per image.
-2. **Scan or Inspect a Single Asset (`scan-asset` / `inspect-asset`)**:
-   - User is on an AEM Asset Detail page (or provides a detail URL, DAM path, or `urn:aaid:aem:<uuid>`) and asks to scan the image or see who is in it.
-   - Returns all detected faces **ordered left-to-right (`#1 leftmost` → `#N rightmost`)** with bounding box coordinates, group names / `Person #N` placeholder labels, total appearances across the DAM, and synced `xdm:faceNames` / `xdm:persona` metadata.
-3. **Find Other Assets with the Same People as the Current Image (`related-assets`)**:
-   - User asks: *"What other assets have the same people as the current image?"* or *"Which other photos have ALL of the people in this shot together?"*
-   - Works for **both named people (`Jill Jelly`) AND unnamed placeholders (`Person #37`)** via internal `groupId` vectors — even when `includeUnnamedInMetadata` is turned off in AEM metadata!
-   - If the source asset hasn't been scanned yet, automatically scans it first, then ranks all other DAM assets by how many people they share (`--mode any` default, or `--mode all` for exact co-appearance), returning direct clickable AEM Assets View deep links.
-4. **Search Assets by Person Name or Group (`find-person`)**:
-   - User asks: *"Find all photos of Belinda Baker"* or *"Which assets have both Freddie Father and Belinda Baker together?"* (`--mode all`).
-5. **Name People in an Asset from Left to Right (`name-faces-ltr`)**:
-   - User says: *"In this photo, the people from left to right are John Johnson, Jill Jelly, and Dave Driver."*
-   - Sorts the asset's detected faces by `boundingBox.left` ascending (`#1` to `#N`), renames each person's Face Group (use `"-"` to skip a position), and automatically syncs `xdm:faceNames` + `xdm:persona` across every DAM asset where those people appear.
-6. **Curation Triage — Top Unnamed People (`triage-unnamed`)**:
-   - User asks: *"Which unnamed people appear in the most photos?"* or *"Who should we name first?"*
-   - Lists unnamed `Person #N` clusters sorted by appearance count descending (`faceCount` / `assetCount`).
-7. **Rename, Combine/Merge, Split, or Delete a Person (`rename`, `combine`, `split`, `delete`)**:
-   - Rename any `Person #N` or existing person, merge duplicate clusters (`combine`), split a misgrouped face into its own standalone group (`split`), or permanently erase a person's biometric vectors, avatars, and metadata (`delete` — GDPR/BIPA right to be forgotten).
+| `assetMetadata` Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `xdm:faceCount` | `String` / `Number` | Total faces detected on the asset (`"0"`, `"1"`, `"2"`, ...). If `undefined`, the asset has **not** been scanned yet. |
+| `xdm:faceLabels` | `String[]` | **Ordered left-to-right (`#1 leftmost` → `#N rightmost`)**. Always contains the display label for every detected person — **both named people (`"John Johnson"`, `"Jill Jelly"`) AND unnamed placeholders (`"Person #38"`, `"Person #70"`)**. |
+| `xdm:faceGroupIds` | `String[]` | **Ordered left-to-right** in 1-to-1 correspondence with `xdm:faceLabels` (e.g. `["grp_2a9b64a3", "grp_cc233d4a"]`). Uniquely identifies each person across the entire DAM even before they are given a real name. |
+| `xdm:faceNames` | `String[]` | Named people on the asset (omits `Person #N` placeholders when *Hide unnamed placeholders* is enabled in Settings). |
+| `xdm:persona` | `String[]` | Dual-written copy of `xdm:faceNames` (pre-indexed in AEM Assets View's Search Filter rail). |
+
+> **Practitioner Communication Note**: Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right, and refer to assets by their filename/title. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
 
 ---
 
-## Accepted Input Formats (URLs, Paths, UUIDs)
+## Workflow 0: Verify the Face Recognition Extension Is Active on the AEM Instance
 
-Every command in `facerec_cli.mjs` accepts **any** of the following directly:
-- **AEM Assets View Folder URL**:
-  `https://experience.adobe.com/?repoId=author-p59602-e520244.adobeaemcloud.com#/@tenant/assets/browse/content/dam/26H2/hertz/hertz-2026-fall%20shoot`
-- **AEM Assets View Asset Detail URL** (with or without the `/<namespace>_face-recognition-panel` segment):
-  `https://experience.adobe.com/?repoId=author-p59602-e520244.adobeaemcloud.com#/@tenant/assets/detail/767251-759moccasingayal_face-recognition-panel/content/dam/26H2/hertz/hertz-2026-fall%20shoot/hertz_elderly-couple_resort_luxury-sedan_v1.png`
-- **AEM Author Touch UI URL**:
-  `https://author-p59602-e520244.adobeaemcloud.com/assets.html/content/dam/26H2/hertz` or `/ui#/aem/assetdetails.html/content/dam/...`
-- **Raw DAM Path**:
-  `/content/dam/26H2/hertz/hertz-2026-fall shoot/hertz_elderly-couple_resort_luxury-sedan_v1.png`
-- **Asset UUID**:
-  `urn:aaid:aem:<uuid>` or `<uuid>`
+Before running a query (or if the user asks whether face recognition is available on the current AEM environment), check:
+1. This extension deployment is bound to **`https://author-p59602-e520244.adobeaemcloud.com`**.
+2. You can verify face recognition metadata is active on any `aemUrl` with a single `read-api` call:
+
+```javascript
+// Run in read-api with aemUrl
+const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+  termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
+  limit: 50
+});
+const results = r.body.results || [];
+const scannedSample = results.filter(a => a.assetMetadata && a.assetMetadata['xdm:faceCount'] !== undefined);
+return {
+  extensionActive: scannedSample.length > 0,
+  sampledAssets: results.length,
+  scannedAssetsInSample: scannedSample.length
+};
+```
+If `extensionActive` is `false` (and the host is not `author-p59602-e520244.adobeaemcloud.com`), let the user know that the Face Recognition extension is not active on that AEM environment.
 
 ---
 
-## Quick CLI Commands
+## Workflow 1: List the Faces in Each Asset in a Folder ("list the faces in each of the assets here")
 
-Run via `node $SKILL/scripts/facerec_cli.mjs` (reads `.env` from `/Users/pnam/Sandbox/aemfacerec/.env` automatically; pass `--json` on any command for structured JSON output):
+When the user is on a DAM folder (e.g. `/content/dam/26H2/hertz/hertz-2026-fall shoot`) and asks to **list the faces in each asset**, **see who is in the folder**, or **inspect the folder**:
+- **Never re-scan already-scanned assets.**
+- Run this single **`read-api`** call to get every asset in the folder, its left-to-right face list (`xdm:faceLabels`), and a summary of recurring people across the folder:
 
-```bash
-# 0. Check whether the Face Recognition App Builder extension is active on a target AEM instance
-node $SKILL/scripts/facerec_cli.mjs check-instance "<optional-aem-url-or-author-host>"
+```javascript
+// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
+const FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // replace with target folder path
+const allAssets = [];
+let cursor = null;
+do {
+  const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+    termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: FOLDER }],
+    limit: 100,
+    cursor
+  });
+  allAssets.push(...(r.body.results || []));
+  cursor = r.body.cursor;
+} while (cursor);
 
-# 1. Scan all unscanned images in a DAM folder (or pass --rescan to re-analyze all)
-node $SKILL/scripts/facerec_cli.mjs scan-folder "<folder-url-or-dam-path>"
-node $SKILL/scripts/facerec_cli.mjs scan-folder "<folder-url-or-dam-path>" --rescan
+// Filter to direct child image assets of FOLDER (or keep all descendants if user asked recursively)
+const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
+const peopleCounts = {};
+const assets = allAssets
+  .filter(a => String(a.repositoryMetadata?.['dc:format'] || '').startsWith('image/'))
+  .map(a => {
+    const meta = a.assetMetadata || {};
+    const scanned = meta['xdm:faceCount'] !== undefined;
+    const faceCount = scanned ? Number(meta['xdm:faceCount'] || 0) : null;
+    const facesLeftToRight = toArray(meta['xdm:faceLabels'].length ? meta['xdm:faceLabels'] : meta['xdm:faceNames']);
+    for (const label of facesLeftToRight) {
+      peopleCounts[label] = (peopleCounts[label] || 0) + 1;
+    }
+    return {
+      name: a.repositoryMetadata['repo:name'],
+      path: a.repositoryMetadata['repo:path'],
+      scanned,
+      faceCount,
+      facesLeftToRight
+    };
+  })
+  .sort((a, b) => a.name.localeCompare(b.name));
 
-# 2. Scan (or re-scan) a single image asset and list detected faces left-to-right
-node $SKILL/scripts/facerec_cli.mjs scan-asset "<asset-detail-url-or-dam-path>"
+const recurringPeople = Object.entries(peopleCounts)
+  .sort((a, b) => b[1] - a[1])
+  .map(([person, assetCount]) => ({ person, assetCount }));
 
-# 3. Inspect already-indexed faces on an asset (ordered left-to-right, no AWS call)
-node $SKILL/scripts/facerec_cli.mjs inspect-asset "<asset-detail-url-or-dam-path>"
+return {
+  folder: FOLDER,
+  totalImages: assets.length,
+  scannedCount: assets.filter(a => a.scanned).length,
+  unscannedCount: assets.filter(a => !a.scanned).length,
+  recurringPeople,
+  assets
+};
+```
 
-# 4. Find other DAM assets that have ANY (or ALL) of the same people as this image
-#    (Automatically scans the source image first if it hasn't been scanned yet)
-node $SKILL/scripts/facerec_cli.mjs related-assets "<asset-detail-url-or-dam-path>"
-node $SKILL/scripts/facerec_cli.mjs related-assets "<asset-detail-url-or-dam-path>" --mode all
+Present the results clearly:
+1. **Summary**: Total images in the folder, how many have faces detected, and any recurring people across multiple photos in the folder.
+2. **Per-Asset Breakdown**: Each image filename, its face count, and the people detected (ordered **left-to-right**).
+3. If `unscannedCount > 0`, mention which images haven't been scanned yet and let the user know they can click **Scan Current Folder** in the **Face Groups** modal (or **Recognize Faces** in the action bar) to analyze the new ones.
 
-# 5. Find all DAM assets containing specific people (by name, Person #N, or groupId)
-node $SKILL/scripts/facerec_cli.mjs find-person "Jill Jelly"
-node $SKILL/scripts/facerec_cli.mjs find-person "Freddie Father" "Belinda Baker" --mode all
+---
 
-# 6. Name the people in an asset from left to right (use "-" to skip a position)
-node $SKILL/scripts/facerec_cli.mjs name-faces-ltr "<asset-url-or-path>" "John Johnson" "Jill Jelly" "Dave Driver"
+## Workflow 2: Inspect a Single Asset & What Other Assets Share the Same People
 
-# 7. Rename a face group (by Person #N, current name, or grp_... ID)
-node $SKILL/scripts/facerec_cli.mjs rename "Person #37" "Jill Jelly"
+When the user is on an **Asset Detail** page (or names a specific image) and asks:
+- *"Who is in this image?"*
+- *"What other assets have the same people as the current image?"*
+- *"Where else do the people in this photo appear?"*
 
-# 8. Combine (merge) two groups, split a misgrouped face, or permanently delete a group
-node $SKILL/scripts/facerec_cli.mjs combine "Person #42" "Jill Jelly"
-node $SKILL/scripts/facerec_cli.mjs split "<faceId>" "Optional New Name"
-node $SKILL/scripts/facerec_cli.mjs delete "Person #99"
+Run this single **`read-api`** call. It looks up the source image's `xdm:faceGroupIds` and `xdm:faceLabels` (ordered left-to-right), then searches across `/content/dam` for every other asset sharing one or more of those `xdm:faceGroupIds` — **working for both named people (`Freddie Father`, `Jill Jelly`) AND unnamed placeholders (`Person #38`)**:
 
-# 9. Triage: list the most frequent unnamed people across the DAM so the user can name them
-node $SKILL/scripts/facerec_cli.mjs triage-unnamed --limit 20
+```javascript
+// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
+const SOURCE_FOLDER = "/content/dam/26H2/hertz/hertz-2026-fall shoot"; // parent folder of current asset
+const SOURCE_NAME = "hertz_elderly-couple_resort_luxury-sedan_v1.png";   // filename of current asset
+const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
+
+// 1. Fetch the source asset
+const srcRes = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+  termFilters: [
+    { key: "repositoryMetadata.repo:ancestors", value: SOURCE_FOLDER },
+    { key: "repositoryMetadata.repo:name", value: SOURCE_NAME }
+  ],
+  limit: 5
+});
+const srcAsset = (srcRes.body.results || [])[0];
+if (!srcAsset) return { error: `Asset ${SOURCE_NAME} not found in ${SOURCE_FOLDER}` };
+
+const srcMeta = srcAsset.assetMetadata || {};
+const srcPath = srcAsset.repositoryMetadata['repo:path'];
+const srcLabels = toArray(srcMeta['xdm:faceLabels'] || srcMeta['xdm:faceNames']);
+const srcGroupIds = toArray(srcMeta['xdm:faceGroupIds']);
+
+// Map groupId -> display label from source asset
+const labelByGroupId = {};
+srcGroupIds.forEach((gId, i) => {
+  labelByGroupId[gId] = srcLabels[i] || gId;
+});
+const targetGroupSet = new Set(srcGroupIds);
+
+// 2. Scan indexed DAM assets to find all other assets sharing any of these people
+const allDamAssets = [];
+let cursor = null, pages = 0;
+do {
+  const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+    termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
+    limit: 100,
+    cursor
+  });
+  allDamAssets.push(...(r.body.results || []));
+  cursor = r.body.cursor;
+  pages++;
+} while (cursor && pages < 25);
+
+const relatedAssets = [];
+for (const a of allDamAssets) {
+  const path = a.repositoryMetadata?.['repo:path'];
+  if (!path || path === srcPath) continue;
+  const meta = a.assetMetadata || {};
+  const gIds = toArray(meta['xdm:faceGroupIds']);
+  const labels = toArray(meta['xdm:faceLabels'] || meta['xdm:faceNames']);
+  const sharedPeople = [];
+  gIds.forEach((gId, idx) => {
+    if (targetGroupSet.has(gId)) {
+      sharedPeople.push(labels[idx] || labelByGroupId[gId] || gId);
+    }
+  });
+  if (sharedPeople.length > 0) {
+    relatedAssets.push({
+      name: a.repositoryMetadata['repo:name'],
+      path,
+      sharedPeopleCount: sharedPeople.length,
+      sharedPeople,
+      allFacesLeftToRight: labels,
+      totalFacesOnAsset: Number(meta['xdm:faceCount'] || labels.length)
+    });
+  }
+}
+
+relatedAssets.sort((a, b) => b.sharedPeopleCount - a.sharedPeopleCount || a.path.localeCompare(b.path));
+
+return {
+  sourceAsset: {
+    name: SOURCE_NAME,
+    path: srcPath,
+    scanned: srcMeta['xdm:faceCount'] !== undefined,
+    faceCount: Number(srcMeta['xdm:faceCount'] || 0),
+    facesLeftToRight: srcLabels
+  },
+  totalRelatedAssets: relatedAssets.length,
+  relatedAssets
+};
 ```
 
 ---
 
-## Direct AEM Metadata & Runtime API Reference (When Calling Without the CLI)
+## Workflow 3: Find All Assets Containing a Specific Person (or Combination of People) or Triage Unnamed Faces
 
-### A. Native AEM Asset Metadata (`jcr:content/metadata`)
-Every scan, rename, split, merge, or delete automatically syncs these properties on `jcr:content/metadata`:
-- `xdm:persona` (`String[]`) — Pre-indexed out-of-the-box in AEM Assets View's Searchable Property Index (`/adobe/repository?resource=searchableproperties`).
-- `xdm:faceNames` (`String[]`) — Primary multi-value array of face group names on the asset.
-- `xdm:faceGroupIds` (`String[]`) — Internal cluster IDs (`grp_...`) on the asset.
-- `xdm:faceCount` (`Long`) — Number of detected faces on the asset.
+When the user asks *"Find all photos with Jill Jelly"*, *"Which photos have both Freddie Father and Belinda Baker?"*, or *"Which unnamed people appear in the most photos?"*:
 
-> **Important**: Never edit `xdm:faceNames` or `xdm:persona` directly via raw JCR/Sling writes when renaming or merging people — always use the `groups` Runtime action (or `facerec_cli.mjs`) so AWS Rekognition vectors, App Builder storage, and all affected AEM assets stay in sync.
+```javascript
+// Run in read-api with aemUrl = "https://author-p59602-e520244.adobeaemcloud.com"
+const SEARCH_PEOPLE = ["Jill Jelly"]; // or leave empty [] to rank all people across the DAM
+const REQUIRE_ALL = false;            // true = must contain ALL listed people together
+const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 
-### B. App Builder Runtime Actions (`aem-assets-assetsview-1`)
-- **`ingest` (`aem-assets-assetsview-1/ingest`)**:
-  - `browseFolder`: `{ "operation": "browseFolder", "folderPath": "/content/dam/..." }`
-  - `scanFolder`: `{ "operation": "scanFolder", "folderPath": "/content/dam/...", "assets": [...], "force": true, "rescan": false }`
-  - `ingestAsset`: `{ "operation": "ingestAsset", "assetPath": "/content/dam/.../img.png", "force": true, "rescan": true }`
-- **`groups` (`aem-assets-assetsview-1/groups`)**:
-  - `getAssetFaces`: `{ "operation": "getAssetFaces", "assetPath": "/content/dam/.../img.png" }`
-  - `findRelatedAssets`: `{ "operation": "findRelatedAssets", "assetPath": "/content/dam/.../img.png", "matchMode": "any" }` (or pass `"personNames": ["Jill Jelly"]`, `"groupIds": ["grp_..."]`)
-  - `listGroups`: `{ "operation": "listGroups", "filter": "all" | "named" | "unnamed", "query": "", "offset": 0, "limit": 60 }`
-  - `renameGroup`: `{ "operation": "renameGroup", "groupId": "grp_...", "name": "Jill Jelly" }`
-  - `mergeGroups`: `{ "operation": "mergeGroups", "sourceGroupIds": ["grp_..."], "targetGroupId": "grp_..." }`
-  - `splitFaces`: `{ "operation": "splitFaces", "faceIds": ["<faceId>"], "newGroupName": "..." }`
-  - `deleteGroup`: `{ "operation": "deleteGroup", "groupId": "grp_..." }`
+const allDamAssets = [];
+let cursor = null, pages = 0;
+do {
+  const r = await aem.post('/adobe/experimental/aemmcpserver-expires-20991231/search-assets', {
+    termFilters: [{ key: "repositoryMetadata.repo:ancestors", value: "/content/dam" }],
+    limit: 100,
+    cursor
+  });
+  allDamAssets.push(...(r.body.results || []));
+  cursor = r.body.cursor;
+  pages++;
+} while (cursor && pages < 25);
+
+const roster = {};
+const matchingAssets = [];
+
+for (const a of allDamAssets) {
+  const meta = a.assetMetadata || {};
+  if (meta['xdm:faceCount'] === undefined) continue;
+  const labels = toArray(meta['xdm:faceLabels'] || meta['xdm:faceNames']);
+  const name = a.repositoryMetadata?.['repo:name'];
+  const path = a.repositoryMetadata?.['repo:path'];
+
+  for (const label of labels) {
+    if (!roster[label]) roster[label] = { person: label, isNamed: !label.startsWith('Person #'), count: 0, sampleAssets: [] };
+    roster[label].count++;
+    if (roster[label].sampleAssets.length < 5) roster[label].sampleAssets.push(path);
+  }
+
+  if (SEARCH_PEOPLE.length > 0) {
+    const matched = SEARCH_PEOPLE.filter(q =>
+      labels.some(l => l.toLowerCase().includes(q.toLowerCase()))
+    );
+    if ((REQUIRE_ALL && matched.length === SEARCH_PEOPLE.length) || (!REQUIRE_ALL && matched.length > 0)) {
+      matchingAssets.push({ name, path, matchedPeople: matched, facesLeftToRight: labels });
+    }
+  }
+}
+
+return {
+  matchingAssets,
+  topPeople: Object.values(roster).sort((a, b) => b.count - a.count).slice(0, 30)
+};
+```
+
+---
+
+## Workflow 4: Scanning Unscanned Assets or Renaming / Combining / Splitting Face Groups
+
+1. **In the AEM Assets View UI (when inside the Coworker cloud sandbox)**:
+   - **To scan a folder**: Click **Face Groups** in the top header bar → click **Scan Current Folder** (automatically skips already-scanned images at zero AWS cost), or select assets/folders and click **Recognize Faces** in the action bar.
+   - **To scan or curate a single asset**: Open the asset and click the **Recognized Faces** icon in the right rail to view cropped face avatars, highlight bounding boxes, **Name / Rename** a person, **Split Face**, or **Combine Into...** another group.
+2. **In a Local Terminal / OpenCode Session (where `/Users/pnam/Sandbox/aemfacerec/.env` is present)**:
+   Run the bundled CLI helper `scripts/facerec_cli.mjs`:
+   ```bash
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs check-instance
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs scan-folder "<folder-url-or-path>"
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs scan-asset "<asset-url-or-path>"
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs related-assets "<asset-url-or-path>"
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs name-faces-ltr "<asset-url-or-path>" "Name 1" "Name 2"
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs rename "Person #38" "Elena Rostova"
+   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs combine "Person #70" "Elena Rostova"
+   ```

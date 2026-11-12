@@ -843,6 +843,7 @@ function createAemClient({
       assetPath,
       {
         faceNames = [],
+        faceLabels = [],
         faceGroupIds = [],
         faceCount = 0,
         metadataProperty = 'xdm:faceNames',
@@ -860,9 +861,11 @@ function createAemClient({
       }
       const hasDistinctSecondary =
         Boolean(secondaryMetadataProperty) && secondaryMetadataProperty !== metadataProperty;
+      const effectiveLabels = Array.isArray(faceLabels) && faceLabels.length > 0 ? faceLabels : faceNames;
       const metadataOut = {
         [metadataProperty]: faceNames,
         ...(hasDistinctSecondary ? { [secondaryMetadataProperty]: faceNames } : {}),
+        'xdm:faceLabels': effectiveLabels,
         'xdm:faceGroupIds': faceGroupIds,
         'xdm:faceCount': faceCount
       };
@@ -894,6 +897,15 @@ function createAemClient({
           for (const name of faceNames) {
             formData.append(secondaryMetadataProperty, name);
           }
+        }
+      }
+
+      formData.append('xdm:faceLabels@TypeHint', 'String[]');
+      if (effectiveLabels.length === 0) {
+        formData.append('xdm:faceLabels@Delete', 'true');
+      } else {
+        for (const label of effectiveLabels) {
+          formData.append('xdm:faceLabels', label);
         }
       }
 

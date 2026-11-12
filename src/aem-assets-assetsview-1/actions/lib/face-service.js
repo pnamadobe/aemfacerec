@@ -118,14 +118,31 @@ function getGroupEffectiveMetadataName(group, settings) {
  */
 function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
   const faceIds = (assetRecord?.faceIds || []).filter((id) => Boolean(faces[id]));
-  const resolvedGroups = faceIds
-    .map((id) => groups[faces[id]?.groupId])
+  const sortedFaces = faceIds
+    .map((id) => faces[id])
+    .filter(Boolean)
+    .sort((a, b) => (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0));
+  const resolvedGroups = sortedFaces
+    .map((f) => groups[f.groupId])
     .filter(Boolean);
 
   const faceNames = Array.from(
     new Set(
       resolvedGroups
         .map((g) => getGroupEffectiveMetadataName(g, settings))
+        .filter(Boolean)
+    )
+  );
+
+  // Always includes both named people and unnamed placeholder labels (`Person #N`), ordered left-to-right
+  const faceLabels = Array.from(
+    new Set(
+      resolvedGroups
+        .map((g) =>
+          g.name && String(g.name).trim() !== ''
+            ? String(g.name).trim()
+            : g.autoLabel || g.groupId
+        )
         .filter(Boolean)
     )
   );
@@ -144,6 +161,7 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     metadataProperty,
     secondaryMetadataProperty,
     faceNames,
+    faceLabels,
     faceGroupIds,
     faceCount: faceIds.length
   };
@@ -252,6 +270,7 @@ async function createFaceService({
       metadataProperty: computed.metadataProperty,
       secondaryMetadataProperty: computed.secondaryMetadataProperty || null,
       faceNames: computed.faceNames || [],
+      faceLabels: computed.faceLabels || [],
       faceGroupIds: computed.faceGroupIds || [],
       faceCount: computed.faceCount || 0
     });
@@ -769,6 +788,144 @@ async function createFaceService({
       return {
         ...browsed,
         assets: enrichedAssets
+      };
+    },
+
+    /**
+     * Returns all assets in a DAM folder along with the detected faces/people on each asset
+     * (sorted left-to-right by `boundingBox.left`), including both named people and unnamed
+     * `Person #N` placeholders, plus a folder-level rollup of people appearing in the folder.
+     * Read-only: never triggers AWS Rekognition scans.
+     */
+    async getFolderFaces({ folderPath = '/content/dam', includeSubfolders = false } = {}) {
+      const cleanFolder = assertDamPath(folderPath || '/content/dam', 'folder path').replace(
+        /\/+$/,
+        ''
+      ) || '/content/dam';
+      const [db, settings] = await Promise.all([
+        storage.getDatabase({ readOnly: true }),
+        storage.getSettings()
+      ]);
+
+      let browsed = { folderPath: cleanFolder, folders: [], assets: [], excludedAssetCount: 0 };
+      try {
+        browsed = await aemClient.browseDamFolder(cleanFolder, {
+          allowedImageTypes: settings.allowedImageTypes
+        });
+      } catch (e) {
+        // Fallback to indexed assets in db.assets if live AEM folder browse is unavailable
+      }
+
+      const byPath = new Map();
+      for (const a of browsed.assets || []) {
+        const normPath = safeNormalizeDamPath(a.assetPath);
+        if (!normPath) continue;
+        byPath.set(normPath, {
+          assetId: a.assetId,
+          assetPath: normPath,
+          assetTitle: a.assetTitle || normPath.split('/').pop(),
+          indexedRecord: findAssetRecord(db, a.assetId, normPath)
+        });
+      }
+
+      for (const rec of Object.values(db.assets || {})) {
+        if (!rec || !rec.assetPath) continue;
+        const normPath = safeNormalizeDamPath(rec.assetPath);
+        if (!normPath || byPath.has(normPath)) continue;
+        const parentDir = normPath.slice(0, normPath.lastIndexOf('/')) || '/content/dam';
+        const inScope = includeSubfolders
+          ? parentDir === cleanFolder || normPath.startsWith(`${cleanFolder}/`)
+          : parentDir === cleanFolder;
+        if (inScope) {
+          byPath.set(normPath, {
+            assetId: rec.assetId,
+            assetPath: normPath,
+            assetTitle: rec.assetTitle || normPath.split('/').pop(),
+            indexedRecord: rec
+          });
+        }
+      }
+
+      const peopleMap = new Map();
+      let scannedAssetCount = 0;
+      let totalFacesInFolder = 0;
+
+      const assets = Array.from(byPath.values())
+        .sort((a, b) => String(a.assetPath).localeCompare(String(b.assetPath)))
+        .map(({ assetId, assetPath, assetTitle, indexedRecord }) => {
+          if (!indexedRecord) {
+            return {
+              assetId,
+              assetPath,
+              assetTitle,
+              scanned: false,
+              faceCount: 0,
+              people: []
+            };
+          }
+          scannedAssetCount++;
+          const sortedFaces = (indexedRecord.faceIds || [])
+            .map((fId) => enrichFace(db.faces[fId], db.groups))
+            .filter(Boolean)
+            .sort((a, b) => (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0));
+
+          totalFacesInFolder += sortedFaces.length;
+          const seenGroupsOnAsset = new Set();
+
+          const people = sortedFaces.map((f, idx) => {
+            const isNamed = Boolean(f.groupName && String(f.groupName).trim());
+            if (f.groupId && !seenGroupsOnAsset.has(f.groupId)) {
+              seenGroupsOnAsset.add(f.groupId);
+              const prev = peopleMap.get(f.groupId) || {
+                groupId: f.groupId,
+                displayName: f.groupDisplayName,
+                isNamed,
+                appearancesInFolder: 0,
+                totalAppearancesInDam: f.groupFaceCount || 1,
+                assetsInFolder: []
+              };
+              prev.appearancesInFolder += 1;
+              prev.assetsInFolder.push(assetTitle);
+              peopleMap.set(f.groupId, prev);
+            }
+            return {
+              positionFromLeft: idx + 1,
+              faceId: f.faceId,
+              groupId: f.groupId,
+              displayName: f.groupDisplayName,
+              isNamed,
+              confidence: f.confidence
+            };
+          });
+
+          return {
+            assetId: indexedRecord.assetId || assetId,
+            assetPath,
+            assetTitle: indexedRecord.assetTitle || assetTitle,
+            scanned: true,
+            faceCount: people.length,
+            people
+          };
+        });
+
+      const peopleInFolder = Array.from(peopleMap.values()).sort(
+        (a, b) =>
+          b.appearancesInFolder - a.appearancesInFolder ||
+          (a.isNamed !== b.isNamed ? (a.isNamed ? -1 : 1) : 0) ||
+          String(a.displayName).localeCompare(String(b.displayName))
+      );
+
+      return {
+        aemHost: aemHost || null,
+        folderPath: cleanFolder,
+        subfolders: (browsed.folders || []).map((f) => f.folderPath),
+        totalAssetsInFolder: assets.length,
+        scannedAssetCount,
+        unscannedAssetCount: assets.length - scannedAssetCount,
+        excludedAssetCount: browsed.excludedAssetCount || 0,
+        totalFacesInFolder,
+        peopleInFolder,
+        assets
       };
     },
 
