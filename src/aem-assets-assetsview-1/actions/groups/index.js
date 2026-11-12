@@ -128,6 +128,19 @@ async function main(params = {}) {
         };
       }
 
+      case 'findRelatedAssets': {
+        const result = await faceService.findRelatedAssets({
+          assetId: params.assetId,
+          assetPath: params.assetPath,
+          assetName: params.assetName,
+          groupIds: params.groupIds,
+          personNames: params.personNames,
+          matchMode: params.matchMode,
+          limit: params.limit
+        });
+        return { statusCode: 200, headers: corsHeaders, body: result };
+      }
+
       case 'renameGroup': {
         if (!params.groupId) {
           return {

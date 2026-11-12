@@ -402,3 +402,42 @@ test('7. scanFolder processes asset batches in-memory with a single ensureCollec
     harness.cleanup();
   }
 });
+
+test('8. findRelatedAssets finds co-appearing assets ranked by shared people and sorts source faces left-to-right', async () => {
+  const harness = await createTestHarness();
+  try {
+    await harness.faceService.seedDemoData();
+
+    // keynote-panel.jpg has Sarah Jenkins (left=0.12), Marcus Vance (left=0.42), and Person #3 (left=0.71)
+    const anyRes = await harness.faceService.findRelatedAssets({
+      assetPath: '/content/dam/events/2026-summit/keynote-panel.jpg',
+      matchMode: 'any'
+    });
+
+    assert.equal(anyRes.sourceAsset.scanned, true);
+    assert.deepEqual(
+      anyRes.sourceAsset.people.map((p) => p.displayName),
+      ['Sarah Jenkins', 'Marcus Vance', 'Person #3'],
+      'source faces should be sorted left-to-right by boundingBox.left'
+    );
+    // backstage-chat.jpg shares 2 people (Sarah Jenkins + Person #3), executive-portrait.jpg shares 1 (Marcus Vance)
+    assert.equal(anyRes.totalRelatedAssets, 2);
+    assert.equal(anyRes.relatedAssets[0].assetTitle, 'backstage-chat.jpg');
+    assert.equal(anyRes.relatedAssets[0].sharedPeopleCount, 2);
+    assert.equal(anyRes.relatedAssets[1].assetTitle, 'executive-portrait.jpg');
+    assert.equal(anyRes.relatedAssets[1].sharedPeopleCount, 1);
+
+    // Search by personNames with matchMode='all' for Sarah Jenkins + Person #3
+    const togetherRes = await harness.faceService.findRelatedAssets({
+      personNames: ['Sarah Jenkins', 'Person #3'],
+      matchMode: 'all'
+    });
+    assert.equal(togetherRes.totalRelatedAssets, 2);
+    assert.deepEqual(
+      togetherRes.relatedAssets.map((a) => a.assetTitle).sort(),
+      ['backstage-chat.jpg', 'keynote-panel.jpg']
+    );
+  } finally {
+    harness.cleanup();
+  }
+});

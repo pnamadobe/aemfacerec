@@ -978,6 +978,174 @@ async function createFaceService({
     },
 
     /**
+     * Finds all other indexed DAM assets that share one or more (`matchMode: 'any'`) or all
+     * (`matchMode: 'all'`) of the people detected in a source asset (or specified via `groupIds`
+     * / `personNames`). Works for both named people and unnamed `Person #N` placeholders, and
+     * omits base64 avatars so responses remain compact.
+     */
+    async findRelatedAssets({
+      assetId,
+      assetPath,
+      assetName,
+      groupIds = null,
+      personNames = null,
+      matchMode = 'any',
+      limit = 100
+    } = {}) {
+      const db = await storage.getDatabase({ readOnly: true });
+      const maxResults = clampInt(limit, { min: 1, max: 500, fallback: 100 });
+      const normalizedMode = String(matchMode || 'any').toLowerCase() === 'all' ? 'all' : 'any';
+
+      let sourceAsset = null;
+      let sourceDedupeKey = '';
+      const targetGroupIdSet = new Set();
+
+      if (assetId || assetPath || assetName) {
+        const assetRes = await this.getAssetFaces({ assetId, assetPath, assetName });
+        sourceDedupeKey = safeNormalizeDamPath(assetRes.assetPath) || stripUrnPrefix(assetRes.assetId) || '';
+        const sortedFaces = [...(assetRes.faces || [])].sort(
+          (a, b) => (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0)
+        );
+        const peopleOnSource = sortedFaces.map((f, idx) => {
+          const grp = db.groups[f.groupId];
+          const grpSummary = grp ? summarizeGroup(grp, db.faces, { includeCover: false }) : null;
+          if (f.groupId) targetGroupIdSet.add(f.groupId);
+          return {
+            positionFromLeft: idx + 1,
+            faceId: f.faceId,
+            groupId: f.groupId,
+            displayName: f.groupDisplayName,
+            isNamed: Boolean(f.groupName && String(f.groupName).trim()),
+            boundingBox: f.boundingBox || null,
+            confidence: f.confidence,
+            totalAssetAppearances: grpSummary?.assetCount || 1
+          };
+        });
+        sourceAsset = {
+          assetId: assetRes.assetId || null,
+          assetPath: assetRes.assetPath || null,
+          assetTitle: assetRes.assetTitle || (assetRes.assetPath ? assetRes.assetPath.split('/').pop() : null),
+          scanned: Boolean(assetRes.scanned),
+          faceCount: assetRes.faceCount || 0,
+          faceNames: assetRes.faceNames || [],
+          people: peopleOnSource
+        };
+      }
+
+      if (Array.isArray(groupIds)) {
+        for (const gId of groupIds) {
+          if (gId && db.groups[gId]) targetGroupIdSet.add(gId);
+        }
+      } else if (typeof groupIds === 'string' && groupIds.trim()) {
+        for (const gId of groupIds.split(',').map((s) => s.trim()).filter(Boolean)) {
+          if (db.groups[gId]) targetGroupIdSet.add(gId);
+        }
+      }
+
+      const nameQueries = (
+        Array.isArray(personNames)
+          ? personNames
+          : typeof personNames === 'string' && personNames.trim()
+          ? [personNames]
+          : []
+      )
+        .map((n) => String(n || '').trim().toLowerCase())
+        .filter(Boolean);
+
+      if (nameQueries.length > 0) {
+        for (const grp of Object.values(db.groups || {})) {
+          if (!grp) continue;
+          const display = String(grp.name || grp.autoLabel || grp.groupId).trim().toLowerCase();
+          const auto = String(grp.autoLabel || '').trim().toLowerCase();
+          const id = String(grp.groupId || '').trim().toLowerCase();
+          const hit = nameQueries.some(
+            (q) => display === q || auto === q || id === q || display.includes(q)
+          );
+          if (hit) targetGroupIdSet.add(grp.groupId);
+        }
+      }
+
+      const targetPeople = Array.from(targetGroupIdSet)
+        .map((gId) => summarizeGroup(db.groups[gId], db.faces, { includeCover: false }))
+        .filter(Boolean);
+
+      if (targetPeople.length === 0) {
+        return {
+          aemHost: aemHost || null,
+          sourceAsset,
+          targetPeople: [],
+          matchMode: normalizedMode,
+          totalRelatedAssets: 0,
+          relatedAssets: []
+        };
+      }
+
+      const candidatesByKey = new Map();
+      for (const assetRecord of Object.values(db.assets || {})) {
+        if (!assetRecord) continue;
+        const key =
+          safeNormalizeDamPath(assetRecord.assetPath) ||
+          stripUrnPrefix(assetRecord.assetId) ||
+          '';
+        if (!key || (sourceDedupeKey && key === sourceDedupeKey)) continue;
+
+        const assetFaces = (assetRecord.faceIds || [])
+          .map((fId) => db.faces[fId])
+          .filter(Boolean)
+          .sort((a, b) => (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0));
+
+        const allPeopleMap = new Map();
+        const sharedPeopleMap = new Map();
+        for (const f of assetFaces) {
+          const grp = db.groups[f.groupId];
+          if (!grp) continue;
+          const personInfo = {
+            groupId: grp.groupId,
+            displayName: grp.name || grp.autoLabel || grp.groupId,
+            isNamed: Boolean(grp.name && String(grp.name).trim())
+          };
+          allPeopleMap.set(grp.groupId, personInfo);
+          if (targetGroupIdSet.has(grp.groupId)) {
+            sharedPeopleMap.set(grp.groupId, personInfo);
+          }
+        }
+
+        if (sharedPeopleMap.size === 0) continue;
+        if (normalizedMode === 'all' && sharedPeopleMap.size < targetGroupIdSet.size) continue;
+
+        const existing = candidatesByKey.get(key);
+        if (!existing || sharedPeopleMap.size > existing.sharedPeopleCount) {
+          candidatesByKey.set(key, {
+            assetId: assetRecord.assetId,
+            assetPath: assetRecord.assetPath,
+            assetTitle:
+              assetRecord.assetTitle ||
+              (assetRecord.assetPath ? assetRecord.assetPath.split('/').pop() : assetRecord.assetId),
+            sharedPeopleCount: sharedPeopleMap.size,
+            sharedPeople: Array.from(sharedPeopleMap.values()),
+            allPeopleOnAsset: Array.from(allPeopleMap.values()),
+            faceCount: assetFaces.length
+          });
+        }
+      }
+
+      const sortedRelated = Array.from(candidatesByKey.values()).sort(
+        (a, b) =>
+          b.sharedPeopleCount - a.sharedPeopleCount ||
+          String(a.assetPath || '').localeCompare(String(b.assetPath || ''))
+      );
+
+      return {
+        aemHost: aemHost || null,
+        sourceAsset,
+        targetPeople,
+        matchMode: normalizedMode,
+        totalRelatedAssets: sortedRelated.length,
+        relatedAssets: sortedRelated.slice(0, maxResults)
+      };
+    },
+
+    /**
      * Lists all Face Groups (Named and Unnamed) for the Admin Console and group pickers.
      */
     /**
