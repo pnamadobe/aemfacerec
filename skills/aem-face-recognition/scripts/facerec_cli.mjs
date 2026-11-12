@@ -254,6 +254,102 @@ function parseFlags(argv) {
   return { positional, flags };
 }
 
+function normalizeHostUrl(host = '') {
+  const clean = String(host || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '');
+  return clean ? `https://${clean}` : '';
+}
+
+function getConfiguredAllowedHosts(env = {}) {
+  const raw = [
+    env.AEM_HOST,
+    env.AEM_AUTHOR_URL,
+    ...(String(env.AEM_ALLOWED_HOSTS || '').split(','))
+  ]
+    .map(normalizeHostUrl)
+    .filter(Boolean);
+  return Array.from(new Set(raw));
+}
+
+/**
+ * Verifies that if the caller provided an explicit AEM Author host/URL, the Face Recognition
+ * App Builder extension is actually configured for that AEM instance.
+ */
+function assertTargetInstanceMatches(target, env) {
+  if (!target?.aemHost) return;
+  const targetNormalized = normalizeHostUrl(target.aemHost);
+  const allowed = getConfiguredAllowedHosts(env);
+  if (allowed.length > 0 && !allowed.includes(targetNormalized)) {
+    throw new Error(
+      `The Face Recognition App Builder extension is not active on AEM instance ${targetNormalized}. ` +
+        `This extension deployment (${env.AIO_runtime_namespace || 'local'}) is bound to: ${allowed.join(', ')}.`
+    );
+  }
+}
+
+async function checkAemInstanceStatus(rawInput = '', env = {}) {
+  const target = parseAemTarget(rawInput);
+  const targetHost = normalizeHostUrl(
+    target.aemHost || (/^author-[a-z0-9-]+\.adobeaemcloud\.com$/i.test(String(rawInput || '').trim()) ? rawInput : '')
+  );
+  const configuredHosts = getConfiguredAllowedHosts(env);
+  const primaryBoundHost = configuredHosts[0] || '';
+  const hostMatches = !targetHost || configuredHosts.includes(targetHost);
+
+  if (!hostMatches) {
+    return {
+      extensionActiveOnInstance: false,
+      targetAemHost: targetHost,
+      boundAemHosts: configuredHosts,
+      namespace: env.AIO_runtime_namespace || null,
+      reason: `Target AEM instance ${targetHost} does not match the AEM instance(s) bound to this App Builder extension (${configuredHosts.join(', ')}).`
+    };
+  }
+
+  const [settingsRes, groupsRes] = await Promise.all([
+    invokeRuntimeAction('settings', { operation: 'getSettings' }, env),
+    invokeRuntimeAction('groups', { operation: 'listGroups', limit: 1 }, env)
+  ]);
+
+  const s = settingsRes.settings || {};
+  const profiles = settingsRes.processingProfiles || [];
+  const matchingProfile = profiles.find(
+    (p) =>
+      String(p.name || '').toLowerCase() ===
+      String(s.processingProfileName || 'Face Recognition').toLowerCase()
+  );
+
+  return {
+    extensionActiveOnInstance: Boolean(s.hasAwsSecretKey),
+    targetAemHost: targetHost || primaryBoundHost,
+    boundAemHosts: configuredHosts,
+    namespace: env.AIO_runtime_namespace || null,
+    appUrl: env.AIO_runtime_namespace
+      ? `https://${env.AIO_runtime_namespace}.adobeio-static.net/index.html`
+      : null,
+    awsConfigured: Boolean(s.hasAwsSecretKey && s.awsAccessKeyId),
+    awsRegion: s.awsRegion || null,
+    collectionId: s.collectionId || null,
+    metadataProperty: s.metadataProperty || 'xdm:faceNames',
+    secondaryMetadataProperty: s.enableSecondaryMetadataProperty ? s.secondaryMetadataProperty : null,
+    requireProcessingProfile: Boolean(s.requireProcessingProfile),
+    processingProfileName: s.processingProfileName || 'Face Recognition',
+    processingProfileInstalledOnAem: Boolean(matchingProfile),
+    availableProcessingProfilesOnAem: profiles.map((p) => p.name),
+    enabledFolders: s.enabledFolders || [],
+    indexedStats: {
+      totalGroups: groupsRes.totalGroups || 0,
+      namedGroups: groupsRes.namedCount || 0,
+      unnamedGroups: groupsRes.unnamedCount || 0,
+      totalFaces: groupsRes.totalFaces || 0,
+      totalAssets: groupsRes.totalAssets || 0
+    }
+  };
+}
+
 function stripAvatarsForJson(obj) {
   return JSON.parse(
     JSON.stringify(obj, (k, v) => (k === 'avatarDataUrl' || k === 'coverAvatarDataUrl' || k === 'previewDataUrl' ? undefined : v))
@@ -271,6 +367,7 @@ async function main() {
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(`AEM Assets Facial Recognition & Grouping CLI
 Usage:
+  node facerec_cli.mjs check-instance [aem-url-or-host] [--json]
   node facerec_cli.mjs scan-folder <folder-url-or-path> [--rescan] [--json]
   node facerec_cli.mjs scan-asset <asset-url-or-path> [--json]
   node facerec_cli.mjs inspect-asset <asset-url-or-path> [--json]
@@ -287,10 +384,49 @@ Usage:
   }
 
   // -------------------------------------------------------------------------
+  // 0. check-instance ("is the Face Recognition extension in use on this AEM instance?")
+  // -------------------------------------------------------------------------
+  if (command === 'check-instance' || command === 'status') {
+    const status = await checkAemInstanceStatus(positional[1] || '', env);
+    if (flags.json) {
+      console.log(JSON.stringify(status, null, 2));
+      return;
+    }
+    if (!status.extensionActiveOnInstance) {
+      console.log(`Face Recognition Extension Active: NO`);
+      console.log(`Reason: ${status.reason || 'AWS Rekognition credentials are not configured.'}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`Face Recognition Extension Active: YES`);
+    console.log(`Bound AEM Instance: ${status.targetAemHost}`);
+    console.log(`App Builder Namespace: ${status.namespace} (${status.appUrl})`);
+    console.log(
+      `AWS Rekognition: Configured (Region: ${status.awsRegion}, Collection: ${status.collectionId})`
+    );
+    console.log(
+      `AEM Processing Profile ("${status.processingProfileName}"): ${
+        status.processingProfileInstalledOnAem ? 'Installed on AEM' : 'Not found in /conf/global/settings/dam/processing'
+      } (requireProcessingProfile=${status.requireProcessingProfile})`
+    );
+    console.log(`Enabled DAM Folders: ${(status.enabledFolders || []).join(', ')}`);
+    console.log(
+      `AEM Metadata Properties: ${status.metadataProperty}${
+        status.secondaryMetadataProperty ? ` + ${status.secondaryMetadataProperty} (dual-write)` : ''
+      }`
+    );
+    console.log(
+      `Indexed Library Totals: ${status.indexedStats.totalAssets} asset(s), ${status.indexedStats.totalFaces} face(s), ${status.indexedStats.totalGroups} group(s) (${status.indexedStats.namedGroups} named, ${status.indexedStats.unnamedGroups} unnamed)`
+    );
+    return;
+  }
+
+  // -------------------------------------------------------------------------
   // 1. scan-folder
   // -------------------------------------------------------------------------
   if (command === 'scan-folder') {
     const target = parseAemTarget(positional[1] || '/content/dam');
+    assertTargetInstanceMatches(target, env);
     const folderPath = target.damPath || '/content/dam';
     const browsed = await invokeRuntimeAction(
       'ingest',
@@ -390,6 +526,7 @@ Usage:
   // -------------------------------------------------------------------------
   if (command === 'scan-asset') {
     const target = parseAemTarget(positional[1]);
+    assertTargetInstanceMatches(target, env);
     if (!target.damPath && !target.assetId) {
       throw new Error('Please provide an AEM asset URL, DAM path (/content/dam/...), or asset UUID.');
     }
@@ -457,6 +594,7 @@ Usage:
   // -------------------------------------------------------------------------
   if (command === 'inspect-asset') {
     const target = parseAemTarget(positional[1]);
+    assertTargetInstanceMatches(target, env);
     if (!target.damPath && !target.assetId) {
       throw new Error('Please provide an AEM asset URL, DAM path (/content/dam/...), or asset UUID.');
     }
@@ -520,6 +658,7 @@ Usage:
   // -------------------------------------------------------------------------
   if (command === 'related-assets') {
     const target = parseAemTarget(positional[1]);
+    assertTargetInstanceMatches(target, env);
     if (!target.damPath && !target.assetId) {
       throw new Error('Please provide an AEM asset URL, DAM path (/content/dam/...), or asset UUID.');
     }
@@ -667,6 +806,7 @@ Usage:
   // -------------------------------------------------------------------------
   if (command === 'name-faces-ltr') {
     const target = parseAemTarget(positional[1]);
+    assertTargetInstanceMatches(target, env);
     const names = positional.slice(2);
     if ((!target.damPath && !target.assetId) || names.length === 0) {
       throw new Error('Usage: name-faces-ltr <asset-url-or-path> "<Name 1>" "<Name 2>" ...');

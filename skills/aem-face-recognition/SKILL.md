@@ -13,6 +13,12 @@ Interacts with the **AEM Assets View Facial Recognition & Grouping App Builder E
 
 ## Core Practitioner Workflows Supported
 
+0. **Verify Extension Is Active on the Target AEM Instance (`check-instance`)**:
+   - Before running face recognition on an AEM instance (or when the user provides an AEM URL with a specific `repoId` / `author-p...-e....adobeaemcloud.com` host), verifies that:
+     1. The target AEM host matches the AEM environment bound to this App Builder extension (`AEM_HOST` / `AEM_ALLOWED_HOSTS`),
+     2. The App Builder Runtime actions (`groups`, `ingest`, `settings`) are reachable and AWS Rekognition credentials + Collection ID are configured,
+     3. The **`Face Recognition`** Processing Profile is installed on that AEM instance (`/conf/global/settings/dam/processing`) and reports which DAM folders are enabled.
+   - Note: Every command (`scan-folder`, `scan-asset`, `inspect-asset`, `related-assets`, `name-faces-ltr`) also runs this host check automatically when given an AEM URL and fails fast with a clear message if the user is on a different AEM environment.
 1. **Scan a DAM Folder for Faces (`scan-folder`)**:
    - User is viewing a folder in AEM Assets View (or provides a folder URL / `/content/dam/...` path) and asks to scan the assets for faces.
    - Automatically skips already-scanned images at zero AWS cost (pass `--rescan` to force re-analysis), batches in chunks of 5 to avoid 30s gateway timeouts, and summarizes detected faces per image.
@@ -57,6 +63,9 @@ Every command in `facerec_cli.mjs` accepts **any** of the following directly:
 Run via `node $SKILL/scripts/facerec_cli.mjs` (reads `.env` from `/Users/pnam/Sandbox/aemfacerec/.env` automatically; pass `--json` on any command for structured JSON output):
 
 ```bash
+# 0. Check whether the Face Recognition App Builder extension is active on a target AEM instance
+node $SKILL/scripts/facerec_cli.mjs check-instance "<optional-aem-url-or-author-host>"
+
 # 1. Scan all unscanned images in a DAM folder (or pass --rescan to re-analyze all)
 node $SKILL/scripts/facerec_cli.mjs scan-folder "<folder-url-or-dam-path>"
 node $SKILL/scripts/facerec_cli.mjs scan-folder "<folder-url-or-dam-path>" --rescan
