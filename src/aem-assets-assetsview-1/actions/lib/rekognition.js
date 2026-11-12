@@ -1,5 +1,149 @@
+const crypto = require('crypto');
 const { PublicError } = require('./security');
 const { withRetry, isRetryableAwsError } = require('./retry');
+
+const stsRoleCache = new Map();
+
+function hmacSha256(key, data) {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
+
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+function extractXmlTag(xml, tag) {
+  const m = String(xml || '').match(new RegExp(`<${tag}>([^<]+)</${tag}>`));
+  return m ? m[1].trim() : '';
+}
+
+/**
+ * Assumes a customer cross-account IAM Role via AWS STS (`AssumeRole`, SigV4 signed)
+ * and caches the temporary session credentials until 2 minutes before expiration (`S8`).
+ */
+async function assumeIamRole({
+  roleArn,
+  externalId = '',
+  region = 'us-east-1',
+  accessKeyId = '',
+  secretAccessKey = '',
+  sessionToken = '',
+  fetchImpl = global.fetch
+} = {}) {
+  const cleanRoleArn = String(roleArn || '').trim();
+  if (!cleanRoleArn) {
+    throw new PublicError('An AWS IAM Role ARN is required when IAM Role authentication is enabled.');
+  }
+  const cleanExternalId = String(externalId || '').trim();
+  const cacheKey = `${cleanRoleArn}|${cleanExternalId}|${region}`;
+  const now = Date.now();
+  const cached = stsRoleCache.get(cacheKey);
+  if (cached && cached.expiresAt > now + 120000) {
+    return cached.credentials;
+  }
+
+  const baseAccessKey = accessKeyId || process.env.AWS_ACCESS_KEY_ID || '';
+  const baseSecretKey = secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || '';
+  const baseSessionToken = sessionToken || process.env.AWS_SESSION_TOKEN || '';
+
+  if (!baseAccessKey || !baseSecretKey) {
+    throw new PublicError(
+      'AWS base credentials are required to assume the configured cross-account IAM Role.'
+    );
+  }
+
+  const host = `sts.${region}.amazonaws.com`;
+  const endpoint = `https://${host}/`;
+  const params = new URLSearchParams({
+    Action: 'AssumeRole',
+    Version: '2011-06-15',
+    RoleArn: cleanRoleArn,
+    RoleSessionName: 'aem-facerec-session',
+    DurationSeconds: '3600'
+  });
+  if (cleanExternalId) {
+    params.set('ExternalId', cleanExternalId);
+  }
+  const body = params.toString();
+
+  const isoNow = new Date(now).toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = isoNow.slice(0, 8);
+  const contentType = 'application/x-www-form-urlencoded; charset=utf-8';
+  const payloadHash = sha256Hex(body);
+
+  const canonicalHeaders =
+    `content-type:${contentType}\n` +
+    `host:${host}\n` +
+    `x-amz-date:${isoNow}\n` +
+    (baseSessionToken ? `x-amz-security-token:${baseSessionToken}\n` : '');
+  const signedHeaders =
+    'content-type;host;x-amz-date' + (baseSessionToken ? ';x-amz-security-token' : '');
+
+  const canonicalRequest = [
+    'POST',
+    '/',
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join('\n');
+
+  const credentialScope = `${dateStamp}/${region}/sts/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    isoNow,
+    credentialScope,
+    sha256Hex(canonicalRequest)
+  ].join('\n');
+
+  const kDate = hmacSha256(`AWS4${baseSecretKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, 'sts');
+  const kSigning = hmacSha256(kService, 'aws4_request');
+  const signature = crypto
+    .createHmac('sha256', kSigning)
+    .update(stringToSign, 'utf8')
+    .digest('hex');
+
+  const authorization =
+    `AWS4-HMAC-SHA256 Credential=${baseAccessKey}/${credentialScope}, ` +
+    `SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const headers = {
+    'Content-Type': contentType,
+    Host: host,
+    'X-Amz-Date': isoNow,
+    Authorization: authorization
+  };
+  if (baseSessionToken) {
+    headers['X-Amz-Security-Token'] = baseSessionToken;
+  }
+
+  const res = await fetchImpl(endpoint, { method: 'POST', headers, body });
+  const xml = await res.text();
+  if (!res.ok) {
+    const msg = extractXmlTag(xml, 'Message') || `HTTP ${res.status}`;
+    throw new PublicError(`AWS STS AssumeRole failed: ${msg}`, 502);
+  }
+
+  const assumedAccessKeyId = extractXmlTag(xml, 'AccessKeyId');
+  const assumedSecretAccessKey = extractXmlTag(xml, 'SecretAccessKey');
+  const assumedSessionToken = extractXmlTag(xml, 'SessionToken');
+  const expirationStr = extractXmlTag(xml, 'Expiration');
+
+  if (!assumedAccessKeyId || !assumedSecretAccessKey) {
+    throw new PublicError('AWS STS AssumeRole response did not contain temporary credentials.', 502);
+  }
+
+  const expiresAt = expirationStr ? Date.parse(expirationStr) || now + 3300000 : now + 3300000;
+  const credentials = {
+    accessKeyId: assumedAccessKeyId,
+    secretAccessKey: assumedSecretAccessKey,
+    sessionToken: assumedSessionToken
+  };
+  stsRoleCache.set(cacheKey, { credentials, expiresAt });
+  return credentials;
+}
 
 // Errors that mean "nothing to match against yet" (empty collection, face or user vectors
 // not ready). Anything else, notably throttling, must NOT be treated as "no match", or every
@@ -82,8 +226,37 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
   const collectionId = settings.collectionId || 'aem-assets-faces';
   const similarityThreshold = Number(settings.similarityThreshold ?? 85);
 
-  function getClient() {
+  async function getClient() {
     if (customClient) return customClient;
+    const region = settings.awsRegion || 'us-east-1';
+
+    if (settings.awsAuthMode === 'iamRole' || (settings.awsRoleArn && !settings.awsAccessKeyId)) {
+      if (!settings.awsRoleArn) {
+        throw new PublicError(
+          'AWS IAM Role ARN is not configured. Please provide your IAM Role ARN in the Face Recognition Settings tab.'
+        );
+      }
+      const assumedCreds = retryOptions.stsAssumeRole
+        ? await retryOptions.stsAssumeRole({
+            roleArn: settings.awsRoleArn,
+            externalId: settings.awsExternalId || '',
+            region
+          })
+        : await assumeIamRole({
+            roleArn: settings.awsRoleArn,
+            externalId: settings.awsExternalId || '',
+            region,
+            accessKeyId: settings.awsAccessKeyId,
+            secretAccessKey: settings.awsSecretAccessKey,
+            fetchImpl: retryOptions.fetchImpl || global.fetch
+          });
+      return new RekognitionClient({
+        maxAttempts: 1,
+        region,
+        credentials: assumedCreds
+      });
+    }
+
     if (!settings.awsAccessKeyId || !settings.awsSecretAccessKey) {
       if (settings.awsSecretKeyUnreadable) {
         throw new PublicError(
@@ -91,13 +264,13 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
         );
       }
       throw new PublicError(
-        'AWS Rekognition credentials are not configured. Please provide your AWS Access Key ID and Secret Access Key in the Face Recognition Settings tab.'
+        'AWS Rekognition credentials are not configured. Please provide your AWS Access Key ID and Secret Access Key (or Cross-Account IAM Role ARN) in the Face Recognition Settings tab.'
       );
     }
     return new RekognitionClient({
       // Retries are handled by withRetry below so they are not multiplied by SDK retries
       maxAttempts: 1,
-      region: settings.awsRegion || 'us-east-1',
+      region,
       credentials: {
         accessKeyId: settings.awsAccessKeyId,
         secretAccessKey: settings.awsSecretAccessKey
@@ -105,13 +278,16 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
     });
   }
 
-  let cachedClient = null;
+  let cachedClientPromise = null;
   /**
    * Sends a Rekognition command, retrying throttling / transient errors with backoff.
    */
-  function send(command) {
-    if (!cachedClient) cachedClient = getClient();
-    return withRetry(() => cachedClient.send(command), {
+  async function send(command) {
+    if (!cachedClientPromise) {
+      cachedClientPromise = Promise.resolve().then(() => getClient());
+    }
+    const client = await cachedClientPromise;
+    return withRetry(() => client.send(command), {
       isRetryable: isRetryableAwsError,
       ...retryOptions
     });
@@ -361,6 +537,7 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
 
 module.exports = {
   createRekognitionService,
+  assumeIamRole,
   sanitizeExternalImageId,
   chunkArray
 };

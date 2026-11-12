@@ -152,10 +152,83 @@ function isWebInvocation(params = {}) {
   return Boolean(params.__ow_method || params.__ow_headers);
 }
 
+const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,127}$/;
+
 function extractBearerToken(params = {}) {
   const headers = params.__ow_headers || {};
   const auth = headers.authorization || headers.Authorization || '';
   return String(auth).replace(/^Bearer\s+/i, '').trim();
+}
+
+/**
+ * Extracts the IMS Org ID claim (`org` / `imsOrg` / `ims_org_id`) from a JWT Bearer token
+ * if the token is a well-formed 3-part JWT. Returns '' for opaque tokens.
+ */
+function extractImsOrgFromJwt(bearerToken = '') {
+  const raw = String(bearerToken || '').trim();
+  if (!raw) return '';
+  const parts = raw.split('.');
+  if (parts.length !== 3) return '';
+  try {
+    const payloadJson = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const payload = JSON.parse(payloadJson);
+    const org = payload?.org || payload?.imsOrg || payload?.ims_org_id || '';
+    return typeof org === 'string' ? org.trim() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * Normalizes an IMS Org ID (e.g. `4A603BC061E191130A495FEF@AdobeOrg`) into a safe storage
+ * partition slug (`4a603bc061e191130a495fef_adobeorg`).
+ */
+function sanitizeTenantId(imsOrgId = '') {
+  const raw = String(imsOrgId || '').trim().toLowerCase();
+  if (!raw) return '';
+  const slug = raw
+    .replace(/@/g, '_')
+    .replace(/[^a-z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+    .slice(0, 128);
+  return TENANT_ID_PATTERN.test(slug) ? slug : '';
+}
+
+/**
+ * Resolves and verifies the caller's tenant IMS Org ID (`S11`).
+ * - Cross-checks the `x-gw-ims-org-id` header against the JWT `org` claim when both are present,
+ *   rejecting any mismatch with 403 Forbidden so a tenant cannot spoof another org's header.
+ * - Extracts `imsOrgId` from Adobe I/O Events envelopes when invoked via webhook.
+ */
+function resolveTenantOrg(params = {}, bearerToken = '') {
+  const headers = params.__ow_headers || {};
+  const headerOrg = String(
+    headers['x-gw-ims-org-id'] || headers['X-GW-IMS-Org-Id'] || ''
+  ).trim();
+  const jwtOrg = extractImsOrgFromJwt(bearerToken);
+
+  if (jwtOrg && headerOrg && jwtOrg.toLowerCase() !== headerOrg.toLowerCase()) {
+    throw new PublicError(
+      'IMS Organization header does not match authenticated token organization.',
+      403
+    );
+  }
+
+  const evt = params.event || params.data || {};
+  const eventOrg = String(
+    evt.imsOrgId ||
+      evt['xdmEventEnvelope:imsOrgId'] ||
+      params.imsOrgId ||
+      params.DEFAULT_IMS_ORG ||
+      ''
+  ).trim();
+
+  const imsOrgId = jwtOrg || headerOrg || eventOrg || '';
+  return {
+    imsOrgId,
+    tenantId: sanitizeTenantId(imsOrgId)
+  };
 }
 
 /**
@@ -194,5 +267,8 @@ module.exports = {
   isTruthyFlag,
   isWebInvocation,
   extractBearerToken,
+  extractImsOrgFromJwt,
+  sanitizeTenantId,
+  resolveTenantOrg,
   errorResponse
 };

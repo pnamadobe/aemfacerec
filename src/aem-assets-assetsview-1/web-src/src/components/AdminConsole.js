@@ -269,11 +269,14 @@ export default function AdminConsole() {
   const [activeGroupHasMoreFaces, setActiveGroupHasMoreFaces] = useState(false);
   const [loadingMoreFaces, setLoadingMoreFaces] = useState(false);
   const [settings, setSettings] = useState({
+    awsAuthMode: 'accessKey',
     awsRegion: 'us-east-1',
     awsAccessKeyId: '',
     awsSecretAccessKey: '',
     awsSecretKeyMasked: '',
     hasAwsSecretKey: false,
+    awsRoleArn: '',
+    awsExternalId: '',
     collectionId: 'aem-assets-faces',
     similarityThreshold: 85,
     metadataProperty: 'xdm:faceNames',
@@ -1367,10 +1370,23 @@ export default function AdminConsole() {
                         Customer AWS Rekognition Credentials (BYOK)
                       </Heading>
                       <Text UNSAFE_style={{ color: '#475569', fontSize: 13 }}>
-                        Supply your AWS account credentials for Rekognition Collections. The
-                        Secret Access Key is encrypted with AES-256-GCM at rest in App Builder
-                        storage and never returned in plaintext.
+                        Supply your AWS account credentials or a Cross-Account IAM Role for
+                        Rekognition Collections. Secrets are encrypted with per-tenant
+                        HKDF AES-256-GCM at rest in App Builder storage and never returned in
+                        plaintext.
                       </Text>
+
+                      <Picker
+                        label="AWS Authentication Method"
+                        selectedKey={settings.awsAuthMode || 'accessKey'}
+                        onSelectionChange={(key) =>
+                          setSettings((s) => ({ ...s, awsAuthMode: String(key) }))
+                        }
+                        width="100%"
+                      >
+                        <Item key="accessKey">IAM Access Key ID & Secret Key (BYOK)</Item>
+                        <Item key="iamRole">Cross-Account IAM Role (STS AssumeRole)</Item>
+                      </Picker>
 
                       <TextField
                         label="AWS Region"
@@ -1379,6 +1395,25 @@ export default function AdminConsole() {
                         placeholder="us-east-1"
                         width="100%"
                       />
+
+                      {settings.awsAuthMode === 'iamRole' && (
+                        <>
+                          <TextField
+                            label="Cross-Account AWS IAM Role ARN"
+                            value={settings.awsRoleArn || ''}
+                            onChange={(v) => setSettings((s) => ({ ...s, awsRoleArn: v }))}
+                            placeholder="arn:aws:iam::123456789012:role/AemFaceRecognitionRole"
+                            width="100%"
+                          />
+                          <TextField
+                            label="IAM Role External ID (optional)"
+                            value={settings.awsExternalId || ''}
+                            onChange={(v) => setSettings((s) => ({ ...s, awsExternalId: v }))}
+                            placeholder="aem-facerec-external-id"
+                            width="100%"
+                          />
+                        </>
+                      )}
 
                       <TextField
                         label="AWS Access Key ID"

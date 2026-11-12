@@ -6,10 +6,13 @@ const {
   PublicError,
   assertDamPath,
   isValidMetadataProperty,
-  requireEncryptionSecret
+  requireEncryptionSecret,
+  sanitizeTenantId
 } = require('./security');
 
 const AWS_REGION_PATTERN = /^[a-z]{2}(-gov)?-[a-z]+-\d$/;
+const AWS_ROLE_ARN_PATTERN = /^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
+const AWS_EXTERNAL_ID_PATTERN = /^[\w+=,.@:/-]{2,1224}$/;
 const COLLECTION_ID_PATTERN = /^[a-zA-Z0-9_.\-]{1,255}$/;
 const FACE_ID_PATTERN = /^[a-zA-Z0-9_.\-:]{1,128}$/;
 const EVENT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -35,9 +38,12 @@ function assertSafeFaceId(faceId) {
 }
 
 const DEFAULT_SETTINGS = {
+  awsAuthMode: 'accessKey',
   awsRegion: 'us-east-1',
   awsAccessKeyId: '',
   awsSecretAccessKeyEncrypted: '',
+  awsRoleArn: '',
+  awsExternalId: '',
   collectionId: 'aem-assets-faces',
   similarityThreshold: 85,
   metadataProperty: 'xdm:faceNames',
@@ -70,29 +76,65 @@ const MIME_TYPE_PATTERN = /^image\/[a-z0-9][a-z0-9.+-]{0,99}$/;
 const CURATOR_GROUP_PATTERN = /^[a-zA-Z0-9_.\-: ]{1,128}$/;
 
 /**
- * Encrypts a plaintext string using AES-256-GCM with a key derived from secret.
+ * Derives an AES-256-GCM key using HKDF-SHA256 bound to the tenantId when present (`S4`/`S11`),
+ * or legacy SHA-256 when `useLegacySha256` is true.
  */
-function encryptSecret(plaintext, secret) {
+function deriveAesKey(secret, tenantId = '', { useLegacySha256 = false } = {}) {
+  if (useLegacySha256 || !tenantId) {
+    return crypto.createHash('sha256').update(String(secret)).digest();
+  }
+  return Buffer.from(
+    crypto.hkdfSync(
+      'sha256',
+      Buffer.from(String(secret), 'utf8'),
+      Buffer.from(String(tenantId), 'utf8'),
+      Buffer.from('aem-facerec-aes-256-gcm-v2', 'utf8'),
+      32
+    )
+  );
+}
+
+/**
+ * Encrypts a plaintext string using AES-256-GCM with an HKDF-derived per-tenant key (`v2:...`)
+ * or legacy SHA-256 key when no tenantId is provided.
+ */
+function encryptSecret(plaintext, secret, tenantId = '') {
   if (!secret) throw new Error('An encryption secret is required.');
   if (!plaintext) return '';
-  const key = crypto.createHash('sha256').update(String(secret)).digest();
+  const cleanTenant = sanitizeTenantId(tenantId);
+  const key = deriveAesKey(secret, cleanTenant);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
+  if (cleanTenant) {
+    return `v2:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+  }
   return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
 /**
- * Decrypts a string encrypted by encryptSecret.
+ * Decrypts a string encrypted by encryptSecret (supports both `v2:` HKDF per-tenant format
+ * and legacy 3-part SHA-256 format).
  */
-function decryptSecret(payload, secret) {
+function decryptSecret(payload, secret, tenantId = '') {
   if (!secret) throw new Error('An encryption secret is required.');
   if (!payload) return '';
-  const parts = payload.split(':');
-  if (parts.length !== 3) return '';
-  const [ivHex, authTagHex, encryptedHex] = parts;
-  const key = crypto.createHash('sha256').update(String(secret)).digest();
+  const cleanTenant = sanitizeTenantId(tenantId);
+  const parts = String(payload).split(':');
+  let ivHex;
+  let authTagHex;
+  let encryptedHex;
+  let key;
+  if (parts.length === 4 && parts[0] === 'v2') {
+    [, ivHex, authTagHex, encryptedHex] = parts;
+    key = deriveAesKey(secret, cleanTenant);
+  } else if (parts.length === 3) {
+    [ivHex, authTagHex, encryptedHex] = parts;
+    key = deriveAesKey(secret, '', { useLegacySha256: true });
+  } else {
+    return '';
+  }
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
   decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
   const decrypted = Buffer.concat([
@@ -116,6 +158,7 @@ async function createStorage(options = {}) {
   const encryptionKey = requireEncryptionSecret(
     options.encryptionSecret || process.env.ENCRYPTION_SECRET
   );
+  const tenantId = sanitizeTenantId(options.tenantId || '');
 
   let backend = options.backend || null;
 
@@ -218,7 +261,9 @@ async function createStorage(options = {}) {
         }
         return stateClientPromise;
       };
-      const LOCK_KEY = 'facerec_db_lease_lock_v1';
+      const LOCK_KEY = tenantId
+        ? `facerec_db_lease_lock_v1_${tenantId.slice(0, 64)}`
+        : 'facerec_db_lease_lock_v1';
       backend.acquireLease = async (ownerId, ttlSeconds = 60) => {
         const state = await getStateClient();
         if (!state) return true;
@@ -243,7 +288,8 @@ async function createStorage(options = {}) {
       backend.claimIdempotencyKey = async (eventKey, ttlSeconds = 86400) => {
         const state = await getStateClient();
         if (!state) return true;
-        const safeKey = `facerec_evt_${crypto.createHash('sha256').update(String(eventKey)).digest('hex').slice(0, 40)}`;
+        const scopedEventKey = tenantId ? `${tenantId}:${eventKey}` : String(eventKey);
+        const safeKey = `facerec_evt_${crypto.createHash('sha256').update(scopedEventKey).digest('hex').slice(0, 40)}`;
         const res = await state.put(safeKey, new Date().toISOString(), {
           ttl: Math.max(60, Math.ceil(ttlSeconds)),
           ifNotExists: true
@@ -288,7 +334,8 @@ async function createStorage(options = {}) {
         }
       },
       async acquireLease(ownerId, ttlSeconds = 60) {
-        const lockDir = path.join(baseDir, 'db/.lease.lock');
+        const lockRel = tenantId ? `tenants/${tenantId}/db/.lease.lock` : 'db/.lease.lock';
+        const lockDir = path.join(baseDir, lockRel);
         fs.mkdirSync(path.dirname(lockDir), { recursive: true });
         try {
           fs.mkdirSync(lockDir);
@@ -312,7 +359,8 @@ async function createStorage(options = {}) {
         }
       },
       async releaseLease(ownerId) {
-        const lockDir = path.join(baseDir, 'db/.lease.lock');
+        const lockRel = tenantId ? `tenants/${tenantId}/db/.lease.lock` : 'db/.lease.lock';
+        const lockDir = path.join(baseDir, lockRel);
         try {
           const info = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
           if (!info.ownerId || info.ownerId === ownerId) {
@@ -326,21 +374,65 @@ async function createStorage(options = {}) {
   }
 
   /**
+   * Resolves the storage prefix for `tenantId` (`S11`):
+   * - If `tenantId` is empty, uses root (`""`).
+   * - If `tenants/<tenantId>/...` already exists, uses `"tenants/<tenantId>/"`.
+   * - If legacy root `db/groups.json` or `db/settings.json` exists and `db/.owner-tenant` is
+   *   unset (or matches `tenantId`), binds root `db/` to that primary tenant while isolating
+   *   any other tenant under `"tenants/<tenantId>/"`.
+   */
+  let resolvedPrefixPromise = null;
+  async function getTenantPrefix() {
+    if (!tenantId) return '';
+    if (!resolvedPrefixPromise) {
+      resolvedPrefixPromise = (async () => {
+        const tenantSettings = await backend.readText(`tenants/${tenantId}/db/settings.json`);
+        if (tenantSettings !== null) return `tenants/${tenantId}/`;
+        const tenantGroups = await backend.readText(`tenants/${tenantId}/db/groups.json`);
+        if (tenantGroups !== null) return `tenants/${tenantId}/`;
+
+        const ownerRaw = await backend.readText('db/.owner-tenant');
+        const owner = ownerRaw ? ownerRaw.trim() : '';
+        if (owner === tenantId) return '';
+        if (owner && owner !== tenantId) return `tenants/${tenantId}/`;
+
+        const [rootGroups, rootSettings] = await Promise.all([
+          backend.readText('db/groups.json'),
+          backend.readText('db/settings.json')
+        ]);
+        if (rootGroups !== null || rootSettings !== null) {
+          await backend.writeText('db/.owner-tenant', tenantId);
+          return '';
+        }
+        return `tenants/${tenantId}/`;
+      })();
+    }
+    return resolvedPrefixPromise;
+  }
+
+  async function scopedPath(relPath) {
+    const prefix = await getTenantPrefix();
+    return `${prefix}${relPath}`;
+  }
+
+  /**
    * Reads a JSON document. A missing document yields `defaultValue`; an unreadable or corrupt
    * document THROWS, so a transient storage error can never be persisted back as an empty DB.
    */
   async function readJson(filePath, defaultValue) {
-    const raw = await backend.readText(filePath);
+    const targetPath = await scopedPath(filePath);
+    const raw = await backend.readText(targetPath);
     if (raw === null || raw === undefined || raw === '') return structuredClone(defaultValue);
     try {
       return JSON.parse(raw);
     } catch (e) {
-      throw new Error(`Stored document ${filePath} is corrupt and could not be parsed.`);
+      throw new Error(`Stored document ${targetPath} is corrupt and could not be parsed.`);
     }
   }
 
   async function writeJson(filePath, data) {
-    await backend.writeText(filePath, JSON.stringify(data));
+    const targetPath = await scopedPath(filePath);
+    await backend.writeText(targetPath, JSON.stringify(data));
   }
 
   // Serializes mutations inside the same Node process and coordinates across processes/containers
@@ -453,7 +545,23 @@ async function createStorage(options = {}) {
     return { merged, changed };
   }
 
+  function serializeFacesForDisk(facesMap = {}) {
+    const out = {};
+    for (const [k, face] of Object.entries(facesMap || {})) {
+      if (face && face.avatarStoredExternally && face.avatarDataUrl) {
+        const { avatarDataUrl, ...rest } = face;
+        out[k] = rest;
+      } else {
+        out[k] = face;
+      }
+    }
+    return out;
+  }
+
   return {
+    tenantId: tenantId || null,
+    getTenantPrefix,
+
     async getAssetsMap() {
       return readJson('db/assets.json', {});
     },
@@ -526,7 +634,7 @@ async function createStorage(options = {}) {
 
         if (!base) {
           // Full replacement (e.g. clearAllData / seedDemoData / unit-test seed)
-          if (db.faces) await writeJson('db/faces.json', db.faces);
+          if (db.faces) await writeJson('db/faces.json', serializeFacesForDisk(db.faces));
           if (db.groups) await writeJson('db/groups.json', db.groups);
           if (db.assets) await writeJson('db/assets.json', db.assets);
           if (db.counters) await writeJson('db/counters.json', db.counters);
@@ -592,7 +700,9 @@ async function createStorage(options = {}) {
 
         // Write in dependency order (faces -> groups -> assets -> counters) and only for
         // collections that actually changed.
-        if (facesDiff.changed) await writeJson('db/faces.json', facesDiff.merged);
+        if (facesDiff.changed) {
+          await writeJson('db/faces.json', serializeFacesForDisk(facesDiff.merged));
+        }
         if (groupsDiff.changed) await writeJson('db/groups.json', groupsDiff.merged);
         if (assetsDiff.changed) await writeJson('db/assets.json', assetsDiff.merged);
         if (countersChanged) await writeJson('db/counters.json', mergedCounters);
@@ -673,7 +783,11 @@ async function createStorage(options = {}) {
       let secretUnreadable = false;
       if (merged.awsSecretAccessKeyEncrypted) {
         try {
-          decryptedSecret = decryptSecret(merged.awsSecretAccessKeyEncrypted, encryptionKey);
+          decryptedSecret = decryptSecret(
+            merged.awsSecretAccessKeyEncrypted,
+            encryptionKey,
+            tenantId
+          );
         } catch (e) {
           // Encrypted with a different ENCRYPTION_SECRET (e.g. after key rotation). Treat as
           // not configured so the admin can re-enter it, instead of failing every request.
@@ -685,17 +799,24 @@ async function createStorage(options = {}) {
 
       const effectiveAccessKeyId =
         merged.awsAccessKeyId || process.env.AWS_ACCESS_KEY_ID || '';
+      const awsAuthMode = merged.awsAuthMode === 'iamRole' ? 'iamRole' : 'accessKey';
+      const awsRoleArn = String(merged.awsRoleArn || process.env.AWS_ROLE_ARN || '').trim();
+      const awsExternalId = String(merged.awsExternalId || process.env.AWS_EXTERNAL_ID || '').trim();
 
       const result = {
+        tenantId: tenantId || null,
+        awsAuthMode,
         awsRegion: merged.awsRegion || process.env.AWS_REGION || 'us-east-1',
         awsAccessKeyId: effectiveAccessKeyId,
-        hasAwsSecretKey: Boolean(decryptedSecret),
+        hasAwsSecretKey: Boolean(decryptedSecret || (awsAuthMode === 'iamRole' && awsRoleArn)),
         awsSecretKeyUnreadable: secretUnreadable,
         awsSecretKeyMasked: maskSecret(decryptedSecret),
+        awsRoleArn,
+        awsExternalId,
         collectionId:
           merged.collectionId ||
           process.env.REKOGNITION_COLLECTION_ID ||
-          'aem-assets-faces',
+          (tenantId ? `aem-faces-${tenantId.slice(0, 48)}` : 'aem-assets-faces'),
         similarityThreshold: Number(merged.similarityThreshold ?? 85),
         metadataProperty: merged.metadataProperty || 'xdm:faceNames',
         enableSecondaryMetadataProperty: Boolean(
@@ -734,6 +855,28 @@ async function createStorage(options = {}) {
       const currentRaw = await readJson('db/settings.json', {});
       const updated = { ...DEFAULT_SETTINGS, ...currentRaw };
 
+      if (newSettings.awsAuthMode !== undefined) {
+        if (!['accessKey', 'iamRole'].includes(newSettings.awsAuthMode)) {
+          throw new PublicError("Invalid awsAuthMode. Use 'accessKey' or 'iamRole'.");
+        }
+        updated.awsAuthMode = newSettings.awsAuthMode;
+      }
+      if (typeof newSettings.awsRoleArn === 'string') {
+        const arn = newSettings.awsRoleArn.trim();
+        if (arn && !AWS_ROLE_ARN_PATTERN.test(arn)) {
+          throw new PublicError(
+            'Invalid AWS IAM Role ARN. Expected format: arn:aws:iam::<12-digit-account-id>:role/<role-name>.'
+          );
+        }
+        updated.awsRoleArn = arn;
+      }
+      if (typeof newSettings.awsExternalId === 'string') {
+        const extId = newSettings.awsExternalId.trim();
+        if (extId && !AWS_EXTERNAL_ID_PATTERN.test(extId)) {
+          throw new PublicError('Invalid AWS External ID.');
+        }
+        updated.awsExternalId = extId;
+      }
       if (typeof newSettings.awsRegion === 'string' && newSettings.awsRegion.trim()) {
         const region = newSettings.awsRegion.trim();
         if (!AWS_REGION_PATTERN.test(region)) {
@@ -751,7 +894,8 @@ async function createStorage(options = {}) {
       ) {
         updated.awsSecretAccessKeyEncrypted = encryptSecret(
           newSettings.awsSecretAccessKey.trim(),
-          encryptionKey
+          encryptionKey,
+          tenantId
         );
       }
       if (typeof newSettings.collectionId === 'string' && newSettings.collectionId.trim()) {
@@ -854,17 +998,47 @@ async function createStorage(options = {}) {
     },
 
     async saveAvatar(faceId, buffer) {
-      const filePath = `avatars/${assertSafeFaceId(faceId)}.jpg`;
-      await backend.writeBuffer(filePath, buffer);
-      return filePath;
+      const relPath = `avatars/${assertSafeFaceId(faceId)}.jpg`;
+      const targetPath = await scopedPath(relPath);
+      await backend.writeBuffer(targetPath, buffer);
+      return relPath;
     },
 
     async getAvatar(faceId) {
-      return backend.readBuffer(`avatars/${assertSafeFaceId(faceId)}.jpg`);
+      const relPath = `avatars/${assertSafeFaceId(faceId)}.jpg`;
+      const targetPath = await scopedPath(relPath);
+      return backend.readBuffer(targetPath);
     },
 
     async deleteAvatar(faceId) {
-      await backend.deleteFile(`avatars/${assertSafeFaceId(faceId)}.jpg`);
+      const relPath = `avatars/${assertSafeFaceId(faceId)}.jpg`;
+      const targetPath = await scopedPath(relPath);
+      await backend.deleteFile(targetPath);
+    },
+
+    /**
+     * Hydrates `avatarDataUrl` on-demand from `avatars/<faceId>.jpg` for a slice of face records
+     * (`P1` — allows `db/faces.json` on disk to omit inline base64 strings while keeping
+     * paged UI responses identical).
+     */
+    async hydrateFaceAvatars(facesList = []) {
+      const toHydrate = (facesList || []).filter(
+        (f) => f && !f.avatarDataUrl && f.faceId && FACE_ID_PATTERN.test(String(f.faceId))
+      );
+      if (toHydrate.length === 0) return facesList;
+      await Promise.all(
+        toHydrate.map(async (f) => {
+          try {
+            const buf = await this.getAvatar(f.faceId);
+            if (buf && buf.length > 0) {
+              f.avatarDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+            }
+          } catch (e) {
+            // ignore missing avatar file
+          }
+        })
+      );
+      return facesList;
     }
   };
 }

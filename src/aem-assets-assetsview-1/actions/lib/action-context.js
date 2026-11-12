@@ -8,6 +8,7 @@ const {
   PublicError,
   resolveAemHost,
   extractBearerToken,
+  resolveTenantOrg,
   isWebInvocation,
   isRuntimeEnvironment,
   isTruthyFlag
@@ -101,9 +102,13 @@ function buildActionContext(params = {}) {
       ? { scJson: params.AEM_SC_JSON || '', devToken: params.AEM_DEV_TOKEN || '' }
       : null;
 
+  const { imsOrgId, tenantId } = resolveTenantOrg(params, token);
+
   return {
     aemHost,
     token,
+    imsOrgId,
+    tenantId,
     serviceCredentials,
     encryptionSecret,
     isWeb,

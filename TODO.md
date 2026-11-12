@@ -112,3 +112,30 @@ When a user uploads an image attachment into a Coworker chat, the file is mounte
 - [ ] **Step 3 (`AdminConsole.js` & `api.js`)**: Add `api.searchFacesByImage` and the **"Find by Photo"** upload button + match result banner in the Face Management Console.
 - [ ] **Step 4 (`SKILL.md` & `facerec_cli.mjs`)**: Add Workflow 5 (`search-by-image <file-or-url>`) to `SKILL.md` and `facerec_cli.mjs` with automatic Pillow downscaling (`<= 640px` JPEG) and AEM-relayed fallback instructions.
 - [ ] **Step 5 (Tests & Docs)**: Add unit and UI tests for single-face match, multi-face query image, no-match photo, oversized payload rejection, and update `README.md` / `SETUP.md` IAM policy with `rekognition:SearchUsersByImage` and `rekognition:SearchFacesByImage`.
+
+---
+
+## 3. Adobe Exchange Multi-Tenant & Enterprise Readiness — ✅ Completed
+
+### Phase 1 — Multi-Tenant Org Isolation (`S11`)
+- [x] **Verified IMS Org Resolution (`security.js` & `action-context.js`)**:
+  - Extract the caller's IMS Org ID (`imsOrgId`) from the verified JWT payload in `Authorization: Bearer <token>` and cross-check against `x-gw-ims-org-id` so tenants can never spoof another org's header (`403 Forbidden`).
+  - Resolve `imsOrgId` on Adobe I/O Events webhook deliveries from the event envelope (falling back to the default deployment org for single-tenant compatibility).
+- [x] **Tenant-Partitioned Storage & Locks (`storage.js`)**:
+  - Partition all storage paths under `tenants/<sanitizedOrgId>/db/*.json` and `tenants/<sanitizedOrgId>/avatars/*.jpg` (with automatic owner binding for existing root `db/*.json` data).
+  - Partition distributed lease locks (`facerec_db_lease_lock_v1_<sanitizedOrgId>`) and event idempotency keys per tenant.
+  - Derive per-tenant AES-256-GCM encryption keys via HKDF (`crypto.hkdfSync('sha256', ENCRYPTION_SECRET, tenantOrgId, ...)`).
+
+### Phase 2 — Cross-Account AWS IAM Role Assumption (`S8`)
+- [x] **STS `AssumeRole` Support (`rekognition.js`, `storage.js`, `AdminConsole.js`)**:
+  - Support `awsAuthMode: 'iamRole' | 'accessKey'` in Settings.
+  - When `'iamRole'` is selected, accept `awsRoleArn` + per-tenant `awsExternalId` and obtain short-lived credentials via AWS STS `AssumeRole` (SigV4 signed & cached until 2 minutes before expiry) so no long-lived AWS secret key is stored in the publisher namespace.
+
+### Phase 3 — Storage & Memory Scaling Past 10k+ Faces (`P1`)
+- [x] **Externalize Base64 Avatars from `db/faces.json` (`storage.js` & `face-service.js`)**:
+  - Store avatar bytes only in `tenants/<orgId>/avatars/<faceId>.jpg` and omit inline `avatarDataUrl` from `db/faces.json` on disk (shrinking `db/faces.json` by ~85%).
+  - Hydrate `coverAvatarDataUrl` / `avatarDataUrl` on-demand only for the current page of results (`<= 60` items) returned by `listGroups`, `getGroup`, `listGroupOptions`, and `getAssetFaces`.
+
+### Phase 4 — Adobe Exchange Packaging & Auth Gate (`S1` / Exchange Submission)
+- [x] **Enforce `require-adobe-auth: true`** on `groups` and `settings` web actions and validate with 153 automated tests.
+

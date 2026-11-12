@@ -80,7 +80,10 @@ async function main(params = {}) {
 
   try {
     const ctx = buildActionContext(params);
-    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
+    const storage = await createStorage({
+      encryptionSecret: ctx.encryptionSecret,
+      tenantId: ctx.tenantId
+    });
     const faceService = await createFaceService({
       aemHost: ctx.aemHost,
       token: ctx.token,

@@ -268,3 +268,198 @@ test('S10: groups Runtime action exposes deleteGroup and validates groupId', asy
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// S11: Multi-tenant storage & HKDF encryption isolation + JWT org anti-spoofing
+// ---------------------------------------------------------------------------
+
+test('S11: two tenant orgs in the same storage backend are strictly isolated and use distinct HKDF keys', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aem-facerec-mt-'));
+  try {
+    const { encryptSecret, decryptSecret } = require('../actions/lib/storage');
+    const { resolveTenantOrg } = require('../actions/lib/security');
+    const masterSecret = 'enterprise-master-encryption-secret-32b';
+
+    // 1. HKDF per-tenant encryption: Tenant B cannot decrypt Tenant A's secret
+    const cipherA = encryptSecret('aws-secret-A', masterSecret, 'TENANT_A@AdobeOrg');
+    assert.ok(cipherA.startsWith('v2:'));
+    assert.equal(decryptSecret(cipherA, masterSecret, 'TENANT_A@AdobeOrg'), 'aws-secret-A');
+    assert.throws(() => decryptSecret(cipherA, masterSecret, 'TENANT_B@AdobeOrg'));
+
+    // 2. Storage isolation between Tenant A and Tenant B
+    const storageA = await createStorage({
+      localDir: dir,
+      encryptionSecret: masterSecret,
+      tenantId: 'TENANT_A@AdobeOrg'
+    });
+    const storageB = await createStorage({
+      localDir: dir,
+      encryptionSecret: masterSecret,
+      tenantId: 'TENANT_B@AdobeOrg'
+    });
+
+    await storageA.saveSettings({
+      collectionId: 'collection-tenant-a',
+      awsAccessKeyId: 'AKIA_TENANT_A',
+      awsSecretAccessKey: 'secret-tenant-a'
+    });
+    await storageB.saveSettings({
+      collectionId: 'collection-tenant-b',
+      awsAccessKeyId: 'AKIA_TENANT_B',
+      awsSecretAccessKey: 'secret-tenant-b'
+    });
+
+    await storageA.saveDatabase({
+      groups: { grp_a: { groupId: 'grp_a', name: 'Alice (Tenant A)', faceIds: ['f_a'] } },
+      faces: { f_a: { faceId: 'f_a', groupId: 'grp_a', assetId: 'a1' } },
+      assets: { a1: { assetId: 'a1', assetPath: '/content/dam/a.jpg', faceIds: ['f_a'] } },
+      counters: { nextPersonNumber: 2 }
+    });
+
+    const dbA = await storageA.getDatabase();
+    const dbB = await storageB.getDatabase();
+    assert.equal(Object.keys(dbA.groups).length, 1);
+    assert.equal(Object.keys(dbB.groups).length, 0, 'Tenant B must not see Tenant A groups');
+
+    const settingsA = await storageA.getSettings({ includeDecryptedSecret: true });
+    const settingsB = await storageB.getSettings({ includeDecryptedSecret: true });
+    assert.equal(settingsA.collectionId, 'collection-tenant-a');
+    assert.equal(settingsA.awsSecretAccessKey, 'secret-tenant-a');
+    assert.equal(settingsB.collectionId, 'collection-tenant-b');
+    assert.equal(settingsB.awsSecretAccessKey, 'secret-tenant-b');
+
+    // 3. Anti-spoofing: JWT with org=TENANT_A@AdobeOrg + header x-gw-ims-org-id=TENANT_B@AdobeOrg -> 403
+    const fakeJwt = [
+      Buffer.from(JSON.stringify({ alg: 'RS256' })).toString('base64url'),
+      Buffer.from(JSON.stringify({ org: 'TENANT_A@AdobeOrg', sub: 'user1' })).toString('base64url'),
+      'sig'
+    ].join('.');
+    assert.throws(
+      () =>
+        resolveTenantOrg(
+          { __ow_headers: { 'x-gw-ims-org-id': 'TENANT_B@AdobeOrg' } },
+          fakeJwt
+        ),
+      (err) => err instanceof PublicError && err.statusCode === 403
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// S8: Cross-Account AWS IAM Role Assumption (STS AssumeRole)
+// ---------------------------------------------------------------------------
+
+test('S8: assumeIamRole signs STS AssumeRole request with ExternalId and caches temporary credentials', async () => {
+  const { assumeIamRole } = require('../actions/lib/rekognition');
+  let stsCalls = 0;
+  let capturedBody = '';
+  let capturedHeaders = {};
+
+  const mockFetch = async (url, opts) => {
+    stsCalls++;
+    capturedBody = opts.body;
+    capturedHeaders = opts.headers;
+    const futureIso = new Date(Date.now() + 3600 * 1000).toISOString();
+    return {
+      ok: true,
+      status: 200,
+      text: async () => `
+        <AssumeRoleResponse>
+          <AssumeRoleResult>
+            <Credentials>
+              <AccessKeyId>ASIATEMPKEY123</AccessKeyId>
+              <SecretAccessKey>temp-secret-xyz</SecretAccessKey>
+              <SessionToken>temp-session-token-abc</SessionToken>
+              <Expiration>${futureIso}</Expiration>
+            </Credentials>
+          </AssumeRoleResult>
+        </AssumeRoleResponse>
+      `
+    };
+  };
+
+  const roleArn = 'arn:aws:iam::123456789012:role/CustomerFaceRecRole';
+  const creds1 = await assumeIamRole({
+    roleArn,
+    externalId: 'tenant-ext-id-99',
+    region: 'us-east-1',
+    accessKeyId: 'AKIABASE',
+    secretAccessKey: 'base-secret',
+    fetchImpl: mockFetch
+  });
+
+  assert.equal(stsCalls, 1);
+  assert.equal(creds1.accessKeyId, 'ASIATEMPKEY123');
+  assert.equal(creds1.secretAccessKey, 'temp-secret-xyz');
+  assert.equal(creds1.sessionToken, 'temp-session-token-abc');
+  assert.match(capturedBody, /Action=AssumeRole/);
+  assert.match(capturedBody, /ExternalId=tenant-ext-id-99/);
+  assert.match(capturedHeaders.Authorization, /^AWS4-HMAC-SHA256 Credential=AKIABASE\//);
+
+  // Second call uses the in-memory cache without hitting STS again
+  const creds2 = await assumeIamRole({
+    roleArn,
+    externalId: 'tenant-ext-id-99',
+    region: 'us-east-1',
+    accessKeyId: 'AKIABASE',
+    secretAccessKey: 'base-secret',
+    fetchImpl: mockFetch
+  });
+  assert.equal(stsCalls, 1);
+  assert.equal(creds2.accessKeyId, 'ASIATEMPKEY123');
+});
+
+// ---------------------------------------------------------------------------
+// P1: Externalized avatar storage on disk + on-demand hydration
+// ---------------------------------------------------------------------------
+
+test('P1: ingested faces omit inline avatarDataUrl in db/faces.json on disk and hydrate on demand', async () => {
+  const h = await createErasureHarness();
+  try {
+    const ingested = await h.svc.ingestAsset({
+      assetPath: '/content/dam/events/p1-external-avatar.jpg',
+      force: true
+    });
+    assert.equal(ingested.faces.length, 2);
+
+    // 1. On disk, db/faces.json must NOT contain inline base64 avatarDataUrl strings
+    const rawFacesDisk = JSON.parse(
+      fs.readFileSync(path.join(h.dir, 'db/faces.json'), 'utf8')
+    );
+    for (const faceRecord of Object.values(rawFacesDisk)) {
+      assert.equal(faceRecord.avatarStoredExternally, true);
+      assert.equal(
+        faceRecord.avatarDataUrl,
+        undefined,
+        'avatarDataUrl must be omitted from db/faces.json on disk'
+      );
+    }
+
+    // 2. Reading via getAssetFaces, listGroups, and getGroup hydrates avatarDataUrl from avatars/<faceId>.jpg
+    const freshSvc = await createFaceService({
+      storage: await createStorage({ localDir: h.dir, encryptionSecret: 'test-secret-key-for-erasure' }),
+      rekognitionClient: h.rekognitionClient,
+      aemClient: h.aemClient
+    });
+
+    const assetFaces = await freshSvc.getAssetFaces({
+      assetPath: '/content/dam/events/p1-external-avatar.jpg'
+    });
+    assert.ok(
+      assetFaces.faces.every(
+        (f) => typeof f.avatarDataUrl === 'string' && f.avatarDataUrl.startsWith('data:image/jpeg;base64,')
+      )
+    );
+
+    const listed = await freshSvc.listGroups();
+    assert.ok(
+      listed.groups.every(
+        (g) => typeof g.coverAvatarDataUrl === 'string' && g.coverAvatarDataUrl.startsWith('data:image/jpeg;base64,')
+      )
+    );
+  } finally {
+    h.cleanup();
+  }
+});

@@ -46,7 +46,10 @@ async function main(params = {}) {
       throw new PublicError(`Operation '${operation}' is disabled in this deployment.`, 403);
     }
 
-    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
+    const storage = await createStorage({
+      encryptionSecret: ctx.encryptionSecret,
+      tenantId: ctx.tenantId
+    });
     const aemClient = createAemClient({
       aemHost: ctx.aemHost,
       token: ctx.token,

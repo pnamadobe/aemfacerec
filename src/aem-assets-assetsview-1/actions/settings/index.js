@@ -38,7 +38,10 @@ async function main(params = {}) {
 
   try {
     const ctx = buildActionContext(params);
-    const storage = await createStorage({ encryptionSecret: ctx.encryptionSecret });
+    const storage = await createStorage({
+      encryptionSecret: ctx.encryptionSecret,
+      tenantId: ctx.tenantId
+    });
     const aemClient = createAemClient({
       aemHost: ctx.aemHost,
       token: ctx.token,
@@ -140,13 +143,21 @@ async function main(params = {}) {
     if (operation === 'testConnection') {
       // Save any provided credentials first so "Test Connection" also persists the keys
       const inputSettings = params.settings || {};
-      if (inputSettings.awsAccessKeyId || inputSettings.awsSecretAccessKey) {
+      if (
+        inputSettings.awsAccessKeyId ||
+        inputSettings.awsSecretAccessKey ||
+        inputSettings.awsRoleArn ||
+        inputSettings.awsAuthMode
+      ) {
         await storage.saveSettings(inputSettings);
       }
 
       const stored = await storage.getSettings({ includeDecryptedSecret: true });
 
       const testConfig = {
+        awsAuthMode: inputSettings.awsAuthMode || stored.awsAuthMode || 'accessKey',
+        awsRoleArn: inputSettings.awsRoleArn || stored.awsRoleArn || '',
+        awsExternalId: inputSettings.awsExternalId || stored.awsExternalId || '',
         awsRegion: inputSettings.awsRegion || stored.awsRegion,
         awsAccessKeyId: inputSettings.awsAccessKeyId || stored.awsAccessKeyId,
         awsSecretAccessKey:

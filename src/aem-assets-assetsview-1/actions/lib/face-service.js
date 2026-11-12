@@ -173,6 +173,7 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
 async function createFaceService({
   aemHost,
   token,
+  tenantId = '',
   serviceCredentials = null,
   encryptionSecret,
   storage: customStorage,
@@ -180,7 +181,7 @@ async function createFaceService({
   aemClient: customAemClient,
   retryOptions = {}
 } = {}) {
-  const storage = customStorage || (await createStorage({ encryptionSecret }));
+  const storage = customStorage || (await createStorage({ encryptionSecret, tenantId }));
   const aemClient =
     customAemClient || createAemClient({ aemHost, token, serviceCredentials });
 
@@ -665,6 +666,7 @@ async function createFaceService({
           confidence,
           matchConfidence,
           avatarFile,
+          avatarStoredExternally: Boolean(avatarFile),
           avatarDataUrl: avatar.dataUrl,
           createdAt: now
         };
@@ -1116,6 +1118,10 @@ async function createFaceService({
       }
 
       const db = await storage.getDatabase({ readOnly: true });
+      const rawFacesOnAsset = (assetRecord.faceIds || []).map((id) => db.faces[id]).filter(Boolean);
+      if (typeof storage.hydrateFaceAvatars === 'function') {
+        await storage.hydrateFaceAvatars(rawFacesOnAsset);
+      }
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
       const enrichedFaces = (assetRecord.faceIds || [])
         .map((id) => enrichFace(db.faces[id], db.groups))
@@ -1329,9 +1335,14 @@ async function createFaceService({
         .filter((g) => matchesGroupFilter(g, normalizedFilter, normalizedQuery))
         .sort(compareGroupSummaries);
 
-      const page = matched
-        .slice(pageOffset, pageOffset + pageLimit)
-        .map((g) => summarizeGroup(db.groups[g.groupId], db.faces));
+      const pageSlice = matched.slice(pageOffset, pageOffset + pageLimit);
+      if (typeof storage.hydrateFaceAvatars === 'function') {
+        const coverFaces = pageSlice
+          .map((g) => (g.coverFaceId ? db.faces[g.coverFaceId] : null))
+          .filter(Boolean);
+        await storage.hydrateFaceAvatars(coverFaces);
+      }
+      const page = pageSlice.map((g) => summarizeGroup(db.groups[g.groupId], db.faces));
 
       return {
         groups: page,
@@ -1369,8 +1380,17 @@ async function createFaceService({
         .filter((g) => g && matchesGroupFilter(g, 'all', normalizedQuery))
         .sort(compareGroupSummaries);
 
+      const sliced = matched.slice(0, optionLimit);
+      if (includeAvatars && typeof storage.hydrateFaceAvatars === 'function') {
+        const coverFaces = sliced
+          .slice(0, MAX_GROUP_OPTIONS_WITH_AVATARS)
+          .map((g) => (g.coverFaceId ? db.faces[g.coverFaceId] : null))
+          .filter(Boolean);
+        await storage.hydrateFaceAvatars(coverFaces);
+      }
+
       return {
-        options: matched.slice(0, optionLimit).map((g, idx) => {
+        options: sliced.map((g, idx) => {
           const item = {
             groupId: g.groupId,
             displayName: g.displayName,
@@ -1402,6 +1422,10 @@ async function createFaceService({
       const limit = clampInt(faceLimit, { min: 1, max: MAX_GROUP_FACES_PAGE_SIZE, fallback: GROUP_FACES_PAGE_SIZE });
       const memberFaces = (group.faceIds || []).map((id) => db.faces[id]).filter(Boolean);
       const facesPage = memberFaces.slice(offset, offset + limit);
+      if (typeof storage.hydrateFaceAvatars === 'function') {
+        const coverFace = group.coverFaceId ? db.faces[group.coverFaceId] : memberFaces[0];
+        await storage.hydrateFaceAvatars(coverFace ? [coverFace, ...facesPage] : facesPage);
+      }
 
       return {
         group: { ...summarizeGroup(group, db.faces), faces: facesPage },
