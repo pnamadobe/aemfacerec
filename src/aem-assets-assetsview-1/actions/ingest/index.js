@@ -3,7 +3,7 @@ const { createStorage } = require('../lib/storage');
 const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
 const { PublicError, isRuntimeEnvironment, errorResponse } = require('../lib/security');
 
-const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const CHALLENGE_PATTERN = /^[A-Za-z0-9_.\-+~=/]{1,512}$/;
 
 /**
  * Extracts assetPath and assetId from an Adobe I/O Events payload
@@ -146,6 +146,18 @@ async function main(params = {}) {
       };
     }
     if (!assetPath) {
+      if (ctx.isIoEvent) {
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: {
+            skipped: true,
+            assetPath: null,
+            reasonCode: 'missing-asset-path',
+            reason: 'Event payload did not include an assetPath and was ignored.'
+          }
+        };
+      }
       return {
         statusCode: 400,
         headers: corsHeaders,
@@ -176,15 +188,36 @@ async function main(params = {}) {
         };
       }
     }
-    const result = await faceService.ingestAsset({
-      assetPath,
-      assetId,
-      assetTitle: params.assetTitle,
-      mimeType,
-      force: isManualTrigger,
-      // Uploads (events) and the side panel's Re-scan always analyze; bulk actions pass rescan=false
-      rescan: parseFlag(params.rescan, true)
-    });
+
+    let result;
+    try {
+      result = await faceService.ingestAsset({
+        assetPath,
+        assetId,
+        assetTitle: params.assetTitle,
+        mimeType,
+        force: isManualTrigger,
+        // Uploads (events) and the side panel's Re-scan always analyze; bulk actions pass rescan=false
+        rescan: parseFlag(params.rescan, true)
+      });
+    } catch (ingestErr) {
+      // Adobe I/O Events marks a webhook registration UNSTABLE if deliveries return non-2XX.
+      // When an automatic I/O Event references a deleted/moved asset, non-DAM path, or
+      // un-renderable file (PublicError 4xx/502), acknowledge with 200 + skipped:true.
+      if (ctx.isIoEvent && !isManualTrigger && ingestErr && ingestErr.expose) {
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: {
+            skipped: true,
+            assetPath,
+            reasonCode: 'event-asset-skipped',
+            reason: ingestErr.message
+          }
+        };
+      }
+      throw ingestErr;
+    }
 
     return {
       statusCode: 200,

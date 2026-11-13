@@ -6,6 +6,8 @@ dist/
 .wskprops
 .aws.tmp.creds.json
 console.json
+*-Production.json
+*-Stage.json
 src/*/web-src/src/config.json
 *.log
 .DS_Store

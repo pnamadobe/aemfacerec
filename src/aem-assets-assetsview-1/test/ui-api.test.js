@@ -167,3 +167,31 @@ test('UI: scan summary text', () => {
   );
   assert.equal(describeScanSummary(summarizeScanResults([])), 'Analyzed 0 image(s) (0 face(s)).');
 });
+
+test('UI: getActionUrl resolves current workspace action URL from window.location.origin on *.adobeio-static.net', () => {
+  const { getActionUrl } = loadApiModule();
+  const prevWindow = global.window;
+  try {
+    global.window = {
+      location: {
+        origin: 'https://12345-customerapp.adobeio-static.net',
+        hostname: '12345-customerapp.adobeio-static.net'
+      }
+    };
+    assert.equal(
+      getActionUrl('groups'),
+      'https://12345-customerapp.adobeio-static.net/api/v1/web/aem-assets-assetsview-1/groups'
+    );
+    assert.equal(
+      getActionUrl('ingest'),
+      'https://12345-customerapp.adobeio-static.net/api/v1/web/aem-assets-assetsview-1/ingest'
+    );
+    assert.equal(
+      getActionUrl('settings'),
+      'https://12345-customerapp.adobeio-static.net/api/v1/web/aem-assets-assetsview-1/settings'
+    );
+  } finally {
+    global.window = prevWindow;
+  }
+});
+

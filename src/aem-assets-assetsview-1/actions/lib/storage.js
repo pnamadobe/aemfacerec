@@ -783,10 +783,15 @@ async function createStorage(options = {}) {
       let secretUnreadable = false;
       if (merged.awsSecretAccessKeyEncrypted) {
         try {
+          let effectiveTenantForDecrypt = tenantId;
+          if (!effectiveTenantForDecrypt && String(merged.awsSecretAccessKeyEncrypted).startsWith('v2:')) {
+            const ownerRaw = await backend.readText('db/.owner-tenant');
+            effectiveTenantForDecrypt = ownerRaw ? sanitizeTenantId(ownerRaw.trim()) : '';
+          }
           decryptedSecret = decryptSecret(
             merged.awsSecretAccessKeyEncrypted,
             encryptionKey,
-            tenantId
+            effectiveTenantForDecrypt
           );
         } catch (e) {
           // Encrypted with a different ENCRYPTION_SECRET (e.g. after key rotation). Treat as

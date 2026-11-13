@@ -136,7 +136,7 @@ Whenever `verifyAssetExistsBeforeWrite()` returns `exists: false` (or `PUT /api/
 
 ## 5. Implemented Remediation & Pro-Active Defenses (Verified in Production)
 
-All fixes and related edge-case defenses have been implemented, unit-tested, deployed to Production (`767251-759moccasingayal`), and verified against `https://author-p59602-e520244.adobeaemcloud.com`:
+All fixes and related edge-case defenses have been implemented, unit-tested, deployed to Production, and verified against AEM as a Cloud Service Author:
 
 1. **Pre-Flight `dam:Asset` Verification & Automatic Ghost Folder Cleanup (`aem.js` → `verifyAssetExistsBeforeWrite` & `deleteGhostFolder`)**:
    - Before any re-sync or group-mutation metadata writeback (`verifyExists: true`), `updateAssetFaceMetadata` inspects `<assetPath>.2.json`.

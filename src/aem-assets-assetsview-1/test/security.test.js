@@ -608,3 +608,94 @@ test('R12: new face group ids carry 128 bits of randomness', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('Adobe Exchange Public Submission Compliance: ext.config.yaml, app.config.yaml, package.json, and .env.dist/.env.example', () => {
+  const yaml = require('js-yaml');
+  const repoRoot = path.resolve(__dirname, '../../..');
+
+  const extConfig = yaml.load(
+    fs.readFileSync(path.join(repoRoot, 'src/aem-assets-assetsview-1/ext.config.yaml'), 'utf8')
+  );
+  const pkgManifest = extConfig.runtimeManifest.packages['aem-assets-assetsview-1'];
+  assert.ok(pkgManifest.inputs, 'ext.config.yaml must define package-level inputs');
+
+  const actions = pkgManifest.actions;
+  for (const [actionName, actionDef] of Object.entries(actions)) {
+    assert.equal(actionDef.runtime, 'nodejs:22', `Action ${actionName} must use nodejs:22`);
+    if (String(actionDef.web).toLowerCase() === 'yes' || actionDef.web === true) {
+      if (actionName === 'ingest') {
+        // ingest must allow Adobe I/O Events GET ?challenge= verification and webhook POSTs
+        // through the Runtime gateway (which lacks x-gw-ims-org-id) while enforcing user
+        // IMS Bearer auth inside buildActionContext() for all UI requests.
+        assert.equal(
+          actionDef.annotations?.['require-adobe-auth'],
+          false,
+          'ingest web action must set require-adobe-auth: false at gateway so Adobe I/O Events challenge/webhook deliveries reach main()'
+        );
+      } else {
+        assert.equal(
+          actionDef.annotations?.['require-adobe-auth'],
+          true,
+          `Web action ${actionName} must enforce require-adobe-auth: true`
+        );
+      }
+    }
+  }
+
+  // Every $VAR referenced in ext.config.yaml package inputs must be present in both .env.example and .env.dist
+  const yamlEnvRefs = Object.values(pkgManifest.inputs)
+    .filter((v) => typeof v === 'string' && v.startsWith('$'))
+    .map((v) => v.slice(1));
+
+  for (const envFileName of ['.env.example', '.env.dist', 'env.dist']) {
+    const rawEnv = fs.readFileSync(path.join(repoRoot, envFileName), 'utf8');
+    const definedKeys = new Set(
+      rawEnv
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#') && l.includes('='))
+        .map((l) => l.slice(0, l.indexOf('=')).trim())
+    );
+    for (const refKey of yamlEnvRefs) {
+      assert.ok(definedKeys.has(refKey), `${envFileName} must define ${refKey}`);
+    }
+    for (const key of definedKeys) {
+      if (key.startsWith('AIO_runtime_')) continue;
+      assert.ok(
+        yamlEnvRefs.includes(key),
+        `${envFileName} must not contain unused variable ${key}`
+      );
+    }
+  }
+
+  // app.config.yaml must declare productDependencies (AEM) and configSchema for public distribution
+  const appConfig = yaml.load(fs.readFileSync(path.join(repoRoot, 'app.config.yaml'), 'utf8'));
+  assert.ok(
+    Array.isArray(appConfig.productDependencies) &&
+      appConfig.productDependencies.some((p) => p.code === 'AEM'),
+    'app.config.yaml must declare AEM in productDependencies'
+  );
+  assert.ok(
+    appConfig.configSchema && Array.isArray(appConfig.configSchema.properties),
+    'app.config.yaml must define configSchema.properties'
+  );
+  const encProp = appConfig.configSchema.properties.find((p) => p.envKey === 'ENCRYPTION_SECRET');
+  assert.ok(encProp && encProp.secret === true, 'ENCRYPTION_SECRET in configSchema must have secret: true');
+  for (const prop of appConfig.configSchema.properties) {
+    if (prop.default !== undefined) {
+      assert.equal(
+        typeof prop.default,
+        'string',
+        `configSchema property ${prop.envKey} default must be a string for Exchange validator compatibility`
+      );
+    }
+  }
+
+  // package.json metadata and brand compliance
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  assert.ok(!/^(adobe|aem|magento)/i.test(pkgJson.name), 'package.json name must not lead with Adobe trademark');
+  assert.ok(pkgJson.author, 'package.json must include author');
+  assert.ok(pkgJson.license, 'package.json must include license');
+  assert.match(pkgJson.version, /^\d+\.\d+\.\d+$/);
+});
+

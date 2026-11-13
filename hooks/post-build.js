@@ -1,19 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 
-// Keep alias copies for previous Parcel bundle hashes in web-prod AND rewrite index.html
-// to load `/web-src.bundle.js` so a cached index.html in the browser or CloudFront edge POP
-// never 404s when a new build is deployed.
-const LEGACY_BUNDLE_NAMES = [
-  'web-src.bundle.js',
-  'web-src.351216b0.js',
-  'web-src.9872f83d.js',
-  'web-src.df9243c6.js',
-  'web-src.3766d1ab.js',
-  'web-src.0cd1de06.js',
-  'web-src.a2a264e8.js',
-  'web-src.bfe0a6a0.js'
-];
+// Create a stable `/web-src.bundle.js` alias and rewrite index.html to load it
+// so a cached index.html in the browser or CDN edge POP never 404s when a new build is deployed.
+const STABLE_BUNDLE_NAME = 'web-src.bundle.js';
 
 module.exports = (config) => {
   try {
@@ -37,17 +27,15 @@ module.exports = (config) => {
     if (!currentBundle) return;
 
     const srcPath = path.join(webProdDir, currentBundle);
-    for (const alias of LEGACY_BUNDLE_NAMES) {
-      if (alias !== currentBundle) {
-        fs.copyFileSync(srcPath, path.join(webProdDir, alias));
-      }
+    if (currentBundle !== STABLE_BUNDLE_NAME) {
+      fs.copyFileSync(srcPath, path.join(webProdDir, STABLE_BUNDLE_NAME));
     }
 
     if (fs.existsSync(indexHtmlPath)) {
       const html = fs.readFileSync(indexHtmlPath, 'utf8');
       const updatedHtml = html.replace(
         /src="\/?web-src\.[a-f0-9]+\.js"/i,
-        'src="/web-src.bundle.js"'
+        `src="/${STABLE_BUNDLE_NAME}"`
       );
       fs.writeFileSync(indexHtmlPath, updatedHtml, 'utf8');
     }

@@ -24,7 +24,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DEFAULT_REPO_DIR = '/Users/pnam/Sandbox/aemfacerec';
+const DEFAULT_REPO_DIR = path.resolve(__dirname, '../../..');
 const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic|heif|psd)$/i;
 
 function loadEnvFile(repoDir = DEFAULT_REPO_DIR) {
@@ -145,7 +145,7 @@ async function invokeRuntimeAction(actionShortName, payload = {}, env = {}) {
 
   if (!namespace || !auth) {
     throw new Error(
-      'Missing AIO_runtime_namespace or AIO_runtime_auth in .env. Run from /Users/pnam/Sandbox/aemfacerec or set env vars.'
+      'Missing AIO_runtime_namespace or AIO_runtime_auth in .env. Run from the project root directory or set env vars.'
     );
   }
 

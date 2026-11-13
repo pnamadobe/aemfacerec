@@ -606,7 +606,6 @@ export default function AssetDetailsSidePanel() {
                               label="Person Name (updates xdm:faceNames)"
                               value={editingNameValue}
                               onChange={setEditingNameValue}
-                              placeholder="Enter person's name..."
                               width="100%"
                             />
                             <Button

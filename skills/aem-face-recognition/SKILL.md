@@ -315,14 +315,14 @@ return { count: assets.length, assets };
 1. **In the AEM Assets View UI (when inside the Coworker cloud sandbox)**:
    - **To scan a folder**: Click **Face Groups** in the top header bar → click **Scan Current Folder** (automatically skips already-scanned images at zero AWS cost), or select assets/folders and click **Recognize Faces** in the action bar.
    - **To scan or curate a single asset**: Open the asset and click the **Recognized Faces** icon in the right rail to view cropped face avatars, highlight bounding boxes, **Name / Rename** a person, **Split Face**, or **Combine Into...** another group.
-2. **In a Local Terminal / OpenCode Session (where `/Users/pnam/Sandbox/aemfacerec/.env` is present)**:
+2. **In a Local Terminal Session (where `.env` is configured in the project root)**:
    Run the bundled CLI helper `scripts/facerec_cli.mjs`:
    ```bash
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs check-instance
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs scan-folder "<folder-url-or-path>"
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs scan-asset "<asset-url-or-path>"
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs related-assets "<asset-url-or-path>"
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs name-faces-ltr "<asset-url-or-path>" "Name 1" "Name 2"
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs rename "Person #38" "Elena Rostova"
-   node /Users/pnam/Sandbox/aemfacerec/skills/aem-face-recognition/scripts/facerec_cli.mjs combine "Person #70" "Elena Rostova"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs check-instance
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs scan-folder "<folder-url-or-path>"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs scan-asset "<asset-url-or-path>"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs related-assets "<asset-url-or-path>"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs name-faces-ltr "<asset-url-or-path>" "Name 1" "Name 2"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs rename "Person #38" "Elena Rostova"
+   node ./skills/aem-face-recognition/scripts/facerec_cli.mjs combine "Person #70" "Elena Rostova"
    ```

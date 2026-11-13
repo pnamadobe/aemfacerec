@@ -15,12 +15,21 @@ try {
   actionUrls = {};
 }
 
-function getActionUrl(actionName) {
+export function getActionUrl(actionName) {
+  if (typeof window !== 'undefined' && window.__AIO_ACTION_URLS__?.[actionName]) {
+    return window.__AIO_ACTION_URLS__[actionName];
+  }
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    const host = String(window.location.hostname || '').toLowerCase();
+    if (host.endsWith('.adobeio-static.net') || host.endsWith('.adobeioruntime.net')) {
+      return `${window.location.origin}/api/v1/web/aem-assets-assetsview-1/${actionName}`;
+    }
+  }
   const hit = Object.entries(actionUrls || {}).find(
     ([k]) => k.endsWith(`/${actionName}`) || k === actionName
   );
   if (hit) return hit[1];
-  return window.__AIO_ACTION_URLS__?.[actionName] || null;
+  return null;
 }
 
 async function invokeAction(actionName, payload = {}, authContext = {}) {

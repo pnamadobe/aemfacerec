@@ -836,17 +836,23 @@ export default function AdminConsole() {
                             onSelectionChange={handleFilterChange}
                             width="size-2000"
                           >
-                            <Item key="all">All Groups ({stats.totalGroups})</Item>
-                            <Item key="named">Named People ({stats.namedCount})</Item>
-                            <Item key="unnamed">
-                              Unnamed Placeholders ({stats.unnamedCount})
+                            <Item key="all" textValue={`All Groups (${stats.totalGroups})`}>
+                              {`All Groups (${stats.totalGroups})`}
+                            </Item>
+                            <Item key="named" textValue={`Named People (${stats.namedCount})`}>
+                              {`Named People (${stats.namedCount})`}
+                            </Item>
+                            <Item
+                              key="unnamed"
+                              textValue={`Unnamed Placeholders (${stats.unnamedCount})`}
+                            >
+                              {`Unnamed Placeholders (${stats.unnamedCount})`}
                             </Item>
                           </Picker>
                           <TextField
                             label="Search by Name or ID"
                             value={searchQuery}
                             onChange={setSearchQuery}
-                            placeholder="Search Sarah, Person #3..."
                             width="size-2400"
                           />
                           {canManageGroups && (
@@ -1104,7 +1110,11 @@ export default function AdminConsole() {
                                   title={`Delete "${activeGroup.displayName}"?`}
                                   primaryActionLabel="Delete Group"
                                   cancelLabel="Cancel"
-                                  onPrimaryAction={handleDeleteActiveGroup}
+                                  onPrimaryAction={() => {
+                                    setTimeout(() => {
+                                      handleDeleteActiveGroup();
+                                    }, 0);
+                                  }}
                                 >
                                   Permanently remove &quot;{activeGroup.displayName}&quot; (
                                   {activeGroup.faceCount} face(s)), delete its vectors from AWS
@@ -1126,7 +1136,6 @@ export default function AdminConsole() {
                               label={`Person Name (synced to ${settings.metadataProperty} on ${activeGroup.assetCount} asset(s))`}
                               value={groupNameInput}
                               onChange={setGroupNameInput}
-                              placeholder={`Leave blank to use placeholder (${activeGroup.autoLabel})`}
                               width="100%"
                             />
                             <Button variant="cta" onPress={handleRenameActiveGroup}>
@@ -1313,7 +1322,6 @@ export default function AdminConsole() {
                                   label="Split into a New Standalone Group (optional name):"
                                   value={splitNewGroupName}
                                   onChange={setSplitNewGroupName}
-                                  placeholder="Leave blank for Person #N"
                                   width="100%"
                                 />
                                 <Button
@@ -1392,7 +1400,6 @@ export default function AdminConsole() {
                         label="AWS Region"
                         value={settings.awsRegion}
                         onChange={(v) => setSettings((s) => ({ ...s, awsRegion: v }))}
-                        placeholder="us-east-1"
                         width="100%"
                       />
 
@@ -1402,14 +1409,12 @@ export default function AdminConsole() {
                             label="Cross-Account AWS IAM Role ARN"
                             value={settings.awsRoleArn || ''}
                             onChange={(v) => setSettings((s) => ({ ...s, awsRoleArn: v }))}
-                            placeholder="arn:aws:iam::123456789012:role/AemFaceRecognitionRole"
                             width="100%"
                           />
                           <TextField
                             label="IAM Role External ID (optional)"
                             value={settings.awsExternalId || ''}
                             onChange={(v) => setSettings((s) => ({ ...s, awsExternalId: v }))}
-                            placeholder="aem-facerec-external-id"
                             width="100%"
                           />
                         </>
@@ -1419,7 +1424,6 @@ export default function AdminConsole() {
                         label="AWS Access Key ID"
                         value={settings.awsAccessKeyId}
                         onChange={(v) => setSettings((s) => ({ ...s, awsAccessKeyId: v }))}
-                        placeholder="AKIA..."
                         width="100%"
                       />
 
@@ -1434,11 +1438,6 @@ export default function AdminConsole() {
                         onChange={(v) =>
                           setSettings((s) => ({ ...s, awsSecretAccessKey: v }))
                         }
-                        placeholder={
-                          settings.hasAwsSecretKey
-                            ? 'Leave blank to keep existing secret key'
-                            : 'Enter AWS Secret Access Key'
-                        }
                         width="100%"
                       />
 
@@ -1446,7 +1445,6 @@ export default function AdminConsole() {
                         label="Rekognition Collection ID"
                         value={settings.collectionId}
                         onChange={(v) => setSettings((s) => ({ ...s, collectionId: v }))}
-                        placeholder="aem-assets-faces"
                         width="100%"
                       />
 
@@ -1483,7 +1481,6 @@ export default function AdminConsole() {
                         onChange={(v) =>
                           setSettings((s) => ({ ...s, metadataProperty: v }))
                         }
-                        placeholder="xdm:faceNames"
                         width="100%"
                       />
 
@@ -1502,7 +1499,6 @@ export default function AdminConsole() {
                           onChange={(v) =>
                             setSettings((s) => ({ ...s, secondaryMetadataProperty: v }))
                           }
-                          placeholder="xdm:persona"
                           width="100%"
                         />
                       )}
@@ -1594,7 +1590,6 @@ export default function AdminConsole() {
                         label="Allowed AEM Curator Groups (comma-separated)"
                         value={settings.curatorGroupsText}
                         onChange={(v) => setSettings((s) => ({ ...s, curatorGroupsText: v }))}
-                        placeholder="administrators, dam-administrators, face-curators"
                         width="100%"
                       />
                       <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>

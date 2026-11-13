@@ -228,10 +228,16 @@ function resolveTenantOrg(params = {}, bearerToken = '') {
   }
 
   const evt = params.event || params.data || {};
+  const toObj = evt['activitystreams:to'] || params['activitystreams:to'] || {};
+  const recipientObj = evt.recipient || params.recipient || {};
   const eventOrg = String(
     evt.imsOrgId ||
       evt['xdmEventEnvelope:imsOrgId'] ||
+      toObj['xdmImsOrg:id'] ||
+      toObj.imsOrgId ||
+      recipientObj.imsOrgId ||
       params.imsOrgId ||
+      params['xdmEventEnvelope:imsOrgId'] ||
       params.DEFAULT_IMS_ORG ||
       ''
   ).trim();

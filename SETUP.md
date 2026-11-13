@@ -1,10 +1,10 @@
-# End-to-End Setup Guide — AEM Assets Facial Recognition & Grouping Extension
+# End-to-End Setup Guide — Facial Recognition & Grouping for AEM Assets View
 
-This guide walks through every step required to set up, configure, and deploy the **AEM Assets View Facial Recognition & Grouping Extension** (`aem/assets/assetsview/1`) with **AWS Rekognition (BYOK)**, **AEM Processing Profiles**, and **Adobe I/O Events**.
+This guide walks through every step required to set up, configure, and deploy the **Facial Recognition & Grouping Extension for Adobe Experience Manager Assets View** (`aem/assets/assetsview/1`) with **AWS Rekognition (Cross-Account IAM Role or BYOK)**, **AEM Processing Profiles**, and **Adobe I/O Events**.
 
-> 🏢 **Deployment Model — Self-Hosted per Customer Organization**
-> This open-source repository is intended to be cloned and deployed by each customer into **their own** Adobe Developer Console App Builder project (and published privately to their own organization's Extension Manager), rather than installed from a shared multi-tenant listing on public Adobe Exchange.
-> Deploying into your own App Builder project ensures that your `@adobe/aio-lib-files` storage container, your `ENCRYPTION_SECRET` (`.env`), your AWS Rekognition credentials, and all face data remain 100% inside your own Adobe and AWS accounts.
+> 🏢 **Deployment Options — Public Adobe Exchange or Self-Hosted App Builder**
+> - **Installing from Adobe Exchange**: Click **Acquire / Install** on the Adobe Exchange listing, select your organization's AEM Author environment, and provide the required configuration parameters (`AEM_HOST`, `ENCRYPTION_SECRET`) during the Exchange installation prompt. Every subscribing organization is isolated in its own per-tenant storage partition (`tenants/<tenantId>/`) with its own HKDF-SHA256 AES-256-GCM encryption key.
+> - **Deploying from Source (Downloadable / Developer Console)**: Clone this repository, copy `.env.dist` (or `.env.example`) to `.env`, bind to your Adobe Developer Console project workspace (`aio app use`), and run `aio app deploy` (or `aio app pack` to create `dist/app.zip` for Exchange distribution).
 
 ---
 
@@ -61,11 +61,16 @@ Customers supply their own AWS Rekognition credentials in the extension's **Sett
    ```
 3. Click **Next**, then click **Create user**.
 
-### Step 3: Create the Access Key ID & Secret Access Key
-1. Click into the newly created IAM user and open the **Security credentials** tab.
-2. Scroll down to **Access keys** and click **Create access key**.
-3. Select **Application running outside AWS**, check the confirmation box, and click **Next** -> **Create access key**.
-4. Copy the **Access key ID** (`AKIA...`) and **Secret access key**.
+### Step 3: Choose Cross-Account IAM Role (`sts:AssumeRole`) or Access Keys (BYOK)
+- **Option A — Cross-Account IAM Role (`sts:AssumeRole`)**:
+  1. Create an IAM Role in AWS Console with the `AemFaceRecognitionCollectionAccess` permissions policy above.
+  2. Configure its **Trust Policy** to allow `sts:AssumeRole` conditioned on an `sts:ExternalId` string of your choice.
+  3. In the extension's **Settings** tab, select **`Cross-Account IAM Role (STS AssumeRole)`** and enter the **IAM Role ARN** and **External ID**.
+- **Option B — IAM User Access Key ID & Secret Access Key (BYOK)**:
+  1. Click into your IAM user and open the **Security credentials** tab.
+  2. Scroll down to **Access keys** and click **Create access key**.
+  3. Select **Application running outside AWS**, check the confirmation box, and click **Next** -> **Create access key**.
+  4. Copy the **Access key ID** (`AKIA...`) and **Secret access key**.
 
 ---
 
@@ -105,10 +110,10 @@ So that recognized people appear on Asset Details / Properties and in the left S
 
 ### 3A. Deploy to Stage or Production
 
-1. Install dependencies and configure `.env`:
+1. Install dependencies and configure `.env` from `.env.dist` (or `.env.example`):
    ```bash
    npm install --legacy-peer-deps
-   cp .env.example .env
+   cp .env.dist .env
    ```
 2. Ensure `.env` includes your target AEM Author URL, a strong encryption secret and (optionally) the technical-account credentials used by the I/O Events ingestion action:
    ```dotenv
@@ -121,7 +126,7 @@ So that recognized people appear on Asset Details / Properties and in the left S
    # Keep false in production (enables seed/clear/export/import operations)
    ENABLE_MAINTENANCE_OPS=false
    ```
-   > **Security notes:** all web actions use `require-adobe-auth: true`, so they only accept requests carrying a valid IMS token, which the Assets View host provides automatically. Web actions call AEM with the **signed-in user's** token and never with the technical account. As a result, users can only scan and tag assets they are allowed to modify in AEM. See [`SECURITY_AUDIT.md`](./SECURITY_AUDIT.md).
+   > **Security notes:** `groups` and `settings` enforce `require-adobe-auth: true` at the Runtime gateway, while `ingest` enforces user IMS Bearer token authentication inside `buildActionContext()` (so Adobe I/O Events `GET ?challenge=` verification probes and webhook `POST` deliveries can reach the action without `x-gw-ims-org-id` headers). Web actions call AEM with the **signed-in user's** token and never with the technical account. As a result, users can only scan and tag assets they are allowed to modify in AEM. See [`SECURITY_AUDIT.md`](./SECURITY_AUDIT.md).
 3. Select your Adobe Developer Console project & workspace (`Stage` or `Production`), download the workspace config, and deploy:
    ```bash
    aio login
@@ -158,14 +163,14 @@ To have AEM automatically invoke the extension whenever an image finishes upload
 6. **Step 4 — Event Registration Details & Delivery Method**:
    - **Event registration name**: `AEM Face Recognition Upload Trigger`
    - **How to receive events** (choose either option):
-     - **Option A — `Webhook` (Recommended)**:
+     - **Option A — `Runtime Action` (Recommended)**:
+       - Select **`aem-assets-assetsview-1/ingest-event`** *(the non-web `web: 'no'` action entry in `ext.config.yaml`)*.
+     - **Option B — `Webhook` (with OAuth Server-to-Server IMS auth enabled)**:
        - **Delivery style**: Select **`Single`** *(so each uploaded asset gets its own dedicated Runtime invocation)*.
        - **Webhook URL**: Paste your deployed `ingest` Web Action URL:
          ```text
-         https://767251-759moccasingayal.adobeio-static.net/api/v1/web/aem-assets-assetsview-1/ingest
+         https://<your-namespace>.adobeio-static.net/api/v1/web/aem-assets-assetsview-1/ingest
          ```
-     - **Option B — `Runtime Action`**:
-       - Select **`aem-assets-assetsview-1/ingest-event`** *(the non-web `web: 'no'` action entry in `ext.config.yaml`)*.
    - Click **Save configured events**.
 
 ---
@@ -201,3 +206,4 @@ To have AEM automatically invoke the extension whenever an image finishes upload
 | **AEM Processing Profile `Save` button is disabled** | AEM does not allow saving an empty Processing Profile. On the **Basic** tab of the Processing Profile, check **`Create FPO rendition`** (leave the **Custom** tab empty) and click **Save**. |
 | **`Runtime Action` dropdown is not shown in Developer Console Add Event wizard** | Adobe Developer Console only lists actions with `web: 'no'` in the `Runtime Action` dropdown (`aem-assets-assetsview-1/ingest-event`), or you can select **`Webhook`** (Delivery style: **`Single`**) and paste the `.../api/v1/web/aem-assets-assetsview-1/ingest` URL. |
 | **`Face Groups` button disappears after a hard browser refresh** | Before an extension is published org-wide in Developer Console / Admin Console, AEM Assets View only loads it inside the preview session initiated by the `https://experience.adobe.com/aem/extension-manager/preview/...` URL. Re-open via the preview link or publish the Production workspace in Developer Console. |
+| **Adobe I/O Events webhook registration marked `UNSTABLE` or `verification_failed`** | Ensure `ingest` in `ext.config.yaml` has `require-adobe-auth: false` at the Runtime gateway (user auth is enforced in-code via `buildActionContext()`), redeploy (`npx aio app deploy --force-deploy`), and click **Update / Save** on the event registration in Adobe Developer Console to re-verify and reset its status to `VERIFIED`. |

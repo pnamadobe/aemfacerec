@@ -11,24 +11,28 @@ runtimeManifest:
   packages:
     aem-assets-assetsview-1:
       license: Apache-2.0
+      inputs:
+        LOG_LEVEL: info
+        AEM_HOST: $AEM_HOST
+        AEM_AUTHOR_URL: $AEM_AUTHOR_URL
+        AEM_ALLOWED_HOSTS: $AEM_ALLOWED_HOSTS
+        AEM_SC_JSON: $AEM_SC_JSON
+        AEM_DEV_TOKEN: $AEM_DEV_TOKEN
+        ENCRYPTION_SECRET: $ENCRYPTION_SECRET
+        ENABLE_MAINTENANCE_OPS: $ENABLE_MAINTENANCE_OPS
       actions:
         ingest:
           function: actions/ingest/index.js
           web: 'yes'
           runtime: nodejs:22
-          inputs:
-            LOG_LEVEL: info
-            AEM_HOST: $AEM_HOST
-            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
-            AEM_ALLOWED_HOSTS: $AEM_ALLOWED_HOSTS
-            AEM_SC_JSON: $AEM_SC_JSON
-            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
-            ENCRYPTION_SECRET: $ENCRYPTION_SECRET
-            ENABLE_MAINTENANCE_OPS: $ENABLE_MAINTENANCE_OPS
           limits:
             timeout: 120000
             memorySize: 512
           annotations:
+            # Must be false at the Runtime gateway so Adobe I/O Events GET ?challenge= verification
+            # probes and webhook POST deliveries (which do not carry x-gw-ims-org-id) are not
+            # rejected with 401 by adobeio/shared-validators-v1/app-registry before reaching main().
+            # User IMS Bearer token auth is enforced inside buildActionContext() for all UI requests.
             require-adobe-auth: false
             provide-api-key: true
             final: true
@@ -36,13 +40,6 @@ runtimeManifest:
           function: actions/ingest/index.js
           web: 'no'
           runtime: nodejs:22
-          inputs:
-            LOG_LEVEL: info
-            AEM_HOST: $AEM_HOST
-            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
-            AEM_SC_JSON: $AEM_SC_JSON
-            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
-            ENCRYPTION_SECRET: $ENCRYPTION_SECRET
           limits:
             timeout: 120000
             memorySize: 512
@@ -53,15 +50,6 @@ runtimeManifest:
           function: actions/groups/index.js
           web: 'yes'
           runtime: nodejs:22
-          inputs:
-            LOG_LEVEL: info
-            AEM_HOST: $AEM_HOST
-            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
-            AEM_ALLOWED_HOSTS: $AEM_ALLOWED_HOSTS
-            AEM_SC_JSON: $AEM_SC_JSON
-            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
-            ENCRYPTION_SECRET: $ENCRYPTION_SECRET
-            ENABLE_MAINTENANCE_OPS: $ENABLE_MAINTENANCE_OPS
           limits:
             timeout: 120000
             memorySize: 512
@@ -73,15 +61,6 @@ runtimeManifest:
           function: actions/settings/index.js
           web: 'yes'
           runtime: nodejs:22
-          inputs:
-            LOG_LEVEL: info
-            AEM_HOST: $AEM_HOST
-            AEM_AUTHOR_URL: $AEM_AUTHOR_URL
-            AEM_ALLOWED_HOSTS: $AEM_ALLOWED_HOSTS
-            AEM_SC_JSON: $AEM_SC_JSON
-            AEM_DEV_TOKEN: $AEM_DEV_TOKEN
-            ENCRYPTION_SECRET: $ENCRYPTION_SECRET
-            ENABLE_MAINTENANCE_OPS: $ENABLE_MAINTENANCE_OPS
           limits:
             timeout: 60000
             memorySize: 256

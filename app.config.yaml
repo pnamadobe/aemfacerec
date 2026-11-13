@@ -1,3 +1,35 @@
 extensions:
   aem/assets/assetsview/1:
     $include: src/aem-assets-assetsview-1/ext.config.yaml
+
+productDependencies:
+  - code: AEM
+    minVersion: '0.0.0'
+    maxVersion: '999.999.999'
+
+configSchema:
+  title: 'Facial Recognition & Grouping for Adobe Experience Manager Assets'
+  description: 'Configure your AEM as a Cloud Service Author environment and encryption settings for AWS Rekognition facial recognition.'
+  properties:
+    - title: 'AEM Author URL'
+      type: 'string'
+      description: 'Default AEM as a Cloud Service Author URL (e.g. https://author-p12345-e67890.adobeaemcloud.com)'
+      envKey: 'AEM_HOST'
+    - title: 'Additional Allowed AEM Hosts'
+      type: 'string'
+      description: 'Optional comma-separated list of custom AEM author origins allowed on user requests'
+      envKey: 'AEM_ALLOWED_HOSTS'
+    - title: 'Encryption Secret'
+      type: 'string'
+      secret: true
+      description: 'Required secret (at least 16 characters, e.g. openssl rand -base64 32) used to derive per-tenant AES-256-GCM keys for encrypting AWS Rekognition credentials at rest'
+      envKey: 'ENCRYPTION_SECRET'
+    - title: 'AEM Service Credentials JSON (Optional, for I/O Events)'
+      type: 'string'
+      secret: true
+      description: 'Optional base64-encoded OAuth Server-to-Server credentials JSON used by background Adobe I/O Events ingestion'
+      envKey: 'AEM_SC_JSON'
+    - title: 'Enable Maintenance Operations'
+      type: 'boolean'
+      description: 'Enable administrative maintenance operations (seedDemoData, clearAllData, exportSnapshot, importSnapshot). Keep false in production.'
+      envKey: 'ENABLE_MAINTENANCE_OPS'

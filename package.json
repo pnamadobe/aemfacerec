@@ -1,11 +1,13 @@
 {
-  "name": "aem-assets-face-recognition",
+  "name": "face-recognition-for-aem-assets",
   "version": "1.0.0",
-  "description": "AEM Assets View App Builder Extension for Facial Recognition and Grouping with AWS Rekognition",
-  "private": true,
+  "description": "Facial Recognition, Avatar Cropping, and Face Group Management Extension for Adobe Experience Manager Assets View powered by AWS Rekognition",
+  "author": "Patrick Nam",
+  "license": "Apache-2.0",
   "scripts": {
     "test": "node --test src/aem-assets-assetsview-1/test/*.test.js",
     "build": "aio app build",
+    "pack": "aio app pack",
     "deploy": "aio app deploy",
     "deploy:force": "aio app deploy --force-deploy",
     "undeploy": "aio app undeploy",
@@ -28,7 +30,6 @@
     "regenerator-runtime": "^0.13.5"
   },
   "devDependencies": {
-    "@adobe/aem-assets-assetsview-ext-tpl": "^0.1.0",
     "@babel/core": "^7.8.7",
     "@babel/plugin-transform-react-jsx": "^7.8.3",
     "@babel/polyfill": "^7.8.7",
@@ -37,12 +38,10 @@
     "@testing-library/react": "^12.1.5",
     "chalk": "^4.1.2",
     "js-yaml": "^4.1.0",
-    "jsdom": "^24.1.3",
-    "ts-loader": "^9.5.1",
-    "typescript": "^5.5.4"
+    "jsdom": "^24.1.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "aio-app-builder-templates": [
     "@adobe/aem-assets-assetsview-ext-tpl"

@@ -1,14 +1,13 @@
-# AEM Assets View — Facial Recognition & Grouping Extension
+# Facial Recognition & Grouping Extension for Adobe Experience Manager Assets View
 
-An open-source **Adobe Developer App Builder** extension template for **AEM as a Cloud Service (Assets View)** (`aem/assets/assetsview/1`) that integrates with your **AWS Rekognition** account (Bring Your Own Key / BYOK) to automatically detect faces on uploaded images, crop portrait avatars, cluster matching faces into Face Groups, provide an administrative UI to name, split, merge, or delete groups, and write multi-value group names to `xdm:faceNames` on AEM assets.
+An **Adobe Developer App Builder** extension for **Adobe Experience Manager as a Cloud Service (Assets View)** (`aem/assets/assetsview/1`) that integrates with a customer's **AWS Rekognition** account (via **Cross-Account IAM Role `sts:AssumeRole`** or **Bring Your Own Key / BYOK**) to automatically detect faces on uploaded images, crop portrait avatars, cluster matching faces into Face Groups, provide an administrative UI to name, split, merge, or delete groups, and write multi-value group names to `xdm:faceNames` and `xdm:persona` on AEM assets.
 
-> 🏢 **Self-Hosted Customer Deployment Model (Single-Tenant App Builder)**
-> This repository is designed for each customer organization to clone and deploy into **their own** Adobe Developer Console App Builder project (and optionally publish privately to their own org's Extension Manager). It is **not** distributed as a shared multi-tenant listing on public Adobe Exchange.
-> Because you deploy the extension into your own App Builder workspace:
-> - **100% Tenant & Data Isolation**: All face group records (`db/*.json`), cropped face avatars (`avatars/*.jpg`), and encrypted settings live exclusively inside your own App Builder storage container (`@adobe/aio-lib-files` / `@adobe/aio-lib-state`).
-> - **You Control the Encryption Key**: You generate and hold your own `ENCRYPTION_SECRET` in `.env`, which encrypts your AWS Secret Access Key at rest using **AES-256-GCM** — no third-party publisher ever has access to your keys or biometric data.
+> 🏢 **Adobe Exchange Multi-Tenant & Self-Hosted Deployment Support**
+> This extension is architected for both **Public Adobe Exchange distribution** and **customer self-hosted App Builder deployments**:
+> - **Verified Per-Tenant Isolation (`S11`)**: Every request resolves the caller's IMS Organization ID from the verified JWT token and cross-checks `x-gw-ims-org-id`. All database records (`tenants/<tenantId>/db/*.json`), cropped face avatars (`tenants/<tenantId>/avatars/*.jpg`), distributed lease locks, and default Rekognition Collection IDs are strictly partitioned per tenant organization.
+> - **Per-Tenant HKDF-SHA256 AES-256-GCM Encryption & Cross-Account IAM Roles (`S4`, `S8`)**: Customers can connect their AWS account using a **Cross-Account IAM Role (`sts:AssumeRole` with `ExternalId`)** for short-lived STS credentials or **IAM Access Keys** encrypted at rest with a per-tenant key derived via `HKDF-SHA256`.
 
-> 📖 **Looking for step-by-step installation, AWS IAM key setup, AEM Processing Profile setup, and Adobe I/O Events wiring?** See **[SETUP.md](./SETUP.md)** and **[SECURITY_AUDIT.md](./SECURITY_AUDIT.md)**.
+> 📖 **Looking for step-by-step installation, AWS IAM Role / Key setup, AEM Processing Profile setup, and Adobe I/O Events wiring?** See **[SETUP.md](./SETUP.md)** and **[SECURITY_AUDIT.md](./SECURITY_AUDIT.md)**.
 
 ## Demo Video
 
@@ -200,8 +199,8 @@ Implemented in `src/aem-assets-assetsview-1/web-src/src/components/AdminConsole.
 
 ## 7. Step-by-Step Setup & Deployment Guide
 
-### Step 1: Customer AWS Rekognition IAM Setup (BYOK)
-Create an IAM user in the customer's AWS account with programmatic access and attach the following minimum-privilege policy:
+### Step 1: Customer AWS Rekognition IAM Setup (IAM Role or BYOK Access Keys)
+Create an IAM policy in the customer's AWS account with the following minimum-privilege permissions on Rekognition collections:
 
 ```json
 {
@@ -227,6 +226,10 @@ Create an IAM user in the customer's AWS account with programmatic access and at
   ]
 }
 ```
+
+You can authenticate from the extension's **Settings** tab using either:
+- **Option A — Cross-Account IAM Role (`sts:AssumeRole` with `ExternalId`)**: Attach the policy above to an IAM Role in your AWS account, configure a Trust Policy allowing `sts:AssumeRole` with your chosen `sts:ExternalId`, and enter the **Role ARN** and **External ID** in Settings.
+- **Option B — IAM Access Keys (BYOK)**: Attach the policy above to a dedicated IAM user and enter its **Access Key ID** and **Secret Access Key** in Settings (encrypted at rest using per-tenant HKDF AES-256-GCM).
 
 ### Step 2: AEM Metadata Form Configuration (`xdm:faceNames`)
 To display the recognized face group names on Asset Details / Properties in AEM:
