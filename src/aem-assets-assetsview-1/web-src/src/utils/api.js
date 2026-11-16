@@ -6,6 +6,11 @@
  * before `aio app deploy`.
  */
 
+import {
+  isVideoPathOrMime,
+  extractSceneFramesInBrowser
+} from './video-frame-extractor';
+
 let actionUrls = {};
 try {
   // In an App Builder build, config.json maps action names to their Runtime URLs
@@ -465,6 +470,23 @@ async function invokeLocalPreviewFallback(actionName, payload) {
         db.assets['urn:aaid:aem:demo-keynote-panel'];
       return computeAssetFacesLocal(assetRecord, db);
     }
+    if (op === 'getVideoStreamUrl') {
+      return {
+        assetPath: payload.assetPath || '/content/dam/events/2026-summit/highlight-reel.mp4',
+        streamUrl: null,
+        posterUrl: null,
+        renditionName: 'mobile.mp4',
+        presigned: false,
+        supportsRange: true,
+        videoSettings: {
+          enableVideoFaceRecognition: true,
+          videoSceneThreshold: 0.28,
+          videoShotOffsetSec: 0.6,
+          videoMaxSampleIntervalSec: 4.0,
+          videoMaxFramesPerAsset: 24
+        }
+      };
+    }
     if (op === 'renameGroup') {
       const grp = db.groups[payload.groupId];
       if (grp) {
@@ -752,13 +774,122 @@ export const api = {
   },
   seedDemoData: (ctx) => invokeAction('groups', { operation: 'seedDemoData' }, ctx),
   clearAllData: (ctx) => invokeAction('groups', { operation: 'clearAllData' }, ctx),
-  ingestAsset: (params, ctx) =>
-    invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx),
+  getVideoStreamUrl: (params, ctx) =>
+    invokeAction('groups', { operation: 'getVideoStreamUrl', ...params }, ctx),
+  ingestVideoFrames: (params, ctx) =>
+    invokeAction('ingest', { operation: 'ingestVideoFrames', force: true, ...params }, ctx),
+  /**
+   * Sends extracted scene keyframes for a video asset in compact batches (default 4 frames/batch)
+   * so each HTTP request stays well below the 1 MB Runtime payload limit and 20s timeout.
+   */
+  ingestVideoFramesChunked: async (
+    { assetPath, assetId, assetTitle, mimeType = 'video/mp4', frames = [], durationSec = null, extractionMode = 'browser-scene' },
+    ctx,
+    onProgress
+  ) => {
+    const totalFrames = Array.isArray(frames) ? frames.length : 0;
+    if (totalFrames === 0) {
+      return invokeAction(
+        'ingest',
+        { operation: 'ingestAsset', force: true, assetPath, assetId, assetTitle, mimeType },
+        ctx
+      );
+    }
+
+    const FRAME_BATCH_SIZE = 4;
+    let lastRes = null;
+    for (let i = 0; i < totalFrames; i += FRAME_BATCH_SIZE) {
+      const slice = frames.slice(i, i + FRAME_BATCH_SIZE);
+      const isFirst = i === 0;
+      const isFinal = i + FRAME_BATCH_SIZE >= totalFrames;
+
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress({
+            phase: 'indexing-faces',
+            completedFrames: i,
+            totalFrames,
+            timestampSec: slice[0]?.timestampSec ?? 0
+          });
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      lastRes = await invokeAction(
+        'ingest',
+        {
+          operation: 'ingestVideoFrames',
+          assetPath,
+          assetId,
+          assetTitle,
+          mimeType,
+          frames: slice,
+          durationSec,
+          extractionMode,
+          resetExisting: isFirst,
+          syncMetadata: isFinal,
+          force: true
+        },
+        ctx
+      );
+    }
+    return lastRes;
+  },
+  ingestAsset: async (params, ctx, onProgress = null) => {
+    const assetPath = params?.assetPath || '';
+    const isVideo =
+      params?.mediaType === 'video' || isVideoPathOrMime(assetPath, params?.mimeType);
+
+    if (isVideo && assetPath && typeof document !== 'undefined' && getActionUrl('ingest')) {
+      try {
+        const streamRes = await invokeAction(
+          'groups',
+          {
+            operation: 'getVideoStreamUrl',
+            assetId: params.assetId,
+            assetPath
+          },
+          ctx
+        );
+        const vSettings = streamRes?.videoSettings || {};
+        if (streamRes?.streamUrl) {
+          const extracted = await extractSceneFramesInBrowser(streamRes.streamUrl, {
+            sceneThreshold: vSettings.videoSceneThreshold ?? 0.28,
+            shotOffsetSec: vSettings.videoShotOffsetSec ?? 0.6,
+            maxSampleIntervalSec: vSettings.videoMaxSampleIntervalSec ?? 4.0,
+            maxFramesPerAsset: vSettings.videoMaxFramesPerAsset ?? 24,
+            onProgress
+          });
+          if (extracted && Array.isArray(extracted.frames) && extracted.frames.length > 0) {
+            return api.ingestVideoFramesChunked(
+              {
+                assetPath,
+                assetId: params.assetId,
+                assetTitle: params.assetTitle || assetPath.split('/').pop(),
+                mimeType: params.mimeType || 'video/mp4',
+                frames: extracted.frames,
+                durationSec: extracted.durationSec,
+                extractionMode: extracted.extractionMode
+              },
+              ctx,
+              onProgress
+            );
+          }
+        }
+      } catch (e) {
+        // Fall through to server-side ingestAsset if browser extraction is unavailable
+      }
+    }
+
+    return invokeAction('ingest', { operation: 'ingestAsset', force: true, ...params }, ctx);
+  },
   browseFolder: (folderPath, ctx) =>
     invokeAction('ingest', { operation: 'browseFolder', folderPath }, ctx),
   /**
-   * Scans the image assets in a folder in small batches.
-   * By default images that were already scanned are skipped without calling the backend
+   * Scans the image and video assets in a folder in small batches.
+   * By default assets that were already scanned are skipped without calling the backend
    * (no AWS cost); pass { rescan: true } to analyze everything again.
    */
   scanFolder: async (folderPath, ctx, onProgress, { rescan = false } = {}) => {
@@ -790,13 +921,20 @@ export const api = {
       }
     }
 
+    const imageToScan = toScan.filter(
+      (a) => a.mediaType !== 'video' && !isVideoPathOrMime(a.assetPath, a.mimeType)
+    );
+    const videoToScan = toScan.filter(
+      (a) => a.mediaType === 'video' || isVideoPathOrMime(a.assetPath, a.mimeType)
+    );
+
     const BATCH_SIZE = 5;
-    let idx = 0;
+    let completedCount = 0;
     const report = () => {
       if (typeof onProgress !== 'function') return;
       try {
         onProgress({
-          completed: Math.min(idx, toScan.length),
+          completed: Math.min(completedCount, toScan.length),
           total: toScan.length,
           results: allResults
         });
@@ -805,13 +943,16 @@ export const api = {
       }
     };
 
-    while (idx < toScan.length) {
-      const batch = toScan.slice(idx, idx + BATCH_SIZE).map((a) => ({
+    // 1. Scan static images in batches of 5
+    let idx = 0;
+    while (idx < imageToScan.length) {
+      const batch = imageToScan.slice(idx, idx + BATCH_SIZE).map((a) => ({
         assetPath: a.assetPath,
         assetId: a.assetId,
         assetTitle: a.assetTitle,
         mimeType: a.mimeType || null
       }));
+      // eslint-disable-next-line no-await-in-loop
       const batchRes = await invokeAction(
         'ingest',
         {
@@ -827,6 +968,40 @@ export const api = {
       allResults.push(...batchResults);
       const step = Math.max(1, batchResults.length || batch.length);
       idx += step;
+      completedCount += step;
+      report();
+    }
+
+    // 2. Scan video assets using multi-scene extraction
+    for (const vAsset of videoToScan) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const vRes = await api.ingestAsset(
+          {
+            assetPath: vAsset.assetPath,
+            assetId: vAsset.assetId,
+            assetTitle: vAsset.assetTitle,
+            mimeType: vAsset.mimeType || 'video/mp4',
+            mediaType: 'video',
+            force: true,
+            rescan: true
+          },
+          ctx
+        );
+        allResults.push({
+          assetPath: vAsset.assetPath,
+          status: vRes?.skipped ? 'skipped' : 'processed',
+          faceCount: vRes?.faceCount ?? vRes?.faces?.length ?? 0,
+          ...(vRes?.skipped ? { reasonCode: vRes.reasonCode, reason: vRes.reason } : {})
+        });
+      } catch (err) {
+        allResults.push({
+          assetPath: vAsset.assetPath,
+          status: 'error',
+          error: err.message
+        });
+      }
+      completedCount += 1;
       report();
     }
 

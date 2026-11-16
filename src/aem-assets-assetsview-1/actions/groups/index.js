@@ -179,6 +179,18 @@ async function main(params = {}) {
         };
       }
 
+      case 'getVideoStreamUrl': {
+        const result = await faceService.getVideoStreamUrl({
+          assetId: params.assetId,
+          assetPath: params.assetPath
+        });
+        return {
+          statusCode: 200,
+          headers: corsHeaders,
+          body: result
+        };
+      }
+
       case 'findRelatedAssets': {
         const result = await faceService.findRelatedAssets({
           assetId: params.assetId,

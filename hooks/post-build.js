@@ -33,9 +33,11 @@ module.exports = (config) => {
 
     if (fs.existsSync(indexHtmlPath)) {
       const html = fs.readFileSync(indexHtmlPath, 'utf8');
+      const hashMatch = currentBundle.match(/^web-src\.([a-f0-9]+)\.js$/i);
+      const cacheKey = hashMatch ? hashMatch[1] : String(Date.now());
       const updatedHtml = html.replace(
         /src="\/?web-src\.[a-f0-9]+\.js"/i,
-        `src="/${STABLE_BUNDLE_NAME}"`
+        `src="/${STABLE_BUNDLE_NAME}?v=${cacheKey}"`
       );
       fs.writeFileSync(indexHtmlPath, updatedHtml, 'utf8');
     }

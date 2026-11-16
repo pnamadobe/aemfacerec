@@ -102,10 +102,46 @@ async function main(params = {}) {
 
     const operation = params.operation || 'ingestAsset';
 
-    if (operation === 'browseFolder' || operation === 'scanFolder') {
+    if (
+      operation === 'browseFolder' ||
+      operation === 'scanFolder' ||
+      operation === 'getVideoStreamUrl' ||
+      operation === 'ingestVideoFrames'
+    ) {
       if (ctx.isWeb && isRuntimeEnvironment() && !ctx.token && !ctx.isSkillAuth) {
         throw new PublicError('Authentication required.', 401);
       }
+    }
+
+    if (operation === 'getVideoStreamUrl') {
+      const result = await faceService.getVideoStreamUrl({
+        assetPath: params.assetPath,
+        assetId: params.assetId
+      });
+      return { statusCode: 200, headers: corsHeaders, body: result };
+    }
+
+    if (operation === 'ingestVideoFrames') {
+      if (!params.assetPath && !params.assetId) {
+        return {
+          statusCode: 400,
+          headers: corsHeaders,
+          body: { error: 'assetPath or assetId is required for ingestVideoFrames.' }
+        };
+      }
+      const result = await faceService.ingestVideoFrames({
+        assetPath: params.assetPath,
+        assetId: params.assetId,
+        assetTitle: params.assetTitle,
+        mimeType: params.mimeType || 'video/mp4',
+        frames: Array.isArray(params.frames) ? params.frames : [],
+        durationSec: params.durationSec,
+        extractionMode: params.extractionMode || 'browser-scene',
+        resetExisting: parseFlag(params.resetExisting, true),
+        syncMetadata: parseFlag(params.syncMetadata, true),
+        force: parseFlag(params.force, true)
+      });
+      return { statusCode: 200, headers: corsHeaders, body: result };
     }
 
     if (operation === 'browseFolder') {

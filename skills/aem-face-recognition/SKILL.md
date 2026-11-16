@@ -21,6 +21,8 @@ Every image scanned by the Face Recognition App Builder extension has its face-d
 | `xdm:faceGroupIds` | `String[]` | **Ordered left-to-right** in 1-to-1 correspondence with `xdm:faceLabels` (e.g. `["grp_2a9b64a3", "grp_cc233d4a"]`). Uniquely identifies each person across the entire DAM even before they are given a real name. |
 | `xdm:faceNames` | `String[]` | Named people on the asset (omits `Person #N` placeholders when *Hide unnamed placeholders* is enabled in Settings). |
 | `xdm:persona` | `String[]` | **Search-indexed (`searchIndexed: true`)** dual-written copy of `xdm:faceNames`. Supports direct exact-term index queries via `termFilters: [{ key: "assetMetadata.xdm:persona", value: "<Person Name>" }]` in `search-assets`! |
+| `xdm:faceTimestamps` | `String[]` | *(Video assets only)* Immutable `groupId`-keyed scene timestamps per person in 1-to-1 order with `xdm:faceGroupIds` / `xdm:faceLabels`, e.g. `["grp_cc233d4a@00:04.2,00:14.5", "grp_89f01b2c@00:09.8"]`. |
+| `xdm:faceTimelineJson` | `String` | *(Video assets only)* Compact JSON timeline of per-shot `faceId` (`f`), `groupId` (`g`), timestamp (`t`), shot range (`s`), and normalized face bounding box (`b`). |
 
 > **Practitioner Communication & Deep-Link Rule**:
 > - Present people by their human-readable names (`"Jill Jelly"`, `"John Johnson"`) or placeholder labels (`"Person #38"`), ordered left-to-right. Keep raw `grp_...` IDs and `xdm:*` property names internal unless the user asks for technical details.
@@ -91,14 +93,21 @@ do {
 const toArray = (v) => Array.isArray(v) ? v : (v ? [v] : []);
 const peopleCounts = {};
 const assets = allAssets
-  .filter(a => String(a.repositoryMetadata?.['dc:format'] || '').startsWith('image/'))
+  .filter(a => /^(image|video)\//.test(String(a.repositoryMetadata?.['dc:format'] || '')))
   .map(a => {
     const meta = a.assetMetadata || {};
     const repoMeta = a.repositoryMetadata || {};
     const scanned = meta['xdm:faceCount'] !== undefined;
     const faceCount = scanned ? Number(meta['xdm:faceCount'] || 0) : null;
     const rawLabels = toArray(meta['xdm:faceLabels']);
+    const rawGroupIds = toArray(meta['xdm:faceGroupIds']);
+    const labelByGroupId = {};
+    rawGroupIds.forEach((gId, idx) => { labelByGroupId[gId] = rawLabels[idx] || gId; });
     const facesLeftToRight = rawLabels.length ? rawLabels : toArray(meta['xdm:faceNames']);
+    const faceTimestamps = toArray(meta['xdm:faceTimestamps']).map(entry => {
+      const [gIdOrName, times] = String(entry).split('@');
+      return `${labelByGroupId[gIdOrName] || gIdOrName}@${times || ''}`;
+    });
     for (const label of facesLeftToRight) {
       peopleCounts[label] = (peopleCounts[label] || 0) + 1;
     }
@@ -107,10 +116,12 @@ const assets = allAssets
     return {
       name: repoMeta['repo:name'],
       path,
+      mediaType: String(repoMeta['dc:format'] || '').startsWith('video/') ? 'video' : 'image',
       detailUrl: buildDetailUrl(repoId, path),
       scanned,
       faceCount,
-      facesLeftToRight
+      facesLeftToRight,
+      ...(faceTimestamps.length ? { faceTimestamps } : {})
     };
   })
   .sort((a, b) => a.name.localeCompare(b.name));

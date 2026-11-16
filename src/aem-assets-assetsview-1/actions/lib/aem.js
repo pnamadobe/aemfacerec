@@ -21,11 +21,28 @@ const {
 const { withRetry, isNetworkError, RETRYABLE_HTTP_STATUSES } = require('./retry');
 
 const IMAGE_FILE_NAME_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic|heif|psd)$/i;
+const VIDEO_FILE_NAME_RE = /\.(mp4|mov|webm|m4v|avi|mkv|mpeg|mpg)$/i;
+const SAFE_PRESIGNED_HOST_RE =
+  /^https:\/\/(?:author-p\d+-e\d+(-cmstg)?\.adobeaemcloud\.com|[a-z0-9.-]+\.blob\.core\.windows\.net|[a-z0-9.-]+\.amazonaws\.com)(?:\/|$)/i;
 // AWS Rekognition accepts at most 5 MB of image bytes, so anything larger is useless and
 // only risks exhausting action memory.
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const FOLDER_PAGE_SIZE = 200;
 const MAX_FOLDER_PAGES = 50; // up to 10,000 entries per folder
+
+function isVideoAsset(assetPath = '', mimeType = '') {
+  const cleanMime = String(mimeType || '').toLowerCase().split(';')[0].trim();
+  if (cleanMime.startsWith('video/')) return true;
+  return VIDEO_FILE_NAME_RE.test(String(assetPath || '').trim());
+}
+
+function isSafeRedirectStreamUrl(locationUrl, baseUrl) {
+  if (!locationUrl || typeof locationUrl !== 'string') return false;
+  const trimmed = locationUrl.trim();
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) return true;
+  if (baseUrl && trimmed.startsWith(`${baseUrl}/`)) return true;
+  return SAFE_PRESIGNED_HOST_RE.test(trimmed);
+}
 
 class RetryableHttpStatus extends Error {
   constructor(response) {
@@ -580,6 +597,223 @@ function createAemClient({
     },
 
     /**
+     * Resolves a playable MP4 video stream URL for an AEM video asset, preferring lightweight
+     * web/mobile encodes (`mobile.mp4`, `cq5dam.video.iehq.mp4`) before falling back to `original`.
+     *
+     * When AEM Direct Binary Access returns an `HTTP 302` redirect (`Location: https://.../aem-blob-ns-...?sig=...`),
+     * validates the redirect host (`V4`) and returns the presigned SAS URL **verbatim** so:
+     * 1. The Azure HMAC signature (`sig=`) covering `rscd` / `rsct` is never invalidated.
+     * 2. HTML5 `<video>` tags and `ffmpeg -ss <t> -i "<url>"` can scrub via `HTTP 206 Partial Content`
+     *    (`Range: bytes=...`) with zero `Authorization` headers.
+     */
+    async resolveVideoStreamUrl(assetPath) {
+      const cleanPath = assertDamPath(assetPath, 'asset path');
+      const encodedPath = encodeDamPath(cleanPath);
+      const candidates = [
+        {
+          renditionName: 'cq5dam.preview.mp4',
+          path: `${encodedPath}/_jcr_content/renditions/cq5dam.preview.mp4`
+        },
+        {
+          renditionName: 'mobile.mp4',
+          path: `${encodedPath}/_jcr_content/renditions/mobile.mp4`
+        },
+        {
+          renditionName: 'mobile.mp4',
+          path: `${encodedPath}/jcr:content/renditions/mobile.mp4`
+        },
+        {
+          renditionName: 'cq5dam.video.iehq.mp4',
+          path: `${encodedPath}/_jcr_content/renditions/cq5dam.video.iehq.mp4`
+        },
+        {
+          renditionName: 'cq5dam.video.hq.m4v',
+          path: `${encodedPath}/_jcr_content/renditions/cq5dam.video.hq.m4v`
+        },
+        {
+          renditionName: 'original',
+          path: `${encodedPath}/_jcr_content/renditions/original`
+        }
+      ];
+
+      if (!baseUrl || !fetchImpl) {
+        return {
+          assetPath: cleanPath,
+          streamUrl: null,
+          posterUrl: null,
+          renditionName: 'mobile.mp4',
+          presigned: false,
+          supportsRange: true,
+          offline: true
+        };
+      }
+
+      const posterCandidateUrl = `${baseUrl}${encodedPath}/_jcr_content/renditions/cq5dam.web.1280.1280.jpeg`;
+      let resolvedPosterUrl = posterCandidateUrl;
+
+      // 1. Primary AEMaaCS Path: Query `/adobe/repository?path=<assetPath>` (`X-Adobe-Accept-Unsupported-API: 1`)
+      //    and exchange its `block_download` link for a self-authenticating presigned Azure Blob SAS URL
+      //    (`aem-blob-ns-...?sig=...`). Prefer `cq5dam.preview.mp4` or `mobile.mp4` (~3-6 MB) over `original` (~70 MB).
+      try {
+        const repoUrl = `${baseUrl}/adobe/repository?path=${encodeURIComponent(cleanPath)}`;
+        const repoRes = await fetchAemWithFallback(repoUrl, {
+          headers: { 'X-Adobe-Accept-Unsupported-API': '1' }
+        });
+        if (repoRes.ok && typeof repoRes.text === 'function') {
+          const repoText = await repoRes.text();
+          if (repoText && !isHtmlPayload(repoText)) {
+            const repoData = JSON.parse(repoText);
+            const rendLinks = Array.isArray(
+              repoData?._links?.['http://ns.adobe.com/adobecloud/rel/rendition']
+            )
+              ? repoData._links['http://ns.adobe.com/adobecloud/rel/rendition']
+              : [];
+
+            // Resolve presigned poster URL if available
+            const webPosterRend = rendLinks.find(
+              (r) => r?.['dc:title'] === 'cq5dam.web.1280.1280.jpeg'
+            );
+            const posterDlHref =
+              webPosterRend?._links?.['http://ns.adobe.com/adobecloud/rel/download']?.href;
+            if (posterDlHref && posterDlHref.startsWith(`${baseUrl}/`)) {
+              try {
+                const pRes = await fetchAemWithFallback(posterDlHref, {
+                  headers: { Accept: 'application/vnd.adobecloud.download+json' }
+                });
+                if (pRes.ok) {
+                  const pJson = JSON.parse(await pRes.text());
+                  if (pJson?.href && isSafeRedirectStreamUrl(pJson.href, baseUrl)) {
+                    resolvedPosterUrl = pJson.href;
+                  }
+                }
+              } catch (e) {
+                // ignore poster presign failure
+              }
+            }
+
+            // Pick best MP4 rendition (`cq5dam.preview.mp4` or `mobile.mp4`) before falling back to original
+            const preferredOrder = [
+              'cq5dam.preview.mp4',
+              'mobile.mp4',
+              'cq5dam.video.iehq.mp4',
+              'cq5dam.video.hq.m4v'
+            ];
+            let chosenRend = null;
+            for (const prefName of preferredOrder) {
+              const hit = rendLinks.find((r) => r?.['dc:title'] === prefName);
+              if (hit?._links?.['http://ns.adobe.com/adobecloud/rel/download']?.href) {
+                chosenRend = {
+                  renditionName: prefName,
+                  dlHref: hit._links['http://ns.adobe.com/adobecloud/rel/download'].href
+                };
+                break;
+              }
+            }
+            if (!chosenRend) {
+              const origDlHref =
+                repoData?._links?.['http://ns.adobe.com/adobecloud/rel/download']?.href;
+              if (origDlHref) {
+                chosenRend = { renditionName: 'original', dlHref: origDlHref };
+              }
+            }
+
+            if (chosenRend && chosenRend.dlHref.startsWith(`${baseUrl}/`)) {
+              const dlRes = await fetchAemWithFallback(chosenRend.dlHref, {
+                headers: { Accept: 'application/vnd.adobecloud.download+json' }
+              });
+              if (dlRes.ok) {
+                const dlJson = JSON.parse(await dlRes.text());
+                if (dlJson?.href && isSafeRedirectStreamUrl(dlJson.href, baseUrl)) {
+                  return {
+                    assetPath: cleanPath,
+                    streamUrl: dlJson.href,
+                    directRenditionUrl: `${baseUrl}${encodedPath}/_jcr_content/renditions/${chosenRend.renditionName}`,
+                    posterUrl: resolvedPosterUrl,
+                    renditionName: chosenRend.renditionName,
+                    presigned: true,
+                    supportsRange: true
+                  };
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Fall through to direct rendition probing
+      }
+
+      try {
+        const posterRes = await fetchAemWithFallback(posterCandidateUrl, { method: 'HEAD' });
+        if ([301, 302, 303, 307, 308].includes(posterRes.status)) {
+          const loc = posterRes.headers?.get?.('location') || '';
+          if (isSafeRedirectStreamUrl(loc, baseUrl)) {
+            resolvedPosterUrl = loc.startsWith('/') ? `${baseUrl}${loc}` : loc;
+          }
+        }
+      } catch (e) {
+        // Keep default poster URL
+      }
+
+      for (const cand of candidates) {
+        const fullUrl = `${baseUrl}${cand.path}`;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const res = await fetchAemWithFallback(fullUrl, {
+            method: 'GET',
+            headers: {
+              Range: 'bytes=0-0',
+              'Accept-Encoding': 'identity'
+            }
+          });
+
+          if ([301, 302, 303, 307, 308].includes(res.status)) {
+            const loc = res.headers?.get?.('location') || '';
+            if (isSafeRedirectStreamUrl(loc, baseUrl)) {
+              const verbatimStreamUrl = loc.startsWith('/') ? `${baseUrl}${loc}` : loc;
+              return {
+                assetPath: cleanPath,
+                streamUrl: verbatimStreamUrl,
+                directRenditionUrl: fullUrl,
+                posterUrl: resolvedPosterUrl,
+                renditionName: cand.renditionName,
+                presigned: true,
+                supportsRange: true
+              };
+            }
+          }
+
+          if (res.status === 200 || res.status === 206) {
+            const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
+            if (!ct.includes('text/html')) {
+              return {
+                assetPath: cleanPath,
+                streamUrl: fullUrl,
+                directRenditionUrl: fullUrl,
+                posterUrl: resolvedPosterUrl,
+                renditionName: cand.renditionName,
+                presigned: false,
+                supportsRange: res.status === 206 || res.headers?.get?.('accept-ranges') === 'bytes'
+              };
+            }
+          }
+        } catch (err) {
+          // Try next rendition candidate
+        }
+      }
+
+      const fallbackUrl = `${baseUrl}${encodedPath}/_jcr_content/renditions/mobile.mp4`;
+      return {
+        assetPath: cleanPath,
+        streamUrl: fallbackUrl,
+        directRenditionUrl: fallbackUrl,
+        posterUrl: resolvedPosterUrl,
+        renditionName: 'mobile.mp4',
+        presigned: false,
+        supportsRange: true
+      };
+    },
+
+    /**
      * Lists both child folders and image assets inside a DAM folder via the AEM Assets HTTP API.
      */
     /**
@@ -637,8 +871,8 @@ function createAemClient({
         newInPage++;
 
         if (classes.includes('assets/folder')) {
-          if (IMAGE_FILE_NAME_RE.test(name)) {
-            // Skip and schedule cleanup for ghost sling:Folder nodes named after deleted image files
+          if (IMAGE_FILE_NAME_RE.test(name) || VIDEO_FILE_NAME_RE.test(name)) {
+            // Skip and schedule cleanup for ghost sling:Folder nodes named after deleted image/video files
             ghostCandidates.push(fullPath);
             continue;
           }
@@ -667,6 +901,7 @@ function createAemClient({
               assetPath: fullPath,
               assetTitle: Array.isArray(title) ? title[0] : title,
               mimeType: normalizedType || null,
+              mediaType: isVideoAsset(fullPath, normalizedType) ? 'video' : 'image',
               thumbnailUrl: `${baseUrl}${fullPath}/_jcr_content/renditions/cq5dam.thumbnail.319.319.png`
             });
           }
@@ -969,6 +1204,7 @@ function createAemClient({
           onlyJcrContentChild &&
           hasGhostJcrContent &&
           (IMAGE_FILE_NAME_RE.test(cleanPath) ||
+            VIDEO_FILE_NAME_RE.test(cleanPath) ||
             node?.['jcr:content']?.metadata?.['xdm:faceCount'] !== undefined ||
             node?.['jcr:content']?.metadata?.['xdm:faceGroupIds'] !== undefined)
       );
@@ -1069,6 +1305,8 @@ function createAemClient({
         faceLabels = [],
         faceGroupIds = [],
         faceCount = 0,
+        faceTimestamps = null,
+        faceTimelineJson = null,
         metadataProperty = 'xdm:faceNames',
         secondaryMetadataProperty = null,
         verifyExists = false
@@ -1086,12 +1324,23 @@ function createAemClient({
       const hasDistinctSecondary =
         Boolean(secondaryMetadataProperty) && secondaryMetadataProperty !== metadataProperty;
       const effectiveLabels = Array.isArray(faceLabels) && faceLabels.length > 0 ? faceLabels : faceNames;
+      const cleanTimestamps = Array.isArray(faceTimestamps)
+        ? faceTimestamps.map((s) => String(s || '').trim()).filter(Boolean)
+        : null;
+      const cleanTimelineJson =
+        typeof faceTimelineJson === 'string' && faceTimelineJson.trim()
+          ? faceTimelineJson.trim().slice(0, 16384)
+          : null;
       const metadataOut = {
         [metadataProperty]: faceNames,
         ...(hasDistinctSecondary ? { [secondaryMetadataProperty]: faceNames } : {}),
         'xdm:faceLabels': effectiveLabels,
         'xdm:faceGroupIds': faceGroupIds,
-        'xdm:faceCount': faceCount
+        'xdm:faceCount': faceCount,
+        ...(cleanTimestamps && cleanTimestamps.length > 0
+          ? { 'xdm:faceTimestamps': cleanTimestamps }
+          : {}),
+        ...(cleanTimelineJson ? { 'xdm:faceTimelineJson': cleanTimelineJson } : {})
       };
 
       if (!baseUrl || !fetchImpl) {
@@ -1162,6 +1411,25 @@ function createAemClient({
       formData.append('xdm:faceCount', String(faceCount));
       formData.append('xdm:faceCount@TypeHint', 'Long');
 
+      if (cleanTimestamps !== null) {
+        formData.append('xdm:faceTimestamps@TypeHint', 'String[]');
+        if (cleanTimestamps.length === 0) {
+          formData.append('xdm:faceTimestamps@Delete', 'true');
+        } else {
+          for (const tsEntry of cleanTimestamps) {
+            formData.append('xdm:faceTimestamps', tsEntry);
+          }
+        }
+      }
+
+      if (faceTimelineJson !== null) {
+        if (!cleanTimelineJson) {
+          formData.append('xdm:faceTimelineJson@Delete', 'true');
+        } else {
+          formData.append('xdm:faceTimelineJson', cleanTimelineJson);
+        }
+      }
+
       const metadataUrl = `${baseUrl}${encodeDamPath(cleanPath)}/jcr:content/metadata`;
       const slingRes = await fetchAemWithFallback(metadataUrl, {
         method: 'POST',
@@ -1206,6 +1474,8 @@ module.exports = {
   normalizeAemHost,
   normalizeDamPath,
   isPathWithin,
+  isVideoAsset,
+  isSafeRedirectStreamUrl,
   toApiAssetsRelativePath,
   parseRetryAfterMs,
   readBodyWithLimit,

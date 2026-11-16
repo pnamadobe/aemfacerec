@@ -66,13 +66,28 @@ const DEFAULT_SETTINGS = {
   ],
   // Images whose shorter side is below this many pixels (logos, icons) are skipped
   minImageSize: 200,
+  // Video facial recognition & scene-change frame extraction controls
+  enableVideoFaceRecognition: false,
+  allowedVideoTypes: [
+    'video/mp4',
+    'video/quicktime',
+    'video/webm',
+    'video/x-m4v',
+    'video/x-msvideo',
+    'video/x-matroska'
+  ],
+  videoSceneThreshold: 0.28,
+  videoShotOffsetSec: 0.6,
+  videoMaxSampleIntervalSec: 4.0,
+  videoMaxFramesPerAsset: 24,
   // Governance: when true, only AEM Administrators or members of curatorGroups can
   // name, rename, merge, split, or delete face groups
   restrictCuratorActionsToAdmins: false,
   curatorGroups: ['administrators', 'dam-administrators']
 };
 
-const MIME_TYPE_PATTERN = /^image\/[a-z0-9][a-z0-9.+-]{0,99}$/;
+const MIME_TYPE_PATTERN = /^(?:image|video)\/[a-z0-9][a-z0-9.+-]{0,99}$/;
+const VIDEO_MIME_TYPE_PATTERN = /^video\/[a-z0-9][a-z0-9.+-]{0,99}$/;
 const CURATOR_GROUP_PATTERN = /^[a-zA-Z0-9_.\-: ]{1,128}$/;
 
 /**
@@ -842,6 +857,25 @@ async function createStorage(options = {}) {
         minImageSize: Number.isFinite(Number(merged.minImageSize))
           ? Number(merged.minImageSize)
           : DEFAULT_SETTINGS.minImageSize,
+        enableVideoFaceRecognition: Boolean(
+          merged.enableVideoFaceRecognition ?? DEFAULT_SETTINGS.enableVideoFaceRecognition
+        ),
+        allowedVideoTypes:
+          Array.isArray(merged.allowedVideoTypes) && merged.allowedVideoTypes.length > 0
+            ? merged.allowedVideoTypes
+            : DEFAULT_SETTINGS.allowedVideoTypes,
+        videoSceneThreshold: Number.isFinite(Number(merged.videoSceneThreshold))
+          ? Number(merged.videoSceneThreshold)
+          : DEFAULT_SETTINGS.videoSceneThreshold,
+        videoShotOffsetSec: Number.isFinite(Number(merged.videoShotOffsetSec))
+          ? Number(merged.videoShotOffsetSec)
+          : DEFAULT_SETTINGS.videoShotOffsetSec,
+        videoMaxSampleIntervalSec: Number.isFinite(Number(merged.videoMaxSampleIntervalSec))
+          ? Number(merged.videoMaxSampleIntervalSec)
+          : DEFAULT_SETTINGS.videoMaxSampleIntervalSec,
+        videoMaxFramesPerAsset: Number.isFinite(Number(merged.videoMaxFramesPerAsset))
+          ? Number(merged.videoMaxFramesPerAsset)
+          : DEFAULT_SETTINGS.videoMaxFramesPerAsset,
         restrictCuratorActionsToAdmins: Boolean(merged.restrictCuratorActionsToAdmins ?? false),
         curatorGroups:
           Array.isArray(merged.curatorGroups) && merged.curatorGroups.length > 0
@@ -975,6 +1009,64 @@ async function createStorage(options = {}) {
           throw new PublicError('Minimum image size must be a whole number of pixels between 0 and 4000.');
         }
         updated.minImageSize = size;
+      }
+
+      if (typeof newSettings.enableVideoFaceRecognition === 'boolean') {
+        updated.enableVideoFaceRecognition = newSettings.enableVideoFaceRecognition;
+      }
+      if (Array.isArray(newSettings.allowedVideoTypes)) {
+        const vtypes = Array.from(
+          new Set(
+            newSettings.allowedVideoTypes
+              .map((t) => String(t).trim().toLowerCase())
+              .filter(Boolean)
+          )
+        );
+        const invalid = vtypes.filter((t) => !VIDEO_MIME_TYPE_PATTERN.test(t));
+        if (invalid.length > 0) {
+          throw new PublicError(
+            `Invalid video type(s): ${invalid.join(', ')}. Use values like video/mp4.`
+          );
+        }
+        updated.allowedVideoTypes = vtypes.length > 0 ? vtypes : DEFAULT_SETTINGS.allowedVideoTypes;
+      }
+      if (newSettings.videoSceneThreshold !== undefined && newSettings.videoSceneThreshold !== '') {
+        const thresh = Number(newSettings.videoSceneThreshold);
+        if (!Number.isFinite(thresh) || thresh < 0.05 || thresh > 0.95) {
+          throw new PublicError('Video scene threshold must be a number between 0.05 and 0.95.');
+        }
+        updated.videoSceneThreshold = Number(thresh.toFixed(3));
+      }
+      if (newSettings.videoShotOffsetSec !== undefined && newSettings.videoShotOffsetSec !== '') {
+        const offsetSec = Number(newSettings.videoShotOffsetSec);
+        if (!Number.isFinite(offsetSec) || offsetSec < 0 || offsetSec > 10) {
+          throw new PublicError('Video shot offset must be between 0 and 10 seconds.');
+        }
+        updated.videoShotOffsetSec = Number(offsetSec.toFixed(2));
+      }
+      if (
+        newSettings.videoMaxSampleIntervalSec !== undefined &&
+        newSettings.videoMaxSampleIntervalSec !== ''
+      ) {
+        const intervalSec = Number(newSettings.videoMaxSampleIntervalSec);
+        if (!Number.isFinite(intervalSec) || intervalSec < 0.5 || intervalSec > 120) {
+          throw new PublicError(
+            'Video periodic sample interval must be between 0.5 and 120 seconds.'
+          );
+        }
+        updated.videoMaxSampleIntervalSec = Number(intervalSec.toFixed(2));
+      }
+      if (
+        newSettings.videoMaxFramesPerAsset !== undefined &&
+        newSettings.videoMaxFramesPerAsset !== ''
+      ) {
+        const maxFrames = Number(newSettings.videoMaxFramesPerAsset);
+        if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 60) {
+          throw new PublicError(
+            'Maximum video frames per asset must be a whole number between 1 and 60.'
+          );
+        }
+        updated.videoMaxFramesPerAsset = maxFrames;
       }
 
       if (typeof newSettings.restrictCuratorActionsToAdmins === 'boolean') {

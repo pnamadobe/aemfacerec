@@ -113,7 +113,7 @@ test('Build Verification 2: compiled web-prod bundle and post-build hook output 
   const html = fs.readFileSync(indexHtmlPath, 'utf8');
   assert.match(
     html,
-    /src="\/web-src\.bundle\.js"/,
+    /src="\/web-src\.bundle\.js(?:\?v=[a-z0-9]+)?"/i,
     'post-build.js must rewrite index.html to load /web-src.bundle.js'
   );
 

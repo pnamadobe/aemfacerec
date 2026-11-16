@@ -1,9 +1,14 @@
 const crypto = require('crypto');
 const { createStorage } = require('./storage');
 const { createRekognitionService } = require('./rekognition');
-const { createAemClient, normalizeDamPath } = require('./aem');
+const { createAemClient, normalizeDamPath, isVideoAsset, MAX_IMAGE_BYTES } = require('./aem');
 const { PublicError, assertDamPath, isDiscardedOrSystemDamPath } = require('./security');
 const { mapWithConcurrency } = require('./retry');
+const {
+  formatVideoTimestamp,
+  computeFaceFrameQualityScore,
+  extractVideoFramesWithFfmpeg
+} = require('./video-extractor');
 
 const AEM_WRITE_CONCURRENCY = 4;
 const DEFAULT_SYNC_TIME_BUDGET_MS = 18000;
@@ -113,15 +118,34 @@ function getGroupEffectiveMetadataName(group, settings) {
 }
 
 /**
- * Pure helper that computes the exact metadata payload (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`)
- * for a given asset from the current faces and groups state.
+ * Returns the combined list of allowed MIME types from settings, including `allowedVideoTypes`
+ * when `enableVideoFaceRecognition` is enabled.
+ */
+function getEffectiveAllowedMediaTypes(settings = {}) {
+  const imageTypes = (settings.allowedImageTypes || []).map((t) => String(t).toLowerCase());
+  if (!settings.enableVideoFaceRecognition) return imageTypes;
+  const videoTypes = (settings.allowedVideoTypes || []).map((t) => String(t).toLowerCase());
+  return Array.from(new Set([...imageTypes, ...videoTypes]));
+}
+
+/**
+ * Pure helper that computes the exact metadata payload (`xdm:faceNames`, `xdm:faceGroupIds`, `xdm:faceCount`,
+ * and for video assets `xdm:faceTimestamps` + `xdm:faceTimelineJson`) for a given asset from the current
+ * faces and groups state.
  */
 function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
   const faceIds = (assetRecord?.faceIds || []).filter((id) => Boolean(faces[id]));
   const sortedFaces = faceIds
     .map((id) => faces[id])
     .filter(Boolean)
-    .sort((a, b) => (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0));
+    .sort((a, b) => {
+      const aTs = Number.isFinite(Number(a.timestampSec)) ? Number(a.timestampSec) : null;
+      const bTs = Number.isFinite(Number(b.timestampSec)) ? Number(b.timestampSec) : null;
+      if (aTs !== null && bTs !== null && Math.abs(aTs - bTs) > 0.05) {
+        return aTs - bTs;
+      }
+      return (Number(a.boundingBox?.left) || 0) - (Number(b.boundingBox?.left) || 0);
+    });
   const resolvedGroups = sortedFaces
     .map((f) => groups[f.groupId])
     .filter(Boolean);
@@ -134,7 +158,7 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     )
   );
 
-  // Always includes both named people and unnamed placeholder labels (`Person #N`), ordered left-to-right
+  // Always includes both named people and unnamed placeholder labels (`Person #N`), ordered left-to-right (or chronological for video)
   const faceLabels = Array.from(
     new Set(
       resolvedGroups
@@ -151,6 +175,93 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     new Set(resolvedGroups.map((g) => g.groupId).filter(Boolean))
   );
 
+  const isVideo =
+    assetRecord?.mediaType === 'video' ||
+    isVideoAsset(assetRecord?.assetPath, assetRecord?.mimeType) ||
+    sortedFaces.some(
+      (f) =>
+        f.mediaType === 'video' ||
+        Number.isFinite(Number(f.timestampSec)) ||
+        (Array.isArray(f.timestampsSec) && f.timestampsSec.length > 0)
+    );
+
+  let faceTimestamps = null;
+  let faceTimelineJson = null;
+
+  if (isVideo) {
+    const timestampsByGroup = new Map();
+    const timelineItems = [];
+
+    for (const face of sortedFaces) {
+      const grp = groups[face.groupId];
+      if (!grp) continue;
+      const displayLabel =
+        grp.name && String(grp.name).trim() !== ''
+          ? String(grp.name).trim()
+          : grp.autoLabel || grp.groupId;
+
+      const rawApps =
+        Array.isArray(face.appearances) && face.appearances.length > 0
+          ? face.appearances
+          : Number.isFinite(Number(face.timestampSec))
+          ? [
+              {
+                timestampSec: Number(face.timestampSec),
+                shotRangeSec: Array.isArray(face.shotRangeSec)
+                  ? face.shotRangeSec
+                  : [Number(face.timestampSec), Number(face.timestampSec)],
+                boundingBox: face.boundingBox,
+                confidence: face.confidence
+              }
+            ]
+          : [];
+
+      const tsSet = timestampsByGroup.get(face.groupId) || {
+        groupId: face.groupId,
+        label: displayLabel,
+        times: []
+      };
+      for (const app of rawApps) {
+        const t = Number(app.timestampSec);
+        if (Number.isFinite(t) && t >= 0) {
+          if (!tsSet.times.some((existing) => Math.abs(existing - t) < 0.05)) {
+            tsSet.times.push(Number(t.toFixed(2)));
+          }
+          const box = app.boundingBox || face.boundingBox || {};
+          timelineItems.push({
+            f: face.faceId,
+            g: face.groupId,
+            t: Number(t.toFixed(2)),
+            s: Array.isArray(app.shotRangeSec)
+              ? [Number((Number(app.shotRangeSec[0]) || 0).toFixed(2)), Number((Number(app.shotRangeSec[1]) || t).toFixed(2))]
+              : [Number(t.toFixed(2)), Number(t.toFixed(2))],
+            b: [
+              Number((Number(box.left ?? box.Left ?? 0) || 0).toFixed(3)),
+              Number((Number(box.top ?? box.Top ?? 0) || 0).toFixed(3)),
+              Number((Number(box.width ?? box.Width ?? 0.2) || 0.2).toFixed(3)),
+              Number((Number(box.height ?? box.Height ?? 0.2) || 0.2).toFixed(3))
+            ]
+          });
+        }
+      }
+      timestampsByGroup.set(face.groupId, tsSet);
+    }
+
+    faceTimestamps = [];
+    for (const [groupId, entry] of timestampsByGroup.entries()) {
+      const sortedTimes = [...entry.times].sort((a, b) => a - b).slice(0, 12);
+      if (sortedTimes.length > 0) {
+        const formattedList = sortedTimes.map((t) => formatVideoTimestamp(t)).join(',');
+        // Keyed by immutable groupId (with 1-to-1 correspondence to xdm:faceGroupIds / xdm:faceLabels)
+        // so renaming a person never invalidates the timestamp mapping itself.
+        faceTimestamps.push(`${groupId}@${formattedList}`);
+      }
+    }
+
+    timelineItems.sort((a, b) => a.t - b.t);
+    faceTimelineJson = timelineItems.length > 0 ? JSON.stringify(timelineItems).slice(0, 16000) : '';
+  }
+
   const metadataProperty = settings.metadataProperty || 'xdm:faceNames';
   const secondaryMetadataProperty =
     settings.enableSecondaryMetadataProperty && settings.secondaryMetadataProperty
@@ -163,7 +274,9 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     faceNames,
     faceLabels,
     faceGroupIds,
-    faceCount: faceIds.length
+    // For video assets, faceCount is the number of unique people (groups) or total detections when 0
+    faceCount: isVideo && faceGroupIds.length > 0 ? faceGroupIds.length : faceIds.length,
+    ...(isVideo ? { faceTimestamps, faceTimelineJson } : {})
   };
 }
 
@@ -206,6 +319,92 @@ async function createFaceService({
       groupDisplayName: group?.name || group?.autoLabel || 'Unassigned',
       groupFaceCount: group?.faceIds?.length || 1
     };
+  }
+
+  /**
+   * Builds the list of face cards returned for an asset (`getAssetFaces` / `ingestVideoFrames`).
+   *
+   * - For static images: returns 1 card per `faceId` as-is.
+   * - For video assets where multiple shots (`faceId`s) belong to the SAME `groupId`:
+   *   rolls them up into ONE card per person (`groupId`) on the video, using the highest-quality
+   *   shot's `faceId` and cropped avatar as the primary card, while attaching all individual shot
+   *   `faceId`s + avatars + bounding boxes inside `appearances[]` (`[{ faceId, timestampSec, shotRangeSec, boundingBox, avatarDataUrl }]`).
+   *   This keeps the Side Panel UI clean (1 card per person) while allowing any single shot (`faceId`)
+   *   to be split or moved independently!
+   */
+  function buildAssetFacesView(assetRecord, facesMap, groupsMap) {
+    const rawFaces = (assetRecord?.faceIds || [])
+      .map((id) => enrichFace(facesMap[id], groupsMap))
+      .filter(Boolean);
+
+    const isVideo =
+      assetRecord?.mediaType === 'video' ||
+      isVideoAsset(assetRecord?.assetPath, assetRecord?.mimeType) ||
+      rawFaces.some((f) => f.mediaType === 'video' || Number.isFinite(Number(f.timestampSec)));
+
+    if (!isVideo) {
+      return rawFaces;
+    }
+
+    const byGroup = new Map();
+    for (const f of rawFaces) {
+      const key = f.groupId || f.faceId;
+      const list = byGroup.get(key) || [];
+      list.push(f);
+      byGroup.set(key, list);
+    }
+
+    const rolledUp = [];
+    for (const [, memberShots] of byGroup.entries()) {
+      // Pick the highest-quality shot as the primary avatar/face record for the person's card
+      const bestShot = [...memberShots].sort(
+        (a, b) =>
+          (Number(b.bestFrameQualityScore) ||
+            computeFaceFrameQualityScore(b.boundingBox, b.confidence)) -
+          (Number(a.bestFrameQualityScore) ||
+            computeFaceFrameQualityScore(a.boundingBox, a.confidence))
+      )[0];
+
+      // Collect all shot appearances across all member faceIds (plus any legacy multi-appearance array)
+      const allApps = [];
+      for (const shot of memberShots) {
+        if (Array.isArray(shot.appearances) && shot.appearances.length > 1) {
+          for (const app of shot.appearances) {
+            allApps.push({
+              faceId: app.faceId || shot.faceId,
+              timestampSec: Number(app.timestampSec ?? shot.timestampSec ?? 0),
+              shotRangeSec: app.shotRangeSec || shot.shotRangeSec || [0, 0],
+              boundingBox: app.boundingBox || shot.boundingBox,
+              confidence: app.confidence ?? shot.confidence,
+              avatarDataUrl: shot.avatarDataUrl || bestShot.avatarDataUrl || null
+            });
+          }
+        } else {
+          const ts = Number(shot.timestampSec ?? 0);
+          allApps.push({
+            faceId: shot.faceId,
+            timestampSec: ts,
+            shotRangeSec: shot.shotRangeSec || [ts, ts],
+            boundingBox: shot.boundingBox,
+            confidence: shot.confidence,
+            avatarDataUrl: shot.avatarDataUrl || bestShot.avatarDataUrl || null
+          });
+        }
+      }
+      allApps.sort((a, b) => a.timestampSec - b.timestampSec);
+
+      rolledUp.push({
+        ...bestShot,
+        timestampSec: allApps[0]?.timestampSec ?? bestShot.timestampSec ?? 0,
+        shotRangeSec: allApps[0]?.shotRangeSec ?? bestShot.shotRangeSec ?? [0, 0],
+        timestampsSec: allApps.map((a) => a.timestampSec),
+        shotFaceIds: memberShots.map((s) => s.faceId),
+        appearances: allApps
+      });
+    }
+
+    rolledUp.sort((a, b) => (Number(a.timestampSec) || 0) - (Number(b.timestampSec) || 0));
+    return rolledUp;
   }
 
   /**
@@ -273,7 +472,8 @@ async function createFaceService({
       faceNames: computed.faceNames || [],
       faceLabels: computed.faceLabels || [],
       faceGroupIds: computed.faceGroupIds || [],
-      faceCount: computed.faceCount || 0
+      faceCount: computed.faceCount || 0,
+      ...(Array.isArray(computed.faceTimestamps) ? { faceTimestamps: computed.faceTimestamps } : {})
     });
   }
 
@@ -604,6 +804,322 @@ async function createFaceService({
     return { skipped: true, assetPath, reasonCode, reason };
   }
 
+  function decodeFrameInputToBuffer(frameInput) {
+    if (!frameInput) return null;
+    if (Buffer.isBuffer(frameInput)) return frameInput;
+    if (typeof frameInput === 'string') {
+      const stripped = frameInput.replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '').trim();
+      if (!stripped) return null;
+      return Buffer.from(stripped, 'base64');
+    }
+    return null;
+  }
+
+  /**
+   * Core multi-frame video ingestion routine with Intra-Video Person Consolidation (`V2`).
+   *
+   * - Accepts an array of extracted scene keyframes (`[{ timestampSec, shotRangeSec, imageBuffer | imageBase64 }]`).
+   * - Supports chunked multi-batch uploads from the browser (`resetExisting` on Batch 1,
+   *   `syncMetadata` on the Final Batch) so large videos stay well below the 1 MB Runtime payload limit.
+   * - Consolidates multiple shots of the same person (`groupId`) within the same video into ONE
+   *   canonical `faceId` record (retaining the highest-quality cropped avatar and deleting redundant
+   *   intra-video duplicate vectors from AWS Rekognition) while recording all shot appearances in
+   *   `appearances[]` and `timestampsSec[]`.
+   */
+  async function ingestVideoFramesInMemory({
+    assetPath,
+    assetId,
+    assetTitle,
+    mimeType = 'video/mp4',
+    frames = [],
+    durationSec = null,
+    extractionMode = 'browser-scene',
+    resetExisting = true,
+    syncMetadata = true,
+    force = true,
+    db,
+    settings,
+    rekognition,
+    collectionEnsured = false
+  }) {
+    let cleanPath = assetPath ? assertDamPath(assetPath, 'asset path') : '';
+    if (!cleanPath && assetId) {
+      const resolvedFromUuid = await aemClient.resolvePathByAssetUuid(assetId);
+      if (resolvedFromUuid) {
+        cleanPath = normalizeDamPath(resolvedFromUuid);
+      }
+    }
+    if (!cleanPath) {
+      throw new PublicError('assetPath is required to ingest video frames.');
+    }
+
+    if (isDiscardedOrSystemDamPath(cleanPath)) {
+      await pruneDeletedAssetFromDbAndRekognition({ assetId, assetPath: cleanPath }, db, rekognition);
+      return skippedResult(
+        cleanPath,
+        'discarded-asset',
+        'Asset is in AEM Trash (cq:discarded) or is a JCR system node and was skipped.'
+      );
+    }
+
+    if (!force) {
+      const eligibility = await aemClient.checkFolderEligibility(cleanPath, settings);
+      if (!eligibility.eligible) {
+        return {
+          skipped: true,
+          assetPath: cleanPath,
+          reason: eligibility.reason
+        };
+      }
+    }
+
+    const callerHasRealId = Boolean(assetId && !stripUrnPrefix(assetId).startsWith('/'));
+    const info =
+      callerHasRealId && cleanPath
+        ? {
+            assetId,
+            assetPath: cleanPath,
+            assetTitle: assetTitle || cleanPath.split('/').pop(),
+            mimeType
+          }
+        : await aemClient.getAssetInfo(cleanPath);
+
+    const resolvedPath = info.assetPath;
+    const resolvedAssetId = canonicalAssetKey(
+      callerHasRealId ? assetId : info.assetId,
+      resolvedPath
+    );
+    const resolvedTitle = assetTitle || info.assetTitle;
+    const maxFrames = Math.max(1, Math.min(60, Number(settings.videoMaxFramesPerAsset) || 24));
+    const boundedFrames = (Array.isArray(frames) ? frames : []).slice(0, maxFrames);
+
+    if (resetExisting) {
+      await removeExistingAssetFaces(
+        { assetId: resolvedAssetId, assetPath: resolvedPath, canonicalKey: resolvedAssetId },
+        db,
+        rekognition
+      );
+    }
+
+    const now = new Date().toISOString();
+    let assetRecord = db.assets[resolvedAssetId] || {
+      assetId: resolvedAssetId,
+      assetPath: resolvedPath,
+      assetTitle: resolvedTitle,
+      mediaType: 'video',
+      mimeType: mimeType || info.mimeType || 'video/mp4',
+      faceIds: [],
+      scannedAt: now,
+      updatedAt: now
+    };
+    assetRecord.mediaType = 'video';
+    assetRecord.mimeType = mimeType || info.mimeType || assetRecord.mimeType || 'video/mp4';
+    assetRecord.extractionMode = extractionMode;
+    if (Number.isFinite(Number(durationSec)) && Number(durationSec) > 0) {
+      assetRecord.durationSec = Number(Number(durationSec).toFixed(2));
+    }
+
+    // Map existing faces on this video asset by groupId so adjacent samples within the SAME
+    // continuous shot (< 0.45s apart) deduplicate, while distinct shots keep their own faceId,
+    // avatar, and Rekognition vector so any individual shot can be split or reassigned later!
+    const existingFacesByGroup = new Map();
+    for (const fId of assetRecord.faceIds || []) {
+      const fRec = db.faces[fId];
+      if (fRec && fRec.groupId) {
+        const list = existingFacesByGroup.get(fRec.groupId) || [];
+        list.push(fRec);
+        existingFacesByGroup.set(fRec.groupId, list);
+      }
+    }
+
+    let collectionChecked = collectionEnsured;
+    let firstPreviewDataUrl = assetRecord.previewDataUrl || null;
+
+    for (let fIdx = 0; fIdx < boundedFrames.length; fIdx++) {
+      const rawFrame = boundedFrames[fIdx] || {};
+      const buf = decodeFrameInputToBuffer(rawFrame.imageBuffer || rawFrame.imageBase64);
+      if (!buf || buf.length === 0) continue;
+      if (buf.length > MAX_IMAGE_BYTES) {
+        throw new PublicError(
+          `Video frame #${fIdx + 1} exceeds the ${MAX_IMAGE_BYTES / 1024 / 1024} MB limit.`
+        );
+      }
+
+      const timestampSec = Number(
+        Math.max(0, Number(rawFrame.timestampSec ?? rawFrame.timestamp ?? 0)).toFixed(2)
+      );
+      const shotRangeSec = Array.isArray(rawFrame.shotRangeSec) && rawFrame.shotRangeSec.length === 2
+        ? [
+            Number(Math.max(0, Number(rawFrame.shotRangeSec[0]) || 0).toFixed(2)),
+            Number(Math.max(timestampSec, Number(rawFrame.shotRangeSec[1]) || timestampSec).toFixed(2))
+          ]
+        : [timestampSec, timestampSec];
+
+      // eslint-disable-next-line no-await-in-loop
+      const detectedFaces = await rekognition.indexAssetFaces(buf, resolvedAssetId, {
+        skipEnsureCollection: collectionChecked
+      });
+      collectionChecked = true;
+
+      if (!detectedFaces.length) continue;
+
+      let decodedImage = buf;
+      try {
+        decodedImage = decodeImageBuffer(buf);
+        if (!firstPreviewDataUrl) {
+          firstPreviewDataUrl = generatePreviewThumbnailDataUrl(decodedImage, 280, 62);
+        }
+      } catch (e) {
+        decodedImage = buf;
+      }
+
+      for (const detected of detectedFaces) {
+        const { faceId, confidence, boundingBox } = detected;
+        const frameQuality = computeFaceFrameQualityScore(boundingBox, confidence);
+        // eslint-disable-next-line no-await-in-loop
+        const match = await rekognition.findMatchingGroup(faceId, db.faces, db.groups);
+        const matchedGroupId = match && db.groups[match.groupId] ? match.groupId : null;
+
+        // Check if this detection is a sub-0.45s duplicate of the exact same shot already recorded
+        const groupFacesOnVideo = matchedGroupId ? existingFacesByGroup.get(matchedGroupId) || [] : [];
+        const sameShotFace = groupFacesOnVideo.find(
+          (f) => Math.abs(Number(f.timestampSec || 0) - timestampSec) < 0.45
+        );
+
+        if (sameShotFace) {
+          const prevBestScore = Number(sameShotFace.bestFrameQualityScore || 0);
+          if (frameQuality > prevBestScore) {
+            // eslint-disable-next-line no-await-in-loop
+            const avatar = await cropFaceAvatar(decodedImage, boundingBox);
+            // eslint-disable-next-line no-await-in-loop
+            const avatarFile = await storage.saveAvatar(sameShotFace.faceId, avatar.buffer);
+            sameShotFace.avatarFile = avatarFile;
+            sameShotFace.avatarStoredExternally = Boolean(avatarFile);
+            sameShotFace.avatarDataUrl = avatar.dataUrl;
+            sameShotFace.boundingBox = boundingBox;
+            sameShotFace.confidence = confidence;
+            sameShotFace.bestFrameQualityScore = frameQuality;
+            sameShotFace.timestampSec = timestampSec;
+            sameShotFace.shotRangeSec = shotRangeSec;
+            sameShotFace.timestampsSec = [timestampSec];
+            sameShotFace.appearances = [
+              { faceId: sameShotFace.faceId, timestampSec, shotRangeSec, boundingBox, confidence }
+            ];
+          }
+          // Sub-0.45s duplicate within the same shot is discarded
+          // eslint-disable-next-line no-await-in-loop
+          await rekognition.deleteFaces([faceId]).catch(() => {});
+          continue;
+        }
+
+        // Distinct shot detection: keep its own faceId, cropped avatar, and Rekognition vector
+        // so an admin/curator can split or reassign this specific shot independently!
+        // eslint-disable-next-line no-await-in-loop
+        const avatar = await cropFaceAvatar(decodedImage, boundingBox);
+        // eslint-disable-next-line no-await-in-loop
+        const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
+
+        let assignedGroupId;
+        let matchConfidence = null;
+
+        if (matchedGroupId) {
+          assignedGroupId = matchedGroupId;
+          matchConfidence = match.matchConfidence;
+          // eslint-disable-next-line no-await-in-loop
+          await rekognition.associateFaces(assignedGroupId, [faceId]);
+          const grp = db.groups[assignedGroupId];
+          if (!grp.faceIds.includes(faceId)) grp.faceIds.push(faceId);
+          // Promote group cover avatar if this shot is higher quality than the first shot
+          const currentCover = db.faces[grp.coverFaceId];
+          if (
+            currentCover &&
+            currentCover.assetId === resolvedAssetId &&
+            frameQuality > Number(currentCover.bestFrameQualityScore || 0)
+          ) {
+            grp.coverFaceId = faceId;
+          }
+          grp.updatedAt = now;
+        } else {
+          assignedGroupId = generateGroupId();
+          // eslint-disable-next-line no-await-in-loop
+          await rekognition.createGroup(assignedGroupId, [faceId]);
+          const personNumber = db.counters.nextPersonNumber || 1;
+          db.counters.nextPersonNumber = personNumber + 1;
+          db.groups[assignedGroupId] = {
+            groupId: assignedGroupId,
+            name: null,
+            autoLabel: `Person #${personNumber}`,
+            coverFaceId: faceId,
+            faceIds: [faceId],
+            createdAt: now,
+            updatedAt: now
+          };
+        }
+
+        const newFaceRecord = {
+          faceId,
+          groupId: assignedGroupId,
+          assetId: resolvedAssetId,
+          assetPath: resolvedPath,
+          assetTitle: resolvedTitle,
+          mediaType: 'video',
+          boundingBox,
+          confidence,
+          matchConfidence,
+          bestFrameQualityScore: frameQuality,
+          timestampSec,
+          shotRangeSec,
+          timestampsSec: [timestampSec],
+          appearances: [{ faceId, timestampSec, shotRangeSec, boundingBox, confidence }],
+          avatarFile,
+          avatarStoredExternally: Boolean(avatarFile),
+          avatarDataUrl: avatar.dataUrl,
+          createdAt: now
+        };
+
+        db.faces[faceId] = newFaceRecord;
+        if (!assetRecord.faceIds.includes(faceId)) {
+          assetRecord.faceIds.push(faceId);
+        }
+        const updatedList = existingFacesByGroup.get(assignedGroupId) || [];
+        updatedList.push(newFaceRecord);
+        existingFacesByGroup.set(assignedGroupId, updatedList);
+      }
+    }
+
+    if (firstPreviewDataUrl) {
+      assetRecord.previewDataUrl = firstPreviewDataUrl;
+    }
+    assetRecord.scannedFramesCount =
+      (resetExisting ? 0 : Number(assetRecord.scannedFramesCount || 0)) + boundedFrames.length;
+    assetRecord.updatedAt = now;
+    db.assets[resolvedAssetId] = assetRecord;
+
+    let sync = { failed: [] };
+    if (syncMetadata) {
+      sync = await syncAssetsToAem([resolvedAssetId], db, settings, { verifyExists: false });
+    }
+
+    const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
+    const enrichedFaces = buildAssetFacesView(assetRecord, db.faces, db.groups);
+
+    return {
+      ...assetRecord,
+      scanned: true,
+      faceCount: computed.faceCount,
+      faceNames: computed.faceNames,
+      faceLabels: computed.faceLabels,
+      faceGroupIds: computed.faceGroupIds,
+      faceTimestamps: computed.faceTimestamps || [],
+      faceTimelineJson: computed.faceTimelineJson || '',
+      metadataProperty: computed.metadataProperty,
+      includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
+      metadataSynced: syncMetadata ? sync.failed.length === 0 : false,
+      metadataSyncError: sync.failed[0]?.error || null,
+      faces: enrichedFaces
+    };
+  }
+
   /**
    * Core single-asset ingestion routine that operates on an already-loaded `db`, `settings`,
    * and `rekognition` instance so batch/folder operations only read and write storage once.
@@ -621,6 +1137,7 @@ async function createFaceService({
     assetTitle,
     imageBuffer,
     force = false,
+    allowVideoOnDemand = false,
     rescan = true,
     mimeType = null,
     db,
@@ -689,10 +1206,89 @@ async function createFaceService({
     const resolvedTitle = assetTitle || info.assetTitle;
 
     // 2. File type allowlist (unknown types are allowed through; the rendition is still checked)
-    const allowedTypes = (settings.allowedImageTypes || []).map((t) => String(t).toLowerCase());
+    //    When `force: true` is passed by an explicit manual user scan on a video ("Scan Asset" / "Recognize Faces"),
+    //    also allow standard `settings.allowedVideoTypes` so a manual video scan works immediately without
+    //    having to toggle a setting first.
+    const baseAllowedTypes = getEffectiveAllowedMediaTypes(settings);
+    const allowedTypes =
+      allowVideoOnDemand && isVideoAsset(resolvedPath, mimeType || info.mimeType)
+        ? Array.from(
+            new Set([
+              ...baseAllowedTypes,
+              ...(settings.allowedVideoTypes || []).map((t) => String(t).toLowerCase())
+            ])
+          )
+        : baseAllowedTypes;
     const assetType = String(mimeType || info.mimeType || '').toLowerCase().split(';')[0].trim();
     if (assetType && allowedTypes.length > 0 && !allowedTypes.includes(assetType)) {
       return skippedResult(resolvedPath, 'unsupported-type', `File type ${assetType} is not enabled for face recognition`);
+    }
+
+    // 2b. If this is an enabled video asset, attempt server-side FFmpeg scene extraction first,
+    // falling back to AEM's 1280x1280 video poster rendition (t = 0.0s) when FFmpeg is absent.
+    if (
+      isVideoAsset(resolvedPath, assetType) &&
+      (allowVideoOnDemand || settings.enableVideoFaceRecognition || allowedTypes.includes(assetType))
+    ) {
+      let extracted = null;
+      if (typeof aemClient.resolveVideoStreamUrl === 'function') {
+        try {
+          const streamInfo = await aemClient.resolveVideoStreamUrl(resolvedPath);
+          if (streamInfo?.streamUrl) {
+            extracted = await extractVideoFramesWithFfmpeg(streamInfo.streamUrl, {
+              sceneThreshold: settings.videoSceneThreshold,
+              shotOffsetSec: settings.videoShotOffsetSec,
+              maxSampleIntervalSec: settings.videoMaxSampleIntervalSec,
+              maxFramesPerAsset: settings.videoMaxFramesPerAsset
+            });
+          }
+        } catch (e) {
+          extracted = null;
+        }
+      }
+
+      if (extracted && Array.isArray(extracted.frames) && extracted.frames.length > 0) {
+        return ingestVideoFramesInMemory({
+          assetPath: resolvedPath,
+          assetId: resolvedAssetId,
+          assetTitle: resolvedTitle,
+          mimeType: assetType || 'video/mp4',
+          frames: extracted.frames,
+          durationSec: extracted.durationSec,
+          extractionMode: extracted.extractionMode,
+          resetExisting: true,
+          syncMetadata: true,
+          force: true,
+          db,
+          settings,
+          rekognition,
+          collectionEnsured
+        });
+      }
+
+      // Poster fallback: analyze AEM's generated JPEG poster rendition as frame 0 (t = 0.0s)
+      const posterBuffer = imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
+      return ingestVideoFramesInMemory({
+        assetPath: resolvedPath,
+        assetId: resolvedAssetId,
+        assetTitle: resolvedTitle,
+        mimeType: assetType || 'video/mp4',
+        frames: [
+          {
+            timestampSec: 0,
+            shotRangeSec: [0, 0],
+            imageBuffer: posterBuffer
+          }
+        ],
+        extractionMode: 'poster-fallback',
+        resetExisting: true,
+        syncMetadata: true,
+        force: true,
+        db,
+        settings,
+        rekognition,
+        collectionEnsured
+      });
     }
 
     const buffer = imageBuffer || (await aemClient.fetchAssetRenditionBuffer(resolvedPath));
@@ -869,6 +1465,7 @@ async function createFaceService({
           assetTitle,
           imageBuffer,
           force,
+          allowVideoOnDemand: Boolean(force),
           rescan,
           mimeType,
           db,
@@ -890,12 +1487,99 @@ async function createFaceService({
     },
 
     /**
-     * Browses child subfolders and image assets inside a DAM folder for the visual folder/asset picker.
+     * Ingests a batch of scene keyframes extracted from a video asset, consolidating multiple
+     * detections of the same person within the video into a single canonical face record while
+     * recording all shot appearance timestamps (`timestampsSec[]`, `appearances[]`).
+     */
+    async ingestVideoFrames({
+      assetPath,
+      assetId,
+      assetTitle,
+      mimeType = 'video/mp4',
+      frames = [],
+      durationSec = null,
+      extractionMode = 'browser-scene',
+      resetExisting = true,
+      syncMetadata = true,
+      force = true
+    }) {
+      const [{ settings, rekognition }, db] = await Promise.all([
+        getRekognition(),
+        storage.getDatabase()
+      ]);
+
+      const result = await ingestVideoFramesInMemory({
+        assetPath,
+        assetId,
+        assetTitle,
+        mimeType,
+        frames,
+        durationSec,
+        extractionMode,
+        resetExisting,
+        syncMetadata,
+        force,
+        db,
+        settings,
+        rekognition,
+        collectionEnsured: false
+      });
+
+      if (!result.skipped) {
+        await storage.saveDatabase(db);
+      }
+      return result;
+    },
+
+    /**
+     * Resolves a playable MP4 stream URL (and presigned Azure Blob SAS URL when available)
+     * plus the current video sampling settings for an AEM video asset.
+     */
+    async getVideoStreamUrl({ assetPath, assetId }) {
+      let cleanPath = assetPath ? assertDamPath(assetPath, 'asset path') : '';
+      if (!cleanPath && assetId && typeof aemClient.resolvePathByAssetUuid === 'function') {
+        const resolved = await aemClient.resolvePathByAssetUuid(assetId);
+        if (resolved) cleanPath = normalizeDamPath(resolved);
+      }
+      if (!cleanPath) {
+        throw new PublicError('assetPath is required to resolve a video stream URL.');
+      }
+
+      const [streamInfo, settings] = await Promise.all([
+        typeof aemClient.resolveVideoStreamUrl === 'function'
+          ? aemClient.resolveVideoStreamUrl(cleanPath)
+          : {
+              assetPath: cleanPath,
+              streamUrl: null,
+              posterUrl: null,
+              renditionName: 'mobile.mp4',
+              presigned: false,
+              supportsRange: true
+            },
+        storage.getSettings()
+      ]);
+
+      return {
+        ...streamInfo,
+        videoSettings: {
+          enableVideoFaceRecognition: Boolean(settings.enableVideoFaceRecognition),
+          videoSceneThreshold: settings.videoSceneThreshold,
+          videoShotOffsetSec: settings.videoShotOffsetSec,
+          videoMaxSampleIntervalSec: settings.videoMaxSampleIntervalSec,
+          videoMaxFramesPerAsset: settings.videoMaxFramesPerAsset
+        }
+      };
+    },
+
+    /**
+     * Browses child subfolders and image/video assets inside a DAM folder for the visual folder/asset picker.
      */
     async browseFolder({ folderPath = '/content/dam' }) {
       const settings = await storage.getSettings();
       const [browsed, assetsMap] = await Promise.all([
-        aemClient.browseDamFolder(folderPath, { allowedImageTypes: settings.allowedImageTypes }),
+        aemClient.browseDamFolder(folderPath, {
+          allowedImageTypes: getEffectiveAllowedMediaTypes(settings)
+        }),
         typeof storage.getAssetsMap === 'function'
           ? storage.getAssetsMap()
           : storage.getDatabase({ readOnly: true }).then((d) => d.assets)
@@ -938,7 +1622,7 @@ async function createFaceService({
       let liveBrowseSucceeded = false;
       try {
         browsed = await aemClient.browseDamFolder(cleanFolder, {
-          allowedImageTypes: settings.allowedImageTypes
+          allowedImageTypes: getEffectiveAllowedMediaTypes(settings)
         });
         liveBrowseSucceeded = Boolean(aemHost && (browsed.assets?.length > 0 || browsed.folders?.length > 0));
       } catch (e) {
@@ -1086,7 +1770,9 @@ async function createFaceService({
       const [{ settings, rekognition }, db] = await Promise.all([getRekognition(), storage.getDatabase()]);
       const allAssets = Array.isArray(explicitAssets)
         ? explicitAssets
-        : await aemClient.listFolderAssets(folderPath, { allowedImageTypes: settings.allowedImageTypes });
+        : await aemClient.listFolderAssets(folderPath, {
+            allowedImageTypes: getEffectiveAllowedMediaTypes(settings)
+          });
       // The collection check is cached per request and only happens if an image needs AWS
       const collectionEnsured = false;
 
@@ -1252,9 +1938,7 @@ async function createFaceService({
         await storage.hydrateFaceAvatars(rawFacesOnAsset);
       }
       const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
-      const enrichedFaces = (assetRecord.faceIds || [])
-        .map((id) => enrichFace(db.faces[id], db.groups))
-        .filter(Boolean);
+      const enrichedFaces = buildAssetFacesView(assetRecord, db.faces, db.groups);
 
       return {
         ...assetRecord,
@@ -1262,7 +1946,12 @@ async function createFaceService({
         scanned: true,
         faceCount: computed.faceCount,
         faceNames: computed.faceNames,
+        faceLabels: computed.faceLabels,
         faceGroupIds: computed.faceGroupIds,
+        ...(Array.isArray(computed.faceTimestamps) ? { faceTimestamps: computed.faceTimestamps } : {}),
+        ...(typeof computed.faceTimelineJson === 'string'
+          ? { faceTimelineJson: computed.faceTimelineJson }
+          : {}),
         metadataProperty: computed.metadataProperty,
         includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
         faces: enrichedFaces

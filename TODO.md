@@ -140,3 +140,33 @@ When a user uploads an image attachment into a Coworker chat, the file is mounte
 ### Phase 4 — Adobe Exchange Packaging & Auth Gate (`S1` / Exchange Submission)
 - [x] **Enforce `require-adobe-auth: true`** on `groups` and `settings` web actions and validate with 153 automated tests.
 
+---
+
+## 4. Plan: Video Asset Facial Recognition, Scene-Change Extraction & Timestamp Deep-Linking
+
+Full architectural specification and research spike findings are documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md#video-asset-facial-recognition--timestamp-deep-linking-architecture).
+
+### Key Architectural Highlights
+1. **Shot-Clamped Frame Sampling (`t_cut + min(0.60s, 0.45 * shotDuration)`)**:
+   - Avoids Frame 0 of a scene cut (cross-dissolve ghosts, whip-pan motion blur, J/L-cut pre-laps, GOP macroblocking) while preventing fixed-offset overshoot on rapid `< 1.2s` commercial cuts.
+   - Adds periodic `4.0s` fallback samples for long continuous takes (`> 5.0s`), capped at `videoMaxFramesPerAsset` (`24` frames/video).
+2. **AEM `mobile.mp4` Rendition + Presigned `HTTP 206` Blob Streaming**:
+   - Prefers AEM's `mobile.mp4` rendition (~14× smaller than `original`) and resolves AEM's Direct Binary Access presigned SAS URL (`aem-blob-ns-...`, `HTTP 206 Partial Content` + `Access-Control-Allow-Origin: *`) verbatim without mutating signed `rscd` query parameters.
+3. **Dual-Engine Frame Extractor**:
+   - **Browser `<video>` + `<canvas>` Scene Extractor** (`web-src/src/utils/video-frame-extractor.js`): 0 KB impact on OpenWhisk's 22–48 MB action zip limit; hardware-decoded `64×36` Luma-SAD shot detection + chunked `4`-frame batch uploads to `ingestVideoFrames`.
+   - **Server-Side FFmpeg HTTP Range Extractor + Poster Fallback** (`actions/lib/video-extractor.js`): Two-pass `scdet` + `ffmpeg -ss <t> -i "<presignedUrl>"` (via HTTP `Range` without full file download) when `ffmpeg` is available, with automatic fallback to `cq5dam.web.1280.1280.jpeg` (`t = 0.0s`) in standard Runtime containers.
+4. **Intra-Video Person Consolidation & AEM Temporal Metadata (`xdm:faceTimestamps`)**:
+   - Consolidates multiple shots of the same person within one video into a single canonical `faceId` (keeping the highest-quality avatar and deleting redundant intra-video vectors from Rekognition) while storing all shot timestamps and bounding boxes in `appearances[]` / `timestampsSec[]`.
+   - Writes `xdm:faceTimestamps` (`["Jill Jelly@00:04.2,00:14.5", ...]`) and `xdm:faceTimelineJson` to `jcr:content/metadata` so the **Coworker `aem-face-recognition` skill** can read and link to exact video timestamps via `search-assets` with zero extra API calls.
+5. **Interactive Video Scrubber & Deep-Linking (`AssetDetailsSidePanel.js` & `AdminConsole.js`)**:
+   - Inline `<video>` player at the top of `AssetDetailsSidePanel.js` with time-synchronized bounding boxes and clickable `▶ 0:14.5` timestamp pills.
+   - Deep-linking from `AdminConsole.js` (`↗ 0:14.5`) and Coworker reports via `?t=14.5` hash param + `STORAGE_KEY_CTX` (`pendingSeekTimestamp`) auto-seek on load, plus direct `#t=14.5` W3C Media Fragment links on MP4 renditions.
+
+### Implementation Checklist
+- [x] **Step 1 (`storage.js`, `security.js`, `aem.js`)**: Add `video/*` MIME types & video sampling settings; implement `aemClient.resolveVideoStreamUrl(assetPath)` and `xdm:faceTimestamps` / `xdm:faceTimelineJson` metadata writeback.
+- [x] **Step 2 (`face-service.js`, `actions/ingest/index.js`, `actions/groups/index.js`)**: Implement `ingestVideoFrames` with intra-video person consolidation, quality-ranked avatar selection, and `getVideoStreamUrl`.
+- [x] **Step 3 (`video-frame-extractor.js` & `video-extractor.js`)**: Build the browser `<video>` + `<canvas>` Luma-SAD scene extractor and server-side FFmpeg / poster fallback extractor.
+- [x] **Step 4 (`AssetDetailsSidePanel.js`, `AdminConsole.js`, `ExtensionRegistration.js`)**: Add inline `<video>` scrubber, dynamic shot bounding-box overlay, clickable `▶ 0:14.5` pills, and `?t=` deep-link auto-seek.
+- [x] **Step 5 (`SKILL.md` & `test/video-faces.test.js`)**: Update `aem-face-recognition` skill for video timestamps and add unit/UI tests.
+
+

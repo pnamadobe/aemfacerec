@@ -752,20 +752,19 @@ test('UI Simplifications: compact KPI bar, sticky right-hand Manage Group panel,
 
   cleanup();
 
-  // 5. Side panel: shows "Combine Into..." button and loads group options only on demand when clicked
+  // 5. Side panel: compact cards have clickable person name for inline rename, and omit Split Face / Combine Into...
   requests.length = 0;
   renderSidePanel('/content/dam/ui/asset-1-0.jpg');
   await screen.findAllByText(/Alice Example/);
   assert.equal(screen.queryByText(/% conf/), null);
+  assert.equal(screen.queryByText('Split Face'), null);
+  assert.equal(screen.queryByText('Combine Into...'), null);
 
-  const combineBtn = screen.getByText('Combine Into...').closest('button');
-  assert.ok(combineBtn, 'Side panel renders Combine Into... button');
-  fireEvent.click(combineBtn);
-  await screen.findAllByText('Combine into existing group:');
-  assert.ok(
-    requests.some((r) => r.action === 'groups' && r.body.operation === 'listGroupOptions'),
-    'listGroupOptions is fetched lazily when Combine Into... is clicked'
-  );
+  const clickableName = screen.getByTitle(/Click to rename/);
+  assert.ok(clickableName, 'Person name is clickable to open inline rename');
+  fireEvent.click(clickableName);
+  const nameInput = await screen.findByLabelText('Person Name');
+  assert.equal(nameInput.value, 'Alice Example');
 });
 
 test('UI Dual-Write: Settings tab includes secondary metadata property toggle (xdm:persona) and only a single Save Settings & Sync button', async () => {
@@ -796,4 +795,85 @@ test('UI Dual-Write: Settings tab includes secondary metadata property toggle (x
   const closeBefore = modalCloseCalls;
   fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' });
   assert.equal(modalCloseCalls, closeBefore + 1, 'Escape key should close the Face Console modal');
+});
+
+test('UI Video Assets: Side Panel renders video scene scrubber and clickable timestamp pills, and Admin Console renders ?t= deep links', async () => {
+  const storage = await createStorage({});
+  const db = await storage.getDatabase();
+
+  // Seed a video asset with two scene appearances for Alice Example (grp_001)
+  db.faces['face-video-1'] = {
+    faceId: 'face-video-1',
+    groupId: 'grp_001',
+    assetId: 'asset-video-1',
+    assetPath: '/content/dam/ui/commercial-spot.mp4',
+    assetTitle: 'commercial-spot.mp4',
+    mediaType: 'video',
+    boundingBox: { left: 0.25, top: 0.18, width: 0.22, height: 0.35 },
+    confidence: 99.4,
+    timestampSec: 4.2,
+    shotRangeSec: [3.6, 8.0],
+    timestampsSec: [4.2, 14.5],
+    appearances: [
+      {
+        timestampSec: 4.2,
+        shotRangeSec: [3.6, 8.0],
+        boundingBox: { left: 0.25, top: 0.18, width: 0.22, height: 0.35 },
+        confidence: 99.4
+      },
+      {
+        timestampSec: 14.5,
+        shotRangeSec: [13.9, 19.0],
+        boundingBox: { left: 0.45, top: 0.22, width: 0.2, height: 0.32 },
+        confidence: 99.1
+      }
+    ],
+    avatarDataUrl: 'data:image/jpeg;base64,/9j/4AAQSkZJRg=='
+  };
+  db.groups.grp_001.faceIds.unshift('face-video-1');
+  db.assets['asset-video-1'] = {
+    assetId: 'asset-video-1',
+    assetPath: '/content/dam/ui/commercial-spot.mp4',
+    assetTitle: 'commercial-spot.mp4',
+    mediaType: 'video',
+    mimeType: 'video/mp4',
+    faceIds: ['face-video-1']
+  };
+  await storage.saveDatabase(db);
+
+  try {
+    // 1. Render Admin Console and verify the video face card has a ?t=4.2 deep link and 🎬 timestamp badge
+    renderConsole();
+    await screen.findByText('Alice Example');
+    const card = screen.getAllByText('Alice Example').find((el) => el.closest('div[style*="cursor: pointer"]'));
+    fireEvent.click(card);
+    await screen.findByText('Manage Group: Alice Example');
+
+    const videoLink = await screen.findByLabelText('Open commercial-spot.mp4 in new tab');
+    assert.equal(
+      videoLink.getAttribute('href'),
+      'https://experience.adobe.com/?repoId=author-p1-e1.adobeaemcloud.com#/assets/detail/content/dam/ui/commercial-spot.mp4?t=4.2'
+    );
+    assert.ok(screen.getByText(/00:04\.2, 00:14\.5/), 'Admin Console shows video timestamp badge');
+    cleanup();
+
+    // 2. Render Side Panel on the video asset: shows video preview stage and clickable pills (without raw grp_... timestamp dump)
+    renderSidePanel('/content/dam/ui/commercial-spot.mp4');
+    const pill1 = await screen.findByText('▶ 00:04.2');
+    const pill2 = await screen.findByText('▶ 00:14.5');
+    assert.ok(pill1 && pill2);
+    assert.equal(screen.queryByText(/grp_001@00:04\.2/), null);
+    assert.equal(screen.queryByText(/VIDEO SCENE SCRUBBER/), null);
+
+    fireEvent.click(pill2);
+    await waitFor(() => assert.equal(pill2.style.background, 'rgb(224, 242, 254)'));
+  } finally {
+    const cleanDb = await storage.getDatabase();
+    delete cleanDb.faces['face-video-1'];
+    delete cleanDb.assets['asset-video-1'];
+    if (cleanDb.groups.grp_001) {
+      cleanDb.groups.grp_001.faceIds = cleanDb.groups.grp_001.faceIds.filter((id) => id !== 'face-video-1');
+    }
+    await storage.saveDatabase(cleanDb);
+  }
 });

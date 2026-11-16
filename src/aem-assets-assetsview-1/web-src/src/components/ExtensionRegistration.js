@@ -32,7 +32,7 @@ function findAemAuthorUrl(...sources) {
   return sources.map(visit).find(Boolean) || '';
 }
 
-const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic)$/i;
+const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif|tiff?|bmp|avif|heic|heif|psd|mp4|mov|webm|m4v|avi|mkv|mpeg|mpg)$/i;
 
 function extractAssetContext(resourceOrWrapper, context) {
   const resource =
@@ -307,13 +307,22 @@ export default function ExtensionRegistration() {
                 } catch (e) {
                   // ignore
                 }
+                const panelQs = new URLSearchParams(
+                  Object.entries({
+                    v: '2',
+                    assetId: extracted.assetId || '',
+                    assetPath: extracted.assetPath || '',
+                    assetName: extracted.assetName || '',
+                    aemAuthorUrl: extracted.aemAuthorUrl || ''
+                  }).filter(([, v]) => Boolean(v))
+                ).toString();
                 return [
                   {
                     id: 'face-recognition-panel',
                     tooltip: 'Recognized Faces & People',
                     icon: 'UserGroup',
                     title: 'Recognized Faces',
-                    contentUrl: '/#face-recognition-panel',
+                    contentUrl: `/index.html?v=${Date.now()}#face-recognition-panel?${panelQs}`,
                     reloadOnThemeChange: true
                   }
                 ];
@@ -354,7 +363,7 @@ export default function ExtensionRegistration() {
                       const qs = new URLSearchParams(extracted).toString();
                       guestConnection.host.modal.openDialog({
                         title: 'Facial Recognition & Group Management',
-                        contentUrl: `/#modal-face-management?${qs}`,
+                        contentUrl: `/index.html?v=${Date.now()}#modal-face-management?${qs}`,
                         type: 'fullscreen',
                         size: 'XL',
                         payload: extracted

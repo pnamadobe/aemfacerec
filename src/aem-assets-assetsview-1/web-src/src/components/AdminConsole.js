@@ -25,6 +25,7 @@ import {
   AlertDialog
 } from '@adobe/react-spectrum';
 import { api, resultBanner, describeScanSummary } from '../utils/api';
+import { formatVideoTimestamp } from '../utils/video-frame-extractor';
 import { extensionId, STORAGE_KEY_CTX } from './Constants';
 
 const GROUP_PAGE_SIZE = 60;
@@ -33,8 +34,15 @@ const GROUP_FACES_PAGE_SIZE = 60;
 /**
  * Builds a direct URL to open an AEM asset's detail view in AEM Assets View (`experience.adobe.com`).
  * Never uses `/ui#/aem/assetdetails.html...` because that opens the Touch / Admin UI instead of Assets View.
+ * When `timestampSec` is provided (for video assets), appends `?t=<seconds>` so the `Recognized Faces`
+ * side panel scrubs directly to that timestamp.
  */
-function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') {
+function buildAssetDetailUrl(
+  assetPath,
+  hostContext = {},
+  fallbackAemHost = '',
+  { timestampSec = null } = {}
+) {
   if (!assetPath) return null;
   const cleanPath = String(assetPath).startsWith('/') ? String(assetPath) : `/${assetPath}`;
   const rawHost = hostContext.aemHost || fallbackAemHost || '';
@@ -57,7 +65,36 @@ function buildAssetDetailUrl(assetPath, hostContext = {}, fallbackAemHost = '') 
     // ignore
   }
 
-  return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#${tenantPart}/assets/detail${panelSegment}${cleanPath}`;
+  const timeQuery =
+    timestampSec !== null && timestampSec !== undefined && Number.isFinite(Number(timestampSec))
+      ? `?t=${Number(Number(timestampSec).toFixed(2))}`
+      : '';
+
+  return `${expOrigin}/?repoId=${encodeURIComponent(repoId)}#${tenantPart}/assets/detail${panelSegment}${cleanPath}${timeQuery}`;
+}
+
+function broadcastPendingVideoSeek(assetPath, timestampSec) {
+  if (timestampSec === null || timestampSec === undefined || !Number.isFinite(Number(timestampSec))) {
+    return;
+  }
+  const cleanTime = Number(Number(timestampSec).toFixed(2));
+  try {
+    const prev = JSON.parse(localStorage.getItem(STORAGE_KEY_CTX) || '{}');
+    const next = {
+      ...prev,
+      assetPath: assetPath || prev.assetPath,
+      pendingSeekTimestamp: cleanTime,
+      pendingSeekSavedAt: Date.now()
+    };
+    localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(next));
+    if (typeof BroadcastChannel !== 'undefined') {
+      const bc = new BroadcastChannel(STORAGE_KEY_CTX);
+      bc.postMessage(next);
+      bc.close();
+    }
+  } catch (e) {
+    // ignore
+  }
 }
 
 /**
@@ -288,6 +325,12 @@ export default function AdminConsole() {
     enabledFoldersText: '/content/dam/events\n/content/dam/campaigns',
     allowedImageTypesText: '',
     minImageSize: 200,
+    enableVideoFaceRecognition: false,
+    allowedVideoTypesText: 'video/mp4, video/quicktime, video/webm, video/x-m4v',
+    videoSceneThreshold: 0.28,
+    videoShotOffsetSec: 0.6,
+    videoMaxSampleIntervalSec: 4.0,
+    videoMaxFramesPerAsset: 24,
     restrictCuratorActionsToAdmins: false,
     curatorGroupsText: 'administrators, dam-administrators'
   });
@@ -479,6 +522,9 @@ export default function AdminConsole() {
           awsSecretAccessKey: '',
           enabledFoldersText: (settingsRes.settings.enabledFolders || ['/content/dam']).join('\n'),
           allowedImageTypesText: (settingsRes.settings.allowedImageTypes || []).join(', '),
+          allowedVideoTypesText: (
+            settingsRes.settings.allowedVideoTypes || ['video/mp4', 'video/quicktime', 'video/webm']
+          ).join(', '),
           curatorGroupsText: (
             settingsRes.settings.curatorGroups || ['administrators', 'dam-administrators']
           ).join(', ')
@@ -627,6 +673,15 @@ export default function AdminConsole() {
           .map((t) => t.trim())
           .filter(Boolean),
         minImageSize: Number(settings.minImageSize),
+        enableVideoFaceRecognition: Boolean(settings.enableVideoFaceRecognition),
+        allowedVideoTypes: (settings.allowedVideoTypesText || '')
+          .split(/[\s,]+/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+        videoSceneThreshold: Number(settings.videoSceneThreshold),
+        videoShotOffsetSec: Number(settings.videoShotOffsetSec),
+        videoMaxSampleIntervalSec: Number(settings.videoMaxSampleIntervalSec),
+        videoMaxFramesPerAsset: Number(settings.videoMaxFramesPerAsset),
         restrictCuratorActionsToAdmins: Boolean(settings.restrictCuratorActionsToAdmins),
         curatorGroups: (settings.curatorGroupsText || '')
           .split(',')
@@ -1238,10 +1293,17 @@ export default function AdminConsole() {
                                       {face.assetTitle}
                                     </Text>
                                     {(() => {
+                                      const primaryTs =
+                                        face.timestampSec !== undefined &&
+                                        face.timestampSec !== null &&
+                                        Number.isFinite(Number(face.timestampSec))
+                                          ? Number(face.timestampSec)
+                                          : null;
                                       const detailUrl = buildAssetDetailUrl(
                                         face.assetPath,
                                         hostContext,
-                                        serverAemHost
+                                        serverAemHost,
+                                        { timestampSec: primaryTs }
                                       );
                                       if (!detailUrl) return null;
                                       return (
@@ -1250,8 +1312,17 @@ export default function AdminConsole() {
                                           target="_blank"
                                           rel="noopener noreferrer"
                                           aria-label={`Open ${face.assetTitle} in new tab`}
-                                          title={`Open ${face.assetTitle} detail page in new tab`}
-                                          onClick={(e) => e.stopPropagation()}
+                                          title={
+                                            primaryTs !== null
+                                              ? `Open ${face.assetTitle} at ${formatVideoTimestamp(primaryTs)} in new tab`
+                                              : `Open ${face.assetTitle} detail page in new tab`
+                                          }
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            if (primaryTs !== null) {
+                                              broadcastPendingVideoSeek(face.assetPath, primaryTs);
+                                            }
+                                          }}
                                           style={{
                                             display: 'inline-flex',
                                             alignItems: 'center',
@@ -1279,6 +1350,34 @@ export default function AdminConsole() {
                                       );
                                     })()}
                                   </span>
+                                  {(() => {
+                                    const times =
+                                      Array.isArray(face.timestampsSec) && face.timestampsSec.length > 0
+                                        ? face.timestampsSec
+                                        : face.timestampSec !== undefined &&
+                                          face.timestampSec !== null &&
+                                          Number.isFinite(Number(face.timestampSec))
+                                        ? [Number(face.timestampSec)]
+                                        : [];
+                                    if (times.length === 0) return null;
+                                    return (
+                                      <span
+                                        style={{
+                                          fontSize: 10,
+                                          background: '#e0f2fe',
+                                          color: '#0369a1',
+                                          padding: '1px 6px',
+                                          borderRadius: 999,
+                                          fontWeight: 600,
+                                          textAlign: 'center'
+                                        }}
+                                        title={`Video scene timestamps: ${times.map((t) => formatVideoTimestamp(t)).join(', ')}`}
+                                      >
+                                        🎬 {times.slice(0, 3).map((t) => formatVideoTimestamp(t)).join(', ')}
+                                        {times.length > 3 ? ` +${times.length - 3}` : ''}
+                                      </span>
+                                    );
+                                  })()}
                                   {canManageGroups && (
                                     <Checkbox isSelected={isFaceSelected}>
                                       <span style={{ fontSize: 11 }}>Select</span>
@@ -1566,11 +1665,71 @@ export default function AdminConsole() {
                         width="size-3000"
                       />
                       <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>
-                        Other file types (PDFs, videos, SVGs, GIFs...) and small images such as
-                        logos and icons are never sent to AWS. Folder scans also skip images that
+                        Other file types (PDFs, SVGs, GIFs...) and small images such as
+                        logos and icons are never sent to AWS. Folder scans also skip assets that
                         were already scanned unless &quot;Include already-scanned images&quot; is
                         checked.
                       </Text>
+
+                      <Divider size="S" />
+
+                      <Heading level={4} margin={0}>
+                        Video Scene-Change Facial Recognition
+                      </Heading>
+                      <Switch
+                        isSelected={Boolean(settings.enableVideoFaceRecognition)}
+                        onChange={(val) =>
+                          setSettings((s) => ({ ...s, enableVideoFaceRecognition: val }))
+                        }
+                      >
+                        Enable Video Face Recognition &amp; Scene-Change Frame Extraction (writes{' '}
+                        <code>xdm:faceTimestamps</code>)
+                      </Switch>
+                      {settings.enableVideoFaceRecognition && (
+                        <Flex direction="column" gap="size-150">
+                          <TextField
+                            label="Video types to analyze (comma-separated)"
+                            value={settings.allowedVideoTypesText}
+                            onChange={(v) =>
+                              setSettings((s) => ({ ...s, allowedVideoTypesText: v }))
+                            }
+                            width="100%"
+                          />
+                          <Flex gap="size-150" wrap>
+                            <TextField
+                              label="Post-cut settle offset (seconds)"
+                              value={String(settings.videoShotOffsetSec ?? 0.6)}
+                              onChange={(v) =>
+                                setSettings((s) => ({ ...s, videoShotOffsetSec: v }))
+                              }
+                              width="size-2400"
+                            />
+                            <TextField
+                              label="Scene-change threshold (0.05-0.95)"
+                              value={String(settings.videoSceneThreshold ?? 0.28)}
+                              onChange={(v) =>
+                                setSettings((s) => ({ ...s, videoSceneThreshold: v }))
+                              }
+                              width="size-2400"
+                            />
+                            <TextField
+                              label="Max frames per video"
+                              value={String(settings.videoMaxFramesPerAsset ?? 24)}
+                              onChange={(v) =>
+                                setSettings((s) => ({ ...s, videoMaxFramesPerAsset: v }))
+                              }
+                              width="size-2000"
+                            />
+                          </Flex>
+                          <Text UNSAFE_style={{ fontSize: 12, color: '#64748b' }}>
+                            Samples each scene at{' '}
+                            <code>t_cut + min(offset, 0.45 × shotDuration)</code> to avoid
+                            cross-dissolves and motion blur while clamping to short cuts, and
+                            consolidates duplicate shots of the same person into one face record
+                            with clickable timestamps.
+                          </Text>
+                        </Flex>
+                      )}
 
                       <Divider size="S" />
 
