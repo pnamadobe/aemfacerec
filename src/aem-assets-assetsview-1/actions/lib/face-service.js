@@ -7,6 +7,9 @@ const { mapWithConcurrency } = require('./retry');
 const {
   formatVideoTimestamp,
   computeFaceFrameQualityScore,
+  classifyShotFraming,
+  extractFrameVisualMetrics,
+  buildDeterministicVideoSummary,
   extractVideoFramesWithFfmpeg
 } = require('./video-extractor');
 
@@ -262,6 +265,28 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     faceTimelineJson = timelineItems.length > 0 ? JSON.stringify(timelineItems).slice(0, 16000) : '';
   }
 
+  let videoSummary = null;
+  if (isVideo) {
+    const distinctTimes = new Set(
+      sortedFaces.map((f) => Number(f.timestampSec || 0).toFixed(1))
+    );
+    const sceneCount = Math.max(
+      Number(assetRecord?.scannedFramesCount) || 0,
+      distinctTimes.size,
+      1
+    );
+    const emotions = sortedFaces
+      .map((f) => f.attributes?.emotion)
+      .filter(Boolean);
+    videoSummary = buildDeterministicVideoSummary({
+      durationSec: Number(assetRecord?.durationSec) || 0,
+      sceneCount,
+      faceLabels,
+      machineKeywords: assetRecord?.machineKeywords || [],
+      emotions
+    });
+  }
+
   const metadataProperty = settings.metadataProperty || 'xdm:faceNames';
   const secondaryMetadataProperty =
     settings.enableSecondaryMetadataProperty && settings.secondaryMetadataProperty
@@ -276,7 +301,7 @@ function computeAssetFaceMetadata(assetRecord, faces, groups, settings) {
     faceGroupIds,
     // For video assets, faceCount is the number of unique people (groups) or total detections when 0
     faceCount: isVideo && faceGroupIds.length > 0 ? faceGroupIds.length : faceIds.length,
-    ...(isVideo ? { faceTimestamps, faceTimelineJson } : {})
+    ...(isVideo ? { faceTimestamps, faceTimelineJson, videoSummary } : {})
   };
 }
 
@@ -370,12 +395,16 @@ async function createFaceService({
       for (const shot of memberShots) {
         if (Array.isArray(shot.appearances) && shot.appearances.length > 1) {
           for (const app of shot.appearances) {
+            const box = app.boundingBox || shot.boundingBox;
             allApps.push({
               faceId: app.faceId || shot.faceId,
               timestampSec: Number(app.timestampSec ?? shot.timestampSec ?? 0),
               shotRangeSec: app.shotRangeSec || shot.shotRangeSec || [0, 0],
-              boundingBox: app.boundingBox || shot.boundingBox,
+              boundingBox: box,
               confidence: app.confidence ?? shot.confidence,
+              attributes: app.attributes || shot.attributes || null,
+              shotFraming: app.shotFraming || shot.shotFraming || classifyShotFraming(box, 1),
+              frameVisuals: app.frameVisuals || shot.frameVisuals || null,
               avatarDataUrl: shot.avatarDataUrl || bestShot.avatarDataUrl || null
             });
           }
@@ -387,6 +416,9 @@ async function createFaceService({
             shotRangeSec: shot.shotRangeSec || [ts, ts],
             boundingBox: shot.boundingBox,
             confidence: shot.confidence,
+            attributes: shot.attributes || null,
+            shotFraming: shot.shotFraming || classifyShotFraming(shot.boundingBox, 1),
+            frameVisuals: shot.frameVisuals || null,
             avatarDataUrl: shot.avatarDataUrl || bestShot.avatarDataUrl || null
           });
         }
@@ -915,6 +947,18 @@ async function createFaceService({
     assetRecord.mediaType = 'video';
     assetRecord.mimeType = mimeType || info.mimeType || assetRecord.mimeType || 'video/mp4';
     assetRecord.extractionMode = extractionMode;
+    if (Array.isArray(info.machineKeywords) && info.machineKeywords.length > 0) {
+      assetRecord.machineKeywords = info.machineKeywords;
+    } else if (resetExisting && !assetRecord.machineKeywords && cleanPath && typeof aemClient.getAssetInfo === 'function') {
+      try {
+        const extraInfo = await aemClient.getAssetInfo(cleanPath);
+        if (Array.isArray(extraInfo?.machineKeywords) && extraInfo.machineKeywords.length > 0) {
+          assetRecord.machineKeywords = extraInfo.machineKeywords;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
     if (Number.isFinite(Number(durationSec)) && Number(durationSec) > 0) {
       assetRecord.durationSec = Number(Number(durationSec).toFixed(2));
     }
@@ -955,135 +999,195 @@ async function createFaceService({
           ]
         : [timestampSec, timestampSec];
 
-      // eslint-disable-next-line no-await-in-loop
-      const detectedFaces = await rekognition.indexAssetFaces(buf, resolvedAssetId, {
-        skipEnsureCollection: collectionChecked
-      });
-      collectionChecked = true;
-
-      if (!detectedFaces.length) continue;
-
-      let decodedImage = buf;
+      let detectedFaces = [];
+      let indexedInFrame = [];
       try {
-        decodedImage = decodeImageBuffer(buf);
-        if (!firstPreviewDataUrl) {
-          firstPreviewDataUrl = generatePreviewThumbnailDataUrl(decodedImage, 280, 62);
-        }
-      } catch (e) {
-        decodedImage = buf;
-      }
-
-      for (const detected of detectedFaces) {
-        const { faceId, confidence, boundingBox } = detected;
-        const frameQuality = computeFaceFrameQualityScore(boundingBox, confidence);
         // eslint-disable-next-line no-await-in-loop
-        const match = await rekognition.findMatchingGroup(faceId, db.faces, db.groups);
-        const matchedGroupId = match && db.groups[match.groupId] ? match.groupId : null;
+        detectedFaces = await rekognition.indexAssetFaces(buf, resolvedAssetId, {
+          skipEnsureCollection: collectionChecked
+        });
+        collectionChecked = true;
+        indexedInFrame = detectedFaces.map((f) => f.faceId);
 
-        // Check if this detection is a sub-0.45s duplicate of the exact same shot already recorded
-        const groupFacesOnVideo = matchedGroupId ? existingFacesByGroup.get(matchedGroupId) || [] : [];
-        const sameShotFace = groupFacesOnVideo.find(
-          (f) => Math.abs(Number(f.timestampSec || 0) - timestampSec) < 0.45
-        );
+        if (!detectedFaces.length) continue;
 
-        if (sameShotFace) {
-          const prevBestScore = Number(sameShotFace.bestFrameQualityScore || 0);
-          if (frameQuality > prevBestScore) {
+        let decodedImage = buf;
+        let frameVisuals = rawFrame.frameVisuals || null;
+        try {
+          decodedImage = decodeImageBuffer(buf);
+          if (!frameVisuals && decodedImage?.data) {
+            frameVisuals = extractFrameVisualMetrics(decodedImage.data);
+          }
+          if (!firstPreviewDataUrl) {
+            firstPreviewDataUrl = generatePreviewThumbnailDataUrl(decodedImage, 280, 62);
+          }
+        } catch (e) {
+          decodedImage = buf;
+        }
+
+        const peopleInShotCount = detectedFaces.length;
+        const appliedInFrame = new Set();
+
+        try {
+          for (const detected of detectedFaces) {
+            const { faceId, confidence, boundingBox, attributes } = detected;
+            const shotFraming = classifyShotFraming(boundingBox, peopleInShotCount);
+            const frameQuality = computeFaceFrameQualityScore(boundingBox, confidence);
+            // eslint-disable-next-line no-await-in-loop
+            const match = await rekognition.findMatchingGroup(faceId, db.faces, db.groups);
+            const matchedGroupId = match && db.groups[match.groupId] ? match.groupId : null;
+
+            // Check if this detection is a sub-0.45s duplicate of the exact same shot already recorded
+            const groupFacesOnVideo = matchedGroupId
+              ? existingFacesByGroup.get(matchedGroupId) || []
+              : [];
+            const sameShotFace = groupFacesOnVideo.find(
+              (f) => Math.abs(Number(f.timestampSec || 0) - timestampSec) < 0.45
+            );
+
+            if (sameShotFace) {
+              const prevBestScore = Number(sameShotFace.bestFrameQualityScore || 0);
+              if (frameQuality > prevBestScore) {
+                // eslint-disable-next-line no-await-in-loop
+                const avatar = await cropFaceAvatar(decodedImage, boundingBox);
+                // eslint-disable-next-line no-await-in-loop
+                const avatarFile = await storage.saveAvatar(sameShotFace.faceId, avatar.buffer);
+                sameShotFace.avatarFile = avatarFile;
+                sameShotFace.avatarStoredExternally = Boolean(avatarFile);
+                sameShotFace.avatarDataUrl = avatar.dataUrl;
+                sameShotFace.boundingBox = boundingBox;
+                sameShotFace.confidence = confidence;
+                if (attributes) sameShotFace.attributes = attributes;
+                sameShotFace.shotFraming = shotFraming;
+                if (frameVisuals) sameShotFace.frameVisuals = frameVisuals;
+                sameShotFace.bestFrameQualityScore = frameQuality;
+                sameShotFace.timestampSec = timestampSec;
+                sameShotFace.shotRangeSec = shotRangeSec;
+                sameShotFace.timestampsSec = [timestampSec];
+                sameShotFace.appearances = [
+                  {
+                    faceId: sameShotFace.faceId,
+                    timestampSec,
+                    shotRangeSec,
+                    boundingBox,
+                    confidence,
+                    ...(attributes ? { attributes } : {}),
+                    shotFraming,
+                    ...(frameVisuals ? { frameVisuals } : {})
+                  }
+                ];
+              }
+              // Sub-0.45s duplicate within the same shot is discarded
+              appliedInFrame.add(faceId);
+              // eslint-disable-next-line no-await-in-loop
+              await rekognition.deleteFaces([faceId]).catch(() => {});
+              continue;
+            }
+
+            // Distinct shot detection: keep its own faceId, cropped avatar, and Rekognition vector
+            // so an admin/curator can split or reassign this specific shot independently!
             // eslint-disable-next-line no-await-in-loop
             const avatar = await cropFaceAvatar(decodedImage, boundingBox);
             // eslint-disable-next-line no-await-in-loop
-            const avatarFile = await storage.saveAvatar(sameShotFace.faceId, avatar.buffer);
-            sameShotFace.avatarFile = avatarFile;
-            sameShotFace.avatarStoredExternally = Boolean(avatarFile);
-            sameShotFace.avatarDataUrl = avatar.dataUrl;
-            sameShotFace.boundingBox = boundingBox;
-            sameShotFace.confidence = confidence;
-            sameShotFace.bestFrameQualityScore = frameQuality;
-            sameShotFace.timestampSec = timestampSec;
-            sameShotFace.shotRangeSec = shotRangeSec;
-            sameShotFace.timestampsSec = [timestampSec];
-            sameShotFace.appearances = [
-              { faceId: sameShotFace.faceId, timestampSec, shotRangeSec, boundingBox, confidence }
-            ];
+            const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
+
+            let assignedGroupId;
+            let matchConfidence = null;
+
+            if (matchedGroupId) {
+              assignedGroupId = matchedGroupId;
+              matchConfidence = match.matchConfidence;
+              // eslint-disable-next-line no-await-in-loop
+              await rekognition.associateFaces(assignedGroupId, [faceId]);
+              const grp = db.groups[assignedGroupId];
+              if (!grp.faceIds.includes(faceId)) grp.faceIds.push(faceId);
+              // Promote group cover avatar if this shot is higher quality than the first shot
+              const currentCover = db.faces[grp.coverFaceId];
+              if (
+                currentCover &&
+                currentCover.assetId === resolvedAssetId &&
+                frameQuality > Number(currentCover.bestFrameQualityScore || 0)
+              ) {
+                grp.coverFaceId = faceId;
+              }
+              grp.updatedAt = now;
+            } else {
+              assignedGroupId = generateGroupId();
+              // eslint-disable-next-line no-await-in-loop
+              await rekognition.createGroup(assignedGroupId, [faceId]);
+              const personNumber = db.counters.nextPersonNumber || 1;
+              db.counters.nextPersonNumber = personNumber + 1;
+              db.groups[assignedGroupId] = {
+                groupId: assignedGroupId,
+                name: null,
+                autoLabel: `Person #${personNumber}`,
+                coverFaceId: faceId,
+                faceIds: [faceId],
+                createdAt: now,
+                updatedAt: now
+              };
+            }
+
+            const newFaceRecord = {
+              faceId,
+              groupId: assignedGroupId,
+              assetId: resolvedAssetId,
+              assetPath: resolvedPath,
+              assetTitle: resolvedTitle,
+              mediaType: 'video',
+              boundingBox,
+              confidence,
+              matchConfidence,
+              ...(attributes ? { attributes } : {}),
+              shotFraming,
+              ...(frameVisuals ? { frameVisuals } : {}),
+              bestFrameQualityScore: frameQuality,
+              timestampSec,
+              shotRangeSec,
+              timestampsSec: [timestampSec],
+              appearances: [
+                {
+                  faceId,
+                  timestampSec,
+                  shotRangeSec,
+                  boundingBox,
+                  confidence,
+                  ...(attributes ? { attributes } : {}),
+                  shotFraming,
+                  ...(frameVisuals ? { frameVisuals } : {})
+                }
+              ],
+              avatarFile,
+              avatarStoredExternally: Boolean(avatarFile),
+              avatarDataUrl: avatar.dataUrl,
+              createdAt: now
+            };
+
+            db.faces[faceId] = newFaceRecord;
+            if (!assetRecord.faceIds.includes(faceId)) {
+              assetRecord.faceIds.push(faceId);
+            }
+            appliedInFrame.add(faceId);
+            const updatedList = existingFacesByGroup.get(assignedGroupId) || [];
+            updatedList.push(newFaceRecord);
+            existingFacesByGroup.set(assignedGroupId, updatedList);
           }
-          // Sub-0.45s duplicate within the same shot is discarded
+        } catch (frameErr) {
+          const unapplied = indexedInFrame.filter((id) => !appliedInFrame.has(id));
           // eslint-disable-next-line no-await-in-loop
-          await rekognition.deleteFaces([faceId]).catch(() => {});
-          continue;
+          await discardIndexedFaces(unapplied, rekognition);
+          assetRecord.incomplete = true;
+          db.assets[resolvedAssetId] = assetRecord;
+          frameErr.dbMutated = true;
+          throw frameErr;
         }
-
-        // Distinct shot detection: keep its own faceId, cropped avatar, and Rekognition vector
-        // so an admin/curator can split or reassign this specific shot independently!
-        // eslint-disable-next-line no-await-in-loop
-        const avatar = await cropFaceAvatar(decodedImage, boundingBox);
-        // eslint-disable-next-line no-await-in-loop
-        const avatarFile = await storage.saveAvatar(faceId, avatar.buffer);
-
-        let assignedGroupId;
-        let matchConfidence = null;
-
-        if (matchedGroupId) {
-          assignedGroupId = matchedGroupId;
-          matchConfidence = match.matchConfidence;
-          // eslint-disable-next-line no-await-in-loop
-          await rekognition.associateFaces(assignedGroupId, [faceId]);
-          const grp = db.groups[assignedGroupId];
-          if (!grp.faceIds.includes(faceId)) grp.faceIds.push(faceId);
-          // Promote group cover avatar if this shot is higher quality than the first shot
-          const currentCover = db.faces[grp.coverFaceId];
-          if (
-            currentCover &&
-            currentCover.assetId === resolvedAssetId &&
-            frameQuality > Number(currentCover.bestFrameQualityScore || 0)
-          ) {
-            grp.coverFaceId = faceId;
-          }
-          grp.updatedAt = now;
-        } else {
-          assignedGroupId = generateGroupId();
-          // eslint-disable-next-line no-await-in-loop
-          await rekognition.createGroup(assignedGroupId, [faceId]);
-          const personNumber = db.counters.nextPersonNumber || 1;
-          db.counters.nextPersonNumber = personNumber + 1;
-          db.groups[assignedGroupId] = {
-            groupId: assignedGroupId,
-            name: null,
-            autoLabel: `Person #${personNumber}`,
-            coverFaceId: faceId,
-            faceIds: [faceId],
-            createdAt: now,
-            updatedAt: now
-          };
+      } catch (err) {
+        if (resetExisting || assetRecord.faceIds?.length > 0) {
+          assetRecord.incomplete = true;
+          db.assets[resolvedAssetId] = assetRecord;
+          err.dbMutated = true;
         }
-
-        const newFaceRecord = {
-          faceId,
-          groupId: assignedGroupId,
-          assetId: resolvedAssetId,
-          assetPath: resolvedPath,
-          assetTitle: resolvedTitle,
-          mediaType: 'video',
-          boundingBox,
-          confidence,
-          matchConfidence,
-          bestFrameQualityScore: frameQuality,
-          timestampSec,
-          shotRangeSec,
-          timestampsSec: [timestampSec],
-          appearances: [{ faceId, timestampSec, shotRangeSec, boundingBox, confidence }],
-          avatarFile,
-          avatarStoredExternally: Boolean(avatarFile),
-          avatarDataUrl: avatar.dataUrl,
-          createdAt: now
-        };
-
-        db.faces[faceId] = newFaceRecord;
-        if (!assetRecord.faceIds.includes(faceId)) {
-          assetRecord.faceIds.push(faceId);
-        }
-        const updatedList = existingFacesByGroup.get(assignedGroupId) || [];
-        updatedList.push(newFaceRecord);
-        existingFacesByGroup.set(assignedGroupId, updatedList);
+        throw err;
       }
     }
 
@@ -1098,6 +1202,12 @@ async function createFaceService({
     let sync = { failed: [] };
     if (syncMetadata) {
       sync = await syncAssetsToAem([resolvedAssetId], db, settings, { verifyExists: false });
+      // Hydrate externalized avatarDataUrl for faces created in earlier chunked batches (`P1`)
+      // so the final batch response renders all face avatars immediately!
+      const rawFacesOnAsset = (assetRecord.faceIds || []).map((id) => db.faces[id]).filter(Boolean);
+      if (typeof storage.hydrateFaceAvatars === 'function') {
+        await storage.hydrateFaceAvatars(rawFacesOnAsset);
+      }
     }
 
     const computed = computeAssetFaceMetadata(assetRecord, db.faces, db.groups, settings);
@@ -1112,6 +1222,7 @@ async function createFaceService({
       faceGroupIds: computed.faceGroupIds,
       faceTimestamps: computed.faceTimestamps || [],
       faceTimelineJson: computed.faceTimelineJson || '',
+      videoSummary: computed.videoSummary || null,
       metadataProperty: computed.metadataProperty,
       includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
       metadataSynced: syncMetadata ? sync.failed.length === 0 : false,
@@ -1508,22 +1619,28 @@ async function createFaceService({
         storage.getDatabase()
       ]);
 
-      const result = await ingestVideoFramesInMemory({
-        assetPath,
-        assetId,
-        assetTitle,
-        mimeType,
-        frames,
-        durationSec,
-        extractionMode,
-        resetExisting,
-        syncMetadata,
-        force,
-        db,
-        settings,
-        rekognition,
-        collectionEnsured: false
-      });
+      let result;
+      try {
+        result = await ingestVideoFramesInMemory({
+          assetPath,
+          assetId,
+          assetTitle,
+          mimeType,
+          frames,
+          durationSec,
+          extractionMode,
+          resetExisting,
+          syncMetadata,
+          force,
+          db,
+          settings,
+          rekognition,
+          collectionEnsured: false
+        });
+      } catch (err) {
+        if (err.dbMutated) await storage.saveDatabase(db);
+        throw err;
+      }
 
       if (!result.skipped) {
         await storage.saveDatabase(db);
@@ -1952,6 +2069,7 @@ async function createFaceService({
         ...(typeof computed.faceTimelineJson === 'string'
           ? { faceTimelineJson: computed.faceTimelineJson }
           : {}),
+        ...(computed.videoSummary ? { videoSummary: computed.videoSummary } : {}),
         metadataProperty: computed.metadataProperty,
         includeUnnamedInMetadata: settings.includeUnnamedInMetadata,
         faces: enrichedFaces

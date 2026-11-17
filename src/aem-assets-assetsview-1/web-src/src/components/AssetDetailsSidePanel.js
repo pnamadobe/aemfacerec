@@ -100,6 +100,7 @@ export default function AssetDetailsSidePanel() {
   const videoRef = useRef(null);
   const [videoStreamInfo, setVideoStreamInfo] = useState(null);
   const [videoDimensions, setVideoDimensions] = useState(null);
+  const [showVideoInsights, setShowVideoInsights] = useState(false);
   const [currentVideoTime, setCurrentVideoTime] = useState(0);
   const [pendingSeekTime, setPendingSeekTime] = useState(readInitialSeekTimestamp);
   const [selectedAppearance, setSelectedAppearance] = useState(null);
@@ -736,6 +737,189 @@ export default function AssetDetailsSidePanel() {
                 })}
               </div>
             </div>
+
+            {/* Slim 1-Line Collapsible Video Insights Bar ($0.00 Zero-LLM Telemetry) */}
+            {(assetData?.videoSummary || faces.length > 0) && (
+              <div style={{ marginTop: 6 }}>
+                <button
+                  type="button"
+                  onClick={() => setShowVideoInsights((v) => !v)}
+                  style={{
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    background: '#f8fafc',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: 6,
+                    padding: '4px 8px',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: '#475569',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <span>
+                    {showVideoInsights ? '▾' : '▸'} Video Summary &amp; Scene Breakdown
+                  </span>
+                  <span style={{ fontWeight: 400, color: '#64748b' }}>
+                    {assetData?.scannedFramesCount
+                      ? `${assetData.scannedFramesCount} scenes`
+                      : `${faces.length} people`}
+                  </span>
+                </button>
+
+                {showVideoInsights && (
+                  <div
+                    style={{
+                      marginTop: 4,
+                      padding: '8px 10px',
+                      background: '#f8fafc',
+                      border: '1px solid #e2e8f0',
+                      borderRadius: 6,
+                      fontSize: 11.5,
+                      color: '#334155',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 8
+                    }}
+                  >
+                    {assetData?.videoSummary && (
+                      <div style={{ lineHeight: 1.4 }}>{assetData.videoSummary}</div>
+                    )}
+
+                    {Array.isArray(assetData?.machineKeywords) &&
+                      assetData.machineKeywords.length > 0 && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {assetData.machineKeywords.slice(0, 8).map((kw) => (
+                            <span
+                              key={kw}
+                              style={{
+                                background: '#e2e8f0',
+                                color: '#334155',
+                                borderRadius: 4,
+                                padding: '1px 6px',
+                                fontSize: 10
+                              }}
+                            >
+                              {kw}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                    {/* Chronological Scene Breakdown */}
+                    {(() => {
+                      const sceneMap = new Map();
+                      for (const f of faces) {
+                        const apps =
+                          Array.isArray(f.appearances) && f.appearances.length > 0
+                            ? f.appearances
+                            : Number.isFinite(Number(f.timestampSec))
+                            ? [{ timestampSec: Number(f.timestampSec), boundingBox: f.boundingBox }]
+                            : [];
+                        for (const app of apps) {
+                          const ts = Number(app.timestampSec || 0);
+                          const key = ts.toFixed(1);
+                          const existing = sceneMap.get(key) || {
+                            timestampSec: ts,
+                            people: [],
+                            framing: app.shotFraming?.scale || null,
+                            emotion: app.attributes?.emotion || null,
+                            visuals: app.frameVisuals || null,
+                            face: f,
+                            app
+                          };
+                          if (!existing.people.includes(f.groupDisplayName)) {
+                            existing.people.push(f.groupDisplayName);
+                          }
+                          if (!existing.framing && app.shotFraming?.scale) {
+                            existing.framing = app.shotFraming.scale;
+                          }
+                          if (!existing.emotion && app.attributes?.emotion) {
+                            existing.emotion = app.attributes.emotion;
+                          }
+                          if (!existing.visuals && app.frameVisuals) {
+                            existing.visuals = app.frameVisuals;
+                          }
+                          sceneMap.set(key, existing);
+                        }
+                      }
+                      const scenes = Array.from(sceneMap.values()).sort(
+                        (a, b) => a.timestampSec - b.timestampSec
+                      );
+                      if (scenes.length === 0) return null;
+                      return (
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 4,
+                            maxHeight: 150,
+                            overflowY: 'auto'
+                          }}
+                        >
+                          {scenes.map((sc) => (
+                            <div
+                              key={`sc-${sc.timestampSec}`}
+                              onClick={() => handleSeekToTimestamp(sc.timestampSec, sc.face, sc.app)}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                gap: 6,
+                                padding: '3px 6px',
+                                borderRadius: 4,
+                                background: '#ffffff',
+                                border: '1px solid #e2e8f0',
+                                cursor: 'pointer',
+                                fontSize: 10.5
+                              }}
+                            >
+                              <span style={{ fontWeight: 600, color: '#0369a1', flexShrink: 0 }}>
+                                ▶ {formatVideoTimestamp(sc.timestampSec)}
+                              </span>
+                              <span
+                                style={{
+                                  flex: 1,
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap'
+                                }}
+                                title={sc.people.join(', ')}
+                              >
+                                {sc.people.join(', ')}
+                              </span>
+                              <span style={{ color: '#64748b', flexShrink: 0 }}>
+                                {[
+                                  sc.framing,
+                                  sc.emotion ? sc.emotion.toLowerCase() : null
+                                ]
+                                  .filter(Boolean)
+                                  .join(' • ')}
+                              </span>
+                              {sc.visuals?.dominantHex && (
+                                <span
+                                  title={`${sc.visuals.colorName} (${sc.visuals.dominantHex}) • ${sc.visuals.lighting}`}
+                                  style={{
+                                    width: 10,
+                                    height: 10,
+                                    borderRadius: '50%',
+                                    background: sc.visuals.dominantHex,
+                                    border: '1px solid #cbd5e1',
+                                    flexShrink: 0
+                                  }}
+                                />
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
           </View>
         )}
 
@@ -970,12 +1154,31 @@ export default function AssetDetailsSidePanel() {
                             {rawApps.map((app, aIdx) => {
                               const ts = Number(app.timestampSec || 0);
                               const isCurrentShot = Math.abs(currentVideoTime - ts) <= 0.65;
+                              const tooltipParts = [`Scrub to ${formatVideoTimestamp(ts)}`];
+                              if (app.shotFraming?.label) tooltipParts.push(app.shotFraming.label);
+                              if (app.attributes?.emotion) {
+                                tooltipParts.push(
+                                  `${app.attributes.emotion.toLowerCase()}${
+                                    app.attributes.emotionConfidence
+                                      ? ` (${app.attributes.emotionConfidence}%)`
+                                      : ''
+                                  }`
+                                );
+                              } else if (app.attributes?.smile) {
+                                tooltipParts.push('smiling');
+                              }
+                              if (app.attributes?.pose) tooltipParts.push(app.attributes.pose);
+                              if (app.frameVisuals?.colorName) {
+                                tooltipParts.push(
+                                  `${app.frameVisuals.colorName} (${app.frameVisuals.lighting})`
+                                );
+                              }
                               return (
                                 <button
                                   key={`${face.faceId}-ts-${aIdx}-${ts}`}
                                   type="button"
                                   onClick={() => handleSeekToTimestamp(ts, face, app)}
-                                  title={`Scrub video to ${formatVideoTimestamp(ts)}`}
+                                  title={tooltipParts.join(' • ')}
                                   style={{
                                     border: isCurrentShot
                                       ? '1.5px solid #0284c7'

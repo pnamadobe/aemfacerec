@@ -352,7 +352,7 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
             CollectionId: collectionId,
             Image: { Bytes: imageBuffer },
             ExternalImageId: sanitizeExternalImageId(assetId),
-            DetectionAttributes: ['DEFAULT'],
+            DetectionAttributes: ['ALL'],
             QualityFilter: 'AUTO'
           })
         );
@@ -367,16 +367,56 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
       }
 
       const faceRecords = response.FaceRecords || [];
-      return faceRecords.map((record) => ({
-        faceId: record.Face.FaceId,
-        confidence: Number((record.Face.Confidence || 0).toFixed(2)),
-        boundingBox: {
-          left: Number((record.Face.BoundingBox.Left || 0).toFixed(4)),
-          top: Number((record.Face.BoundingBox.Top || 0).toFixed(4)),
-          width: Number((record.Face.BoundingBox.Width || 0).toFixed(4)),
-          height: Number((record.Face.BoundingBox.Height || 0).toFixed(4))
+      return faceRecords.map((record) => {
+        const detail = record.FaceDetail || {};
+        let attributes = null;
+        if (detail && Object.keys(detail).length > 0) {
+          const emotions = Array.isArray(detail.Emotions)
+            ? [...detail.Emotions].sort((a, b) => (b.Confidence || 0) - (a.Confidence || 0))
+            : [];
+          const topEmotion =
+            emotions[0] && Number(emotions[0].Confidence) >= 45
+              ? String(emotions[0].Type || '').toUpperCase()
+              : null;
+          const yaw = Number(detail.Pose?.Yaw || 0);
+          attributes = {
+            ...(topEmotion
+              ? {
+                  emotion: topEmotion,
+                  emotionConfidence: Number((emotions[0].Confidence || 0).toFixed(1))
+                }
+              : {}),
+            ...(detail.Smile?.Value && Number(detail.Smile?.Confidence) >= 65
+              ? { smile: true }
+              : {}),
+            ...(detail.Eyeglasses?.Value && Number(detail.Eyeglasses?.Confidence) >= 65
+              ? { eyeglasses: true }
+              : {}),
+            ...(detail.Sunglasses?.Value && Number(detail.Sunglasses?.Confidence) >= 65
+              ? { sunglasses: true }
+              : {}),
+            ...(detail.MouthOpen?.Value && Number(detail.MouthOpen?.Confidence) >= 70
+              ? { speaking: true }
+              : {}),
+            ...(detail.AgeRange && Number.isFinite(Number(detail.AgeRange.Low))
+              ? { ageRange: [Number(detail.AgeRange.Low), Number(detail.AgeRange.High)] }
+              : {}),
+            pose: Math.abs(yaw) > 25 ? 'profile' : 'frontal'
+          };
         }
-      }));
+
+        return {
+          faceId: record.Face.FaceId,
+          confidence: Number((record.Face.Confidence || 0).toFixed(2)),
+          boundingBox: {
+            left: Number((record.Face.BoundingBox.Left || 0).toFixed(4)),
+            top: Number((record.Face.BoundingBox.Top || 0).toFixed(4)),
+            width: Number((record.Face.BoundingBox.Width || 0).toFixed(4)),
+            height: Number((record.Face.BoundingBox.Height || 0).toFixed(4))
+          },
+          ...(attributes ? { attributes } : {})
+        };
+      });
     },
 
     /**

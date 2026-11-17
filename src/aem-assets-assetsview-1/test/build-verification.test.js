@@ -92,6 +92,17 @@ test('Build Verification 1: compiled Runtime action bundles in dist/ load and ex
     assert.equal(listRes.statusCode, 200);
     assert.ok(Array.isArray(listRes.body.groups));
     assert.equal(listRes.body.totalGroups, 0);
+
+    // getVideoStreamUrl on bundled groups action
+    const streamRes = await groupsBundle.main({
+      operation: 'getVideoStreamUrl',
+      assetPath: '/content/dam/demo/clip.mp4',
+      AEM_HOST: 'https://author-p12345-e67890.adobeaemcloud.com',
+      ENCRYPTION_SECRET: 'build-verification-secret-key-32b'
+    });
+    assert.equal(streamRes.statusCode, 200);
+    assert.equal(streamRes.body.assetPath, '/content/dam/demo/clip.mp4');
+    assert.ok(streamRes.body.videoSettings);
   } finally {
     process.chdir(prevCwd);
     fs.rmSync(tmpDir, { recursive: true, force: true });

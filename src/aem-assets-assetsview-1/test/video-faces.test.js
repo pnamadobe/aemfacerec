@@ -394,3 +394,145 @@ test('settings: validates video settings and keeps enableVideoFaceRecognition fa
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('P1/R5 Video Enterprise Readiness: multi-batch ingestVideoFrames hydrates avatars from earlier batches, synthesizes xdm:videoSummary, and cleans up orphaned faces on mid-batch errors', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aem-facerec-vbatch-'));
+  try {
+    const storage = await createStorage({ localDir: dir, encryptionSecret: 'unit-test-secret-key' });
+    await storage.saveSettings({
+      awsAccessKeyId: 'AKIA',
+      awsSecretAccessKey: 'secret',
+      enableVideoFaceRecognition: true
+    });
+
+    let seq = 0;
+    let shouldFailAssociateOnFaceId = null;
+    const deletedFaces = [];
+
+    const rekognitionClient = {
+      async send(cmd) {
+        const name = cmd.constructor.name.replace(/Command$/, '');
+        if (name === 'IndexFaces') {
+          const fId = `batch-face-${++seq}`;
+          return {
+            FaceRecords: [
+              {
+                Face: {
+                  FaceId: fId,
+                  Confidence: 99.2,
+                  BoundingBox: { Left: 0.3, Top: 0.15, Width: 0.25, Height: 0.35 }
+                },
+                FaceDetail: {
+                  Emotions: [{ Type: 'HAPPY', Confidence: 96.4 }],
+                  Smile: { Value: true, Confidence: 98.1 },
+                  Pose: { Yaw: 4.2, Pitch: 1.1, Roll: 0.5 }
+                }
+              }
+            ]
+          };
+        }
+        if (name === 'SearchUsers') return { UserMatches: [] };
+        if (name === 'SearchFaces') return { FaceMatches: [] };
+        if (name === 'CreateUser' && shouldFailAssociateOnFaceId === `batch-face-${seq}`) {
+          throw new Error('Simulated Rekognition transient failure');
+        }
+        if (name === 'DeleteFaces') {
+          deletedFaces.push(...(cmd.input.FaceIds || []));
+          return {};
+        }
+        return {};
+      }
+    };
+
+    const aemWrites = [];
+    const aemClient = {
+      async checkFolderEligibility() {
+        return { eligible: true };
+      },
+      async getAssetInfo(p) {
+        return {
+          assetId: 'urn:aaid:aem:video-batch-1',
+          assetPath: p,
+          assetTitle: 'enterprise-spot.mp4',
+          mimeType: 'video/mp4',
+          machineKeywords: ['roasting', 'packaging', 'coffee maker', 'person']
+        };
+      },
+      async updateAssetFaceMetadata(p, meta) {
+        aemWrites.push(meta);
+        return { updated: true, assetPath: p, metadata: meta };
+      }
+    };
+
+    const svc = await createFaceService({
+      storage,
+      rekognitionClient,
+      aemClient,
+      retryOptions: { sleep: async () => {} }
+    });
+
+    const frameJpeg = makeJpeg(640, 360);
+
+    // Batch 1 (resetExisting: true, syncMetadata: false)
+    await svc.ingestVideoFrames({
+      assetPath: '/content/dam/demo/enterprise-spot.mp4',
+      assetId: 'urn:aaid:aem:video-batch-1',
+      frames: [{ timestampSec: 1.0, shotRangeSec: [0, 4.0], imageBuffer: frameJpeg }],
+      durationSec: 12.0,
+      resetExisting: true,
+      syncMetadata: false
+    });
+
+    // Verify Batch 1 stripped inline avatarDataUrl on disk (P1)
+    const diskFacesAfterBatch1 = JSON.parse(
+      fs.readFileSync(path.join(dir, 'db/faces.json'), 'utf8')
+    );
+    assert.equal(diskFacesAfterBatch1['batch-face-1'].avatarDataUrl, undefined);
+
+    // Batch 2 (resetExisting: false, syncMetadata: true — final batch!)
+    const finalRes = await svc.ingestVideoFrames({
+      assetPath: '/content/dam/demo/enterprise-spot.mp4',
+      assetId: 'urn:aaid:aem:video-batch-1',
+      frames: [{ timestampSec: 6.0, shotRangeSec: [4.0, 12.0], imageBuffer: frameJpeg }],
+      durationSec: 12.0,
+      resetExisting: false,
+      syncMetadata: true
+    });
+
+    // Both Batch 1's face and Batch 2's face have hydrated avatarDataUrl in the final response!
+    assert.equal(finalRes.faces.length, 2);
+    for (const face of finalRes.faces) {
+      assert.match(face.avatarDataUrl || '', /^data:image\/jpeg;base64,/);
+      assert.equal(face.attributes?.emotion, 'HAPPY');
+      assert.equal(face.shotFraming?.scale, 'Medium close-up');
+      assert.ok(face.frameVisuals?.dominantHex);
+    }
+
+    // Deterministic zero-LLM videoSummary is synthesized and written to AEM metadata
+    assert.match(finalRes.videoSummary || '', /12s .*video \(2 scenes/);
+    assert.match(finalRes.videoSummary || '', /Themes: roasting, packaging, coffee maker/);
+    assert.match(finalRes.videoSummary || '', /Predominant expression: happy/);
+    assert.equal(aemWrites.at(-1).videoSummary, finalRes.videoSummary);
+
+    // R5: Mid-frame failure discards unapplied Rekognition face vector and marks asset incomplete
+    shouldFailAssociateOnFaceId = 'batch-face-3';
+    await assert.rejects(
+      svc.ingestVideoFrames({
+        assetPath: '/content/dam/demo/enterprise-spot.mp4',
+        assetId: 'urn:aaid:aem:video-batch-1',
+        frames: [{ timestampSec: 9.0, shotRangeSec: [8.0, 12.0], imageBuffer: frameJpeg }],
+        resetExisting: false,
+        syncMetadata: true
+      }),
+      /Simulated Rekognition transient failure/
+    );
+    assert.ok(
+      deletedFaces.includes('batch-face-3'),
+      'orphaned face vector is discarded from Rekognition on error'
+    );
+    const dbAfterErr = await storage.getDatabase({ readOnly: true });
+    assert.equal(dbAfterErr.assets['video-batch-1'].incomplete, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -518,6 +518,7 @@ function createAemClient({
       const relPath = toApiAssetsRelativePath(cleanPath);
       try {
         const data = await fetchAemJson(`${baseUrl}/api/assets/${relPath}.json`);
+        const meta = data.properties?.metadata || {};
         const uuid =
           data.properties?.['jcr:uuid'] ||
           data['jcr:uuid'] ||
@@ -526,12 +527,41 @@ function createAemClient({
           data.properties?.['dc:title'] ||
           data.properties?.name ||
           fallbackTitle;
-        const format = data.properties?.metadata?.['dc:format'] || data.properties?.['dc:format'] || null;
+        const format = meta['dc:format'] || data.properties?.['dc:format'] || null;
+
+        // Also extract AEM Sensei Smart Tags (`predictedTags` / `xcm:machineKeywords`) if present
+        const machineKeywords = [];
+        if (Array.isArray(meta['xcm:machineKeywords'])) {
+          for (const kw of meta['xcm:machineKeywords']) {
+            const val = typeof kw === 'string' ? kw : kw?.value || kw?.name;
+            if (val && !machineKeywords.includes(String(val))) {
+              machineKeywords.push(String(val));
+            }
+          }
+        }
+        if (machineKeywords.length === 0 && isVideoAsset(cleanPath, format)) {
+          try {
+            const ptUrl = `${baseUrl}${encodeDamPath(cleanPath)}/jcr:content/metadata/predictedTags.2.json`;
+            const ptData = await fetchAemJson(ptUrl);
+            const entries = Object.values(ptData || {})
+              .filter((v) => v && typeof v === 'object' && v.name)
+              .sort((a, b) => (Number(b.confidence) || 0) - (Number(a.confidence) || 0));
+            for (const entry of entries) {
+              if (entry.name && !machineKeywords.includes(String(entry.name))) {
+                machineKeywords.push(String(entry.name));
+              }
+            }
+          } catch (e) {
+            // ignore if predictedTags node does not exist
+          }
+        }
+
         return {
           assetId: uuid,
           assetPath: cleanPath,
           assetTitle: Array.isArray(title) ? title[0] : title,
-          mimeType: format ? String(Array.isArray(format) ? format[0] : format).toLowerCase() : null
+          mimeType: format ? String(Array.isArray(format) ? format[0] : format).toLowerCase() : null,
+          ...(machineKeywords.length > 0 ? { machineKeywords: machineKeywords.slice(0, 15) } : {})
         };
       } catch (err) {
         // Fallback if API call fails
@@ -1307,6 +1337,7 @@ function createAemClient({
         faceCount = 0,
         faceTimestamps = null,
         faceTimelineJson = null,
+        videoSummary = null,
         metadataProperty = 'xdm:faceNames',
         secondaryMetadataProperty = null,
         verifyExists = false
@@ -1331,6 +1362,10 @@ function createAemClient({
         typeof faceTimelineJson === 'string' && faceTimelineJson.trim()
           ? faceTimelineJson.trim().slice(0, 16384)
           : null;
+      const cleanVideoSummary =
+        typeof videoSummary === 'string' && videoSummary.trim()
+          ? videoSummary.trim().slice(0, 2000)
+          : null;
       const metadataOut = {
         [metadataProperty]: faceNames,
         ...(hasDistinctSecondary ? { [secondaryMetadataProperty]: faceNames } : {}),
@@ -1340,7 +1375,8 @@ function createAemClient({
         ...(cleanTimestamps && cleanTimestamps.length > 0
           ? { 'xdm:faceTimestamps': cleanTimestamps }
           : {}),
-        ...(cleanTimelineJson ? { 'xdm:faceTimelineJson': cleanTimelineJson } : {})
+        ...(cleanTimelineJson ? { 'xdm:faceTimelineJson': cleanTimelineJson } : {}),
+        ...(cleanVideoSummary ? { 'xdm:videoSummary': cleanVideoSummary } : {})
       };
 
       if (!baseUrl || !fetchImpl) {
@@ -1428,6 +1464,10 @@ function createAemClient({
         } else {
           formData.append('xdm:faceTimelineJson', cleanTimelineJson);
         }
+      }
+
+      if (cleanVideoSummary) {
+        formData.append('xdm:videoSummary', cleanVideoSummary);
       }
 
       const metadataUrl = `${baseUrl}${encodeDamPath(cleanPath)}/jcr:content/metadata`;

@@ -179,3 +179,10 @@ Against the original code, 11 of these tests fail. With the fixes, the full suit
 - Per-person erasure (`deleteGroup`) removing the group, deleting Rekognition User + Face vectors, deleting cropped avatar files, detaching from assets, and updating AEM metadata (`S10`).
 - `clearAllData` purging Rekognition Users, Face vectors, and avatar files before wiping local records (`S10`).
 - End-to-end UI test for the **Delete Group** confirmation dialog in the Admin Console (`S10`).
+
+`test/video-faces.test.js` (10 tests) plus `ui-admin-console.test.js` (+1) and `build-verification.test.js` (+1), added for **Video Scene-Change Facial Recognition & Timestamp Deep-Linking (`V1`–`V5`, `P1`, `R5`)**. Covered:
+
+- Shot-clamped offset math (`t_cut + min(0.60s, 0.45 × shotDuration)`), flash-frame filtering (`< 0.20s`), non-overlapping sub-window partitioning for long takes, and `videoMaxFramesPerAsset` cost cap (`V1`).
+- Verbatim Azure Blob SAS redirect preservation (`sig=` / `rscd=`) and SSRF host validation on `resolveVideoStreamUrl` (`V4`).
+- Per-shot `faceId` storage independence + view-level person rollup (`buildAssetFacesView`), allowing individual video shots to be split without affecting other shots of the same person.
+- Multi-batch `P1` avatar hydration across chunked video frame uploads, `R5` orphaned vector cleanup on mid-batch errors, and deterministic zero-LLM `xdm:videoSummary` + `xdm:faceTimestamps` AEM metadata sync.

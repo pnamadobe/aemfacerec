@@ -440,11 +440,153 @@ async function extractVideoFramesWithFfmpeg(
     : null;
 }
 
+/**
+ * Classifies camera shot scale / framing from a face bounding box (`height` in 0..1)
+ * and total number of people in the shot ($0.00 extra cost).
+ */
+function classifyShotFraming(boundingBox = {}, peopleInShotCount = 1) {
+  const h = Number(boundingBox.height ?? boundingBox.Height ?? 0);
+  let scale = 'Medium shot';
+  if (h >= 0.42) scale = 'Close-up';
+  else if (h >= 0.22) scale = 'Medium close-up';
+  else if (h >= 0.1) scale = 'Medium shot';
+  else if (h > 0) scale = 'Wide shot';
+
+  const count = Math.max(1, Number(peopleInShotCount) || 1);
+  const composition =
+    count === 1 ? 'Solo' : count === 2 ? 'Two-shot' : `Group shot (${count})`;
+
+  return {
+    scale,
+    composition,
+    label: count > 1 ? `${scale} (${composition})` : scale
+  };
+}
+
+/**
+ * Computes average RGB color, hex code, human-readable palette name, and lighting mood
+ * from a decoded RGBA pixel buffer ($0.00 extra cost).
+ */
+function extractFrameVisualMetrics(rgbaData) {
+  if (!rgbaData || rgbaData.length < 4) return null;
+  const pixelCount = Math.floor(rgbaData.length / 4);
+  const step = Math.max(1, Math.floor(pixelCount / 1024));
+  let rSum = 0;
+  let gSum = 0;
+  let bSum = 0;
+  let lumaSum = 0;
+  let count = 0;
+
+  for (let i = 0; i < pixelCount; i += step) {
+    const p = i * 4;
+    const r = rgbaData[p];
+    const g = rgbaData[p + 1];
+    const b = rgbaData[p + 2];
+    rSum += r;
+    gSum += g;
+    bSum += b;
+    lumaSum += 0.299 * r + 0.587 * g + 0.114 * b;
+    count++;
+  }
+
+  if (count === 0) return null;
+  const rAvg = Math.round(rSum / count);
+  const gAvg = Math.round(gSum / count);
+  const bAvg = Math.round(bSum / count);
+  const lumaAvg = Math.round(lumaSum / count);
+
+  const toHex = (n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0');
+  const dominantHex = `#${toHex(rAvg)}${toHex(gAvg)}${toHex(bAvg)}`.toUpperCase();
+
+  let lighting = 'Balanced';
+  if (lumaAvg >= 175) lighting = 'Bright high-key';
+  else if (lumaAvg <= 75) lighting = 'Moody low-key';
+
+  // Map RGB to a concise human-readable tone
+  const maxC = Math.max(rAvg, gAvg, bAvg);
+  const minC = Math.min(rAvg, gAvg, bAvg);
+  const chroma = maxC - minC;
+  let colorName = 'Neutral Slate';
+  if (chroma < 20) {
+    colorName = lumaAvg > 170 ? 'Soft Daylight' : lumaAvg < 75 ? 'Charcoal' : 'Neutral Gray';
+  } else if (rAvg >= gAvg && rAvg >= bAvg) {
+    colorName = gAvg > bAvg + 20 ? 'Warm Amber' : 'Warm Rose';
+  } else if (gAvg >= rAvg && gAvg >= bAvg) {
+    colorName = 'Natural Green';
+  } else {
+    colorName = 'Cool Slate Blue';
+  }
+
+  return {
+    dominantHex,
+    colorName,
+    lighting,
+    lumaAvg
+  };
+}
+
+/**
+ * Builds a deterministic, zero-LLM natural-language video summary and per-scene breakdown
+ * from extracted shot timestamps, facial attributes, framing, and AEM Smart Tags.
+ */
+function buildDeterministicVideoSummary({
+  durationSec = 0,
+  sceneCount = 1,
+  faceLabels = [],
+  machineKeywords = [],
+  emotions = [],
+  pacingLabel = null
+} = {}) {
+  const dur = Math.round(Number(durationSec) || 0);
+  const scenes = Math.max(1, Number(sceneCount) || 1);
+  const avgShot = dur > 0 ? Number((dur / scenes).toFixed(1)) : 0;
+  const pacing =
+    pacingLabel ||
+    (avgShot > 0 && avgShot <= 2.0
+      ? 'fast-paced'
+      : avgShot >= 5.0
+      ? 'steady documentary-style'
+      : 'medium-paced');
+
+  const peopleCount = (faceLabels || []).length;
+  let peoplePhrase = 'no detected faces';
+  if (peopleCount === 1) {
+    peoplePhrase = `featuring ${faceLabels[0]}`;
+  } else if (peopleCount === 2) {
+    peoplePhrase = `featuring ${faceLabels[0]} and ${faceLabels[1]}`;
+  } else if (peopleCount > 2) {
+    peoplePhrase = `featuring ${faceLabels.slice(0, 2).join(', ')} and ${peopleCount - 2} other${
+      peopleCount - 2 === 1 ? '' : 's'
+    }`;
+  }
+
+  const topTags = (machineKeywords || [])
+    .filter((k) => !['person', 'people', 'woman', 'man', 'girl', 'boy'].includes(String(k).toLowerCase()))
+    .slice(0, 5);
+  const topEmotion = (emotions || []).find((e) => e && e !== 'CALM');
+
+  const parts = [
+    `${dur > 0 ? `${dur}s ` : ''}${pacing} video (${scenes} ${scenes === 1 ? 'scene' : 'scenes'}${
+      avgShot > 0 ? `, ${avgShot}s avg cut` : ''
+    }) ${peoplePhrase}.`
+  ];
+  if (topTags.length > 0) {
+    parts.push(`Themes: ${topTags.join(', ')}.`);
+  }
+  if (topEmotion) {
+    parts.push(`Predominant expression: ${topEmotion.toLowerCase()}.`);
+  }
+  return parts.join(' ');
+}
+
 module.exports = {
   formatVideoTimestamp,
   parseVideoTimestamp,
   planShotSampleTimestamps,
   computeFaceFrameQualityScore,
+  classifyShotFraming,
+  extractFrameVisualMetrics,
+  buildDeterministicVideoSummary,
   parseScdetOutput,
   resolveFfmpegBinaryPath,
   extractVideoFramesWithFfmpeg,
