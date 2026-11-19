@@ -5,6 +5,7 @@ import { Provider, defaultTheme } from '@adobe/react-spectrum';
 import ExtensionRegistration from './ExtensionRegistration';
 import AssetDetailsSidePanel from './AssetDetailsSidePanel';
 import AdminConsole from './AdminConsole';
+import LicenseReviewModal from './LicenseReviewModal';
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
             <Route path="side-panel" element={<AssetDetailsSidePanel />} />
             <Route path="modal-face-management" element={<AdminConsole />} />
             <Route path="admin" element={<AdminConsole />} />
+            <Route path="modal-license-review" element={<LicenseReviewModal />} />
           </Routes>
         </ErrorBoundary>
       </Router>

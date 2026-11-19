@@ -68,6 +68,8 @@ const DEFAULT_SETTINGS = {
   minImageSize: 200,
   // Video facial recognition & scene-change frame extraction controls
   enableVideoFaceRecognition: false,
+  // Experimental: suggest pre-GA AEM licenses for people in an image by matching contract headshots
+  enableLicenseSuggestions: false,
   allowedVideoTypes: [
     'video/mp4',
     'video/quicktime',
@@ -581,6 +583,15 @@ async function createStorage(options = {}) {
       return readJson('db/assets.json', {});
     },
 
+    /** Cache of contract-headshot -> face-group matches (license suggestions). No images stored. */
+    async getLicenseMatches() {
+      return readJson('db/license-matches.json', {});
+    },
+
+    async saveLicenseMatches(matches) {
+      await writeJson('db/license-matches.json', matches || {});
+    },
+
     async getDatabase({ readOnly = false } = {}) {
       if (readOnly) {
         const [groups, faces, assets] = await Promise.all([
@@ -860,6 +871,7 @@ async function createStorage(options = {}) {
         enableVideoFaceRecognition: Boolean(
           merged.enableVideoFaceRecognition ?? DEFAULT_SETTINGS.enableVideoFaceRecognition
         ),
+        enableLicenseSuggestions: Boolean(merged.enableLicenseSuggestions ?? false),
         allowedVideoTypes:
           Array.isArray(merged.allowedVideoTypes) && merged.allowedVideoTypes.length > 0
             ? merged.allowedVideoTypes
@@ -1011,6 +1023,9 @@ async function createStorage(options = {}) {
         updated.minImageSize = size;
       }
 
+      if (typeof newSettings.enableLicenseSuggestions === 'boolean') {
+        updated.enableLicenseSuggestions = newSettings.enableLicenseSuggestions;
+      }
       if (typeof newSettings.enableVideoFaceRecognition === 'boolean') {
         updated.enableVideoFaceRecognition = newSettings.enableVideoFaceRecognition;
       }

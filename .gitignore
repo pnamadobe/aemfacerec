@@ -12,3 +12,5 @@ src/*/web-src/src/config.json
 *.log
 .DS_Store
 .local-storage/
+
+src/aem-assets-assetsview-1/web-src/src/vendor/

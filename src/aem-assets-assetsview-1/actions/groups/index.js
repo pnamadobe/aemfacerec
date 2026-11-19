@@ -3,6 +3,9 @@ const { createStorage } = require('../lib/storage');
 const { createAemClient } = require('../lib/aem');
 const { corsHeaders: buildCors, buildActionContext } = require('../lib/action-context');
 const { PublicError, errorResponse } = require('../lib/security');
+const { createRekognitionService } = require('../lib/rekognition');
+const { createLicenseClient } = require('../lib/licenses');
+const { createLicenseSuggestionService } = require('../lib/license-suggestions');
 
 const MAINTENANCE_OPERATIONS = new Set([
   'seedDemoData',
@@ -10,6 +13,8 @@ const MAINTENANCE_OPERATIONS = new Set([
   'exportSnapshot',
   'importSnapshot'
 ]);
+
+const LICENSE_OPERATIONS = new Set(['suggestLicenses', 'applyLicense', 'getLicenseDocumentUrl', 'getLicenseDocumentChunk']);
 
 const CURATOR_MUTATION_OPERATIONS = new Set([
   'renameGroup',
@@ -74,6 +79,48 @@ async function main(params = {}) {
           403
         );
       }
+    }
+
+    if (LICENSE_OPERATIONS.has(operation)) {
+      // The pre-GA license API only accepts a signed-in user's token, never service credentials
+      if (!ctx.token || ctx.isSkillAuth) {
+        throw new PublicError('License suggestions require a signed-in Assets View user.', 403);
+      }
+      const licenseService = createLicenseSuggestionService({
+        storage,
+        faceService,
+        licenseClient: createLicenseClient({
+          aemHost: ctx.aemHost,
+          token: ctx.token,
+          orgId: ctx.imsOrgId || ''
+        }),
+        getRekognition: async () => {
+          const settings = await storage.getSettings({ includeDecryptedSecret: true });
+          return { settings, rekognition: createRekognitionService(settings) };
+        }
+      });
+      let result;
+      if (operation === 'suggestLicenses') {
+        result = await licenseService.suggestForAsset({
+          assetId: params.assetId,
+          assetPath: params.assetPath,
+          assetName: params.assetName
+        });
+      } else if (operation === 'getLicenseDocumentChunk') {
+        result = await licenseService.getDocumentChunk({
+          licenseId: params.licenseId,
+          offset: params.offset,
+          length: params.length
+        });
+      } else if (operation === 'getLicenseDocumentUrl') {
+        result = await licenseService.getDocumentUrl({ licenseId: params.licenseId });
+      } else {
+        result = await licenseService.applyLicense({
+          assetPath: params.assetPath,
+          licenseId: params.licenseId
+        });
+      }
+      return { statusCode: 200, headers: corsHeaders, body: result };
     }
 
     switch (operation) {
@@ -163,19 +210,24 @@ async function main(params = {}) {
 
       case 'getAssetFaces': {
         const settingsPromise = storage.getSettings({ includeDecryptedSecret: false });
-        const [result, { canManageGroups }] = await Promise.all([
+        const [result, { canManageGroups }, settings] = await Promise.all([
           faceService.getAssetFaces({
             assetId: params.assetId,
             assetPath: params.assetPath,
             assetName: params.assetName,
             settingsPromise
           }),
-          settingsPromise.then((settings) => resolveCallerPermissions(aemClient, settings, ctx))
+          settingsPromise.then((s) => resolveCallerPermissions(aemClient, s, ctx)),
+          settingsPromise
         ]);
         return {
           statusCode: 200,
           headers: corsHeaders,
-          body: { ...result, canManageGroups }
+          body: {
+            ...result,
+            canManageGroups,
+            licenseSuggestionsEnabled: Boolean(settings.enableLicenseSuggestions)
+          }
         };
       }
 

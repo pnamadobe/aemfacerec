@@ -720,6 +720,14 @@ export const api = {
     invokeAction('groups', { operation: 'getGroup', groupId, ...params }, ctx),
   getAssetFaces: (params, ctx) =>
     invokeAction('groups', { operation: 'getAssetFaces', ...params }, ctx),
+  suggestLicenses: (params, ctx) =>
+    invokeAction('groups', { operation: 'suggestLicenses', ...params }, ctx),
+  getLicenseDocumentChunk: (params, ctx) =>
+    invokeAction('groups', { operation: 'getLicenseDocumentChunk', ...params }, ctx),
+  getLicenseDocumentUrl: (params, ctx) =>
+    invokeAction('groups', { operation: 'getLicenseDocumentUrl', ...params }, ctx),
+  applyLicense: (params, ctx) =>
+    invokeAction('groups', { operation: 'applyLicense', ...params }, ctx),
   renameGroup: (groupId, name, ctx) =>
     invokeAction('groups', { operation: 'renameGroup', groupId, name }, ctx),
   splitFaces: (faceIds, newGroupName, ctx) =>
@@ -1019,3 +1027,32 @@ export const api = {
   testConnection: (settings, ctx) =>
     invokeAction('settings', { operation: 'testConnection', settings }, ctx)
 };
+
+/**
+ * Downloads a whole license PDF through the action in chunks (the storage host has no CORS and
+ * action responses are size-limited). Returns a Uint8Array.
+ */
+export async function fetchLicenseDocument(licenseId, ctx, { chunkSize = 512 * 1024, onProgress } = {}) {
+  const parts = [];
+  let offset = 0;
+  let total = Infinity;
+  for (let i = 0; i < 80 && offset < total; i++) {
+    // eslint-disable-next-line no-await-in-loop
+    const res = await api.getLicenseDocumentChunk({ licenseId, offset, length: chunkSize }, ctx);
+    const bin = atob(res.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
+    if (bytes.length === 0) break;
+    parts.push(bytes);
+    offset += bytes.length;
+    total = res.total;
+    if (onProgress) onProgress(Math.min(1, offset / total));
+  }
+  const out = new Uint8Array(offset);
+  let pos = 0;
+  for (const part of parts) {
+    out.set(part, pos);
+    pos += part.length;
+  }
+  return out;
+}

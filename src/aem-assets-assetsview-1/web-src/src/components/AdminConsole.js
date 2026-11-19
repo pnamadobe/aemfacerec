@@ -326,6 +326,7 @@ export default function AdminConsole() {
     allowedImageTypesText: '',
     minImageSize: 200,
     enableVideoFaceRecognition: false,
+    enableLicenseSuggestions: false,
     allowedVideoTypesText: 'video/mp4, video/quicktime, video/webm, video/x-m4v',
     videoSceneThreshold: 0.28,
     videoShotOffsetSec: 0.6,
@@ -674,6 +675,7 @@ export default function AdminConsole() {
           .filter(Boolean),
         minImageSize: Number(settings.minImageSize),
         enableVideoFaceRecognition: Boolean(settings.enableVideoFaceRecognition),
+        enableLicenseSuggestions: Boolean(settings.enableLicenseSuggestions),
         allowedVideoTypes: (settings.allowedVideoTypesText || '')
           .split(/[\s,]+/)
           .map((t) => t.trim())
@@ -1683,6 +1685,22 @@ export default function AdminConsole() {
                         were already scanned unless &quot;Include already-scanned images&quot; is
                         checked.
                       </Text>
+
+                      <Divider size="S" />
+
+                      <Heading level={4} margin={0}>
+                        License Suggestions (experimental)
+                      </Heading>
+                      <Switch
+                        isSelected={Boolean(settings.enableLicenseSuggestions)}
+                        onChange={(val) =>
+                          setSettings((s) => ({ ...s, enableLicenseSuggestions: val }))
+                        }
+                      >
+                        Suggest AEM licenses for people in an image by matching the face in each
+                        license&apos;s contract headshot (uses the pre-GA license API and the
+                        signed-in user&apos;s permissions)
+                      </Switch>
 
                       <Divider size="S" />
 

@@ -23,7 +23,9 @@ import {
   formatVideoTimestamp,
   extractSceneFramesInBrowser
 } from '../utils/video-frame-extractor';
-import { extensionId, STORAGE_KEY_CTX } from './Constants';
+import { extensionId, STORAGE_KEY_CTX, LICENSE_APPLIED_CHANNEL, LICENSE_REVIEW_KEY } from './Constants';
+import LicenseSuggestionRow from './LicenseSuggestionRow';
+import { withLicenseFlag, licensePeopleKey } from '../utils/license-flag';
 
 function readInitialSeekTimestamp() {
   try {
@@ -95,6 +97,8 @@ export default function AssetDetailsSidePanel() {
   const [movingFaceId, setMovingFaceId] = useState(null);
   const [groupOptions, setGroupOptions] = useState(null);
   const [statusBanner, setStatusBanner] = useState(null);
+  const [licenseState, setLicenseState] = useState({ loading: false, people: [] });
+  const [appliedLicenseIds, setAppliedLicenseIds] = useState([]);
 
   // Video playback & timestamp scrubbing state
   const videoRef = useRef(null);
@@ -329,6 +333,103 @@ export default function AssetDetailsSidePanel() {
     }
   }, [hostResolved, assetId, assetPath, assetName, aemHost, imsToken, imsOrg]);
 
+  // Experimental (flag-gated): suggest licenses whose contract headshot matches the people here
+  const licenseSuggestionsEnabled = Boolean(assetData?.licenseSuggestionsEnabled);
+  const licenseAssetKey = assetData?.assetPath || assetPath || '';
+  const licenseFaceCount = (assetData?.faces || []).length;
+  const licensePeopleSig = licensePeopleKey(assetData?.faces);
+  const [reviewPollUntil, setReviewPollUntil] = useState(0);
+  const fetchLicenseSuggestions = useCallback(
+    (silent) =>
+      api
+        .suggestLicenses(
+          { assetId: assetData?.assetId || assetId, assetPath: licenseAssetKey, assetName },
+          { aemHost, imsToken, imsOrg }
+        )
+        .then((res) => ({ loading: false, people: res.people || [], pending: res.pendingCount || 0 }))
+        .catch(() => (silent ? null : { loading: false, people: [] })),
+    [licenseAssetKey, assetData?.assetId, assetId, assetName, aemHost, imsToken, imsOrg]
+  );
+
+  useEffect(() => {
+    if (!licenseSuggestionsEnabled || !licenseAssetKey || licenseFaceCount === 0 || !imsToken) {
+      setLicenseState({ loading: false, people: [] });
+      return undefined;
+    }
+    let cancelled = false;
+    setLicenseState({ loading: true, people: [] });
+    fetchLicenseSuggestions(false).then((next) => {
+      if (!cancelled && next) setLicenseState(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [licenseSuggestionsEnabled, licenseAssetKey, licenseFaceCount, licensePeopleSig, imsToken]);
+
+  // While a review dialog may be open, re-read the asset's real license state so the panel
+  // reflects an assignment made in the dialog without relying on cross-frame messages.
+  useEffect(() => {
+    if (!reviewPollUntil) return undefined;
+    const timer = setInterval(async () => {
+      if (Date.now() > reviewPollUntil) {
+        setReviewPollUntil(0);
+        return;
+      }
+      const next = await fetchLicenseSuggestions(true);
+      if (next) setLicenseState(next);
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [reviewPollUntil, fetchLicenseSuggestions]);
+
+  // The review modal runs in its own iframe and tells us when the user applied a license
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return undefined;
+    const bc = new BroadcastChannel(LICENSE_APPLIED_CHANNEL);
+    bc.onmessage = (ev) => {
+      const { assetPath: appliedPath, licenseId } = ev?.data || {};
+      if (licenseId && appliedPath === licenseAssetKey) {
+        setAppliedLicenseIds((ids) => (ids.includes(licenseId) ? ids : [...ids, licenseId]));
+      }
+    };
+    return () => bc.close();
+  }, [licenseAssetKey]);
+
+  const handleReviewLicense = useCallback(
+    (license, person) => {
+      try {
+        // Hand the extracted terms to the review dialog (same origin) so it can show them too
+        localStorage.setItem(LICENSE_REVIEW_KEY, JSON.stringify({ [license.licenseId]: license }));
+      } catch (e) {
+        // the dialog still works without the properties tab data
+      }
+      const qs = new URLSearchParams({
+        licenseId: license.licenseId,
+        licenseName: license.name || 'License',
+        assetPath: licenseAssetKey,
+        personName: person?.displayName || '',
+        similarity: String(license.similarity || ''),
+        aemHost: aemHost || ''
+      }).toString();
+      setReviewPollUntil(Date.now() + 3 * 60 * 1000);
+      guestConnection?.host?.modal?.openDialog?.({
+        title: 'Review license contract',
+        contentUrl: `/index.html?v=${Date.now()}#modal-license-review?${qs}`,
+        type: 'fullscreen',
+        size: 'XL'
+      });
+    },
+    [guestConnection, licenseAssetKey, aemHost]
+  );
+
+  const handleApplyLicense = useCallback(
+    (license) =>
+      api.applyLicense(
+        { assetPath: licenseAssetKey, licenseId: license.licenseId },
+        { aemHost, imsToken, imsOrg }
+      ),
+    [licenseAssetKey, aemHost, imsToken, imsOrg]
+  );
+
   useEffect(() => {
     loadData();
   }, [loadData]);
@@ -425,7 +526,7 @@ export default function AssetDetailsSidePanel() {
               );
             }
           );
-          setAssetData(res);
+          setAssetData((prev) => withLicenseFlag(prev, res));
           setStatusBanner(
             resultBanner(
               `Analyzed ${extracted.frames.length} video scene(s), consolidated ${res.faceCount || 0} unique person(s), and synced ${res.metadataProperty || 'xdm:faceNames'} + xdm:faceTimestamps.`,
@@ -440,7 +541,7 @@ export default function AssetDetailsSidePanel() {
         { assetId: hostContext.assetId, assetPath: hostContext.assetPath },
         hostContext
       );
-      setAssetData(res);
+      setAssetData((prev) => withLicenseFlag(prev, res));
       setStatusBanner(resultBanner(`Scanned ${res.faceCount || 0} face(s) and synced ${res.metadataProperty || 'xdm:faceNames'}.`, res));
     } catch (err) {
       setStatusBanner({ type: 'negative', text: err.message });
@@ -1220,6 +1321,15 @@ export default function AssetDetailsSidePanel() {
                             Cancel
                           </ActionButton>
                         </Flex>
+                      )}
+                      {licenseSuggestionsEnabled && (
+                        <LicenseSuggestionRow
+                          person={licenseState.people.find((p) => p.groupId === face.groupId)}
+                          state={licenseState}
+                          onApply={handleApplyLicense}
+                          onReview={guestConnection ? handleReviewLicense : null}
+                          appliedIds={appliedLicenseIds}
+                        />
                       )}
                     </Flex>
                   </Flex>

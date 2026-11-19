@@ -176,6 +176,7 @@ try {
     IndexFacesCommand: makeCommandClass('IndexFacesCommand'),
     SearchUsersCommand: makeCommandClass('SearchUsersCommand'),
     SearchFacesCommand: makeCommandClass('SearchFacesCommand'),
+    SearchFacesByImageCommand: makeCommandClass('SearchFacesByImageCommand'),
     CreateUserCommand: makeCommandClass('CreateUserCommand'),
     DeleteUserCommand: makeCommandClass('DeleteUserCommand'),
     AssociateFacesCommand: makeCommandClass('AssociateFacesCommand'),
@@ -191,6 +192,7 @@ const {
   IndexFacesCommand,
   SearchUsersCommand,
   SearchFacesCommand,
+  SearchFacesByImageCommand,
   CreateUserCommand,
   DeleteUserCommand,
   AssociateFacesCommand,
@@ -477,6 +479,48 @@ function createRekognitionService(settings, customClient = null, retryOptions = 
       }
 
       return null;
+    },
+
+    /**
+     * Stateless face search: finds which existing Face Groups the largest face in `imageBuffer`
+     * matches. Nothing is indexed, so the searched image (e.g. a contract headshot) is never
+     * stored in the Collection. Results are grouped by Face Group, best similarity first.
+     * `facesDb` maps FaceId -> { groupId } and `groupsDb` holds the live groups.
+     */
+    async searchFacesByImage(imageBuffer, facesDb = {}, groupsDb = {}, { maxFaces = 25, threshold } = {}) {
+      let response;
+      try {
+        response = await send(
+          new SearchFacesByImageCommand({
+            CollectionId: collectionId,
+            Image: { Bytes: imageBuffer },
+            MaxFaces: maxFaces,
+            FaceMatchThreshold: Number(threshold ?? similarityThreshold),
+            QualityFilter: 'AUTO'
+          })
+        );
+      } catch (err) {
+        if (err.name === 'InvalidParameterException') return { noFace: true, matches: [] };
+        if (err.name === 'ResourceNotFoundException') return { noFace: false, matches: [] };
+        if (err.name === 'InvalidImageFormatException') {
+          throw new PublicError('This image format is not supported for face search (use JPEG or PNG).');
+        }
+        if (err.name === 'ImageTooLargeException') {
+          throw new PublicError('This image is too large for face search.');
+        }
+        throw err;
+      }
+      const best = new Map();
+      for (const match of response.FaceMatches || []) {
+        const groupId = facesDb[match.Face?.FaceId]?.groupId;
+        if (!groupId || !groupsDb[groupId]) continue;
+        const similarity = Number((match.Similarity || 0).toFixed(2));
+        if (!best.has(groupId) || similarity > best.get(groupId)) best.set(groupId, similarity);
+      }
+      const matches = [...best.entries()]
+        .map(([groupId, similarity]) => ({ groupId, similarity }))
+        .sort((a, b) => b.similarity - a.similarity);
+      return { noFace: false, matches };
     },
 
     /**
