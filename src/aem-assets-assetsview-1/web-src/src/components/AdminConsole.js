@@ -1379,9 +1379,22 @@ export default function AdminConsole() {
                                     );
                                   })()}
                                   {canManageGroups && (
-                                    <Checkbox isSelected={isFaceSelected}>
-                                      <span style={{ fontSize: 11 }}>Select</span>
-                                    </Checkbox>
+                                    <div onClick={(e) => e.stopPropagation()}>
+                                      <Checkbox
+                                        isSelected={isFaceSelected}
+                                        onChange={(checked) =>
+                                          setSelectedFaceIds((prev) =>
+                                            checked
+                                              ? prev.includes(face.faceId)
+                                                ? prev
+                                                : [...prev, face.faceId]
+                                              : prev.filter((id) => id !== face.faceId)
+                                          )
+                                        }
+                                      >
+                                        <span style={{ fontSize: 11 }}>Select</span>
+                                      </Checkbox>
+                                    </div>
                                   )}
                                 </Flex>
                               </div>

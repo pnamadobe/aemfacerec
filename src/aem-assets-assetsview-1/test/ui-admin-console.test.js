@@ -877,3 +877,20 @@ test('UI Video Assets: Side Panel renders video scene scrubber and clickable tim
     await storage.saveDatabase(cleanDb);
   }
 });
+
+test('UI: clicking a face checkbox selects it (no double toggle) and shows split actions', async () => {
+  renderConsole();
+  await screen.findByText('Alice Example');
+  const card = screen.getAllByText('Person #1').find((el) => el.closest('div[style*="cursor: pointer"]'));
+  fireEvent.click(card);
+  await screen.findByText('Faces in this Group (70)');
+
+  const boxes = screen.getAllByLabelText('Select');
+  fireEvent.click(boxes[0]);
+  fireEvent.click(boxes[1]);
+  await screen.findByText('Actions for 2 Selected Face(s):');
+  screen.getByText('Split to New Group');
+
+  fireEvent.click(boxes[1]);
+  await screen.findByText('Actions for 1 Selected Face(s):');
+});
